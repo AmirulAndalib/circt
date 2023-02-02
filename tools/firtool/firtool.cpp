@@ -789,6 +789,14 @@ static LogicalResult processBuffer(
   // Run InnerSymbolDCE as late as possible, but before IMDCE.
   pm.addPass(firrtl::createInnerSymbolDCEPass());
 
+  if (!disableOptimization &&
+      preserveAggregate != firrtl::PreserveAggregate::None &&
+      !disableMergeConnections) {
+    pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+        firrtl::createMergeConnectionsPass(
+            !disableAggressiveMergeConnections.getValue()));
+  }
+
   // The above passes, IMConstProp in particular, introduce additional
   // canonicalization opportunities that we should pick up here before we
   // proceed to output-specific pipelines.
@@ -802,13 +810,6 @@ static LogicalResult processBuffer(
   if (emitOMIR)
     pm.nest<firrtl::CircuitOp>().addPass(
         firrtl::createEmitOMIRPass(omirOutFile));
-
-  if (!disableOptimization &&
-      preserveAggregate != firrtl::PreserveAggregate::None &&
-      !disableMergeConnections)
-    pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
-        firrtl::createMergeConnectionsPass(
-            !disableAggressiveMergeConnections.getValue()));
 
   // Lower if we are going to verilog or if lowering was specifically requested.
   if (outputFormat != OutputIRFir) {

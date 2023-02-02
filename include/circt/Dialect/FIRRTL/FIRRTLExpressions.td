@@ -189,6 +189,7 @@ def VectorCreateOp : FIRRTLOp<"vectorcreate"> {
   let assemblyFormat = "$fields attr-dict `:` functional-type($fields, $result)";
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 
@@ -410,6 +411,16 @@ let inferType = "impl::inferBitwiseResult" in {
     def OrPrimOp  : IntBinaryPrimOp<"or",  UIntType, [Commutative]>;
     def XorPrimOp : IntBinaryPrimOp<"xor", UIntType, [Commutative]>;
   }
+}
+
+let inferType = "impl::inferElementwiseResult" in
+let hasFolder = 0 in {
+  def ElementwiseAndPrimOp : BinaryPrimOp<"elementwise_and", PassiveType,
+                                PassiveType, PassiveType, [Commutative]>;
+  def ElementwiseOrPrimOp  : BinaryPrimOp<"elementwise_or", PassiveType,
+                                PassiveType, PassiveType, [Commutative]>;
+  def ElementwiseXorPrimOp : BinaryPrimOp<"elementwise_xor", PassiveType,
+                                PassiveType, PassiveType, [Commutative]>;
 }
 
 // Comparison Operations

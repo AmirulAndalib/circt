@@ -1884,7 +1884,91 @@ OpFoldResult BundleCreateOp::fold(FoldAdaptor adaptor) {
 }
 
 OpFoldResult VectorCreateOp::fold(FoldAdaptor adaptor) {
+  if (SubindexOp first = getOperand(0).getDefiningOp<SubindexOp>()) {
+    if (first.getIndex() == 0 && first.getInput().getType() == getType() &&
+        !getType().hasUninferredWidth() &&
+        llvm::all_of(
+            llvm::enumerate(getOperands().drop_front()), [&](auto elem) {
+              auto index = elem.index() + 1;
+              auto subindex = elem.value().template getDefiningOp<SubindexOp>();
+              return subindex && subindex.getInput() == first.getInput() &&
+                     subindex.getIndex() == index;
+            })) {
+      return first.getInput();
+    }
+  }
+
   return collectFields(getContext(), adaptor.getOperands());
+}
+
+namespace {
+template <typename OpTy, typename ResultOpType>
+class VectorCreateToLogicElementwise : public mlir::RewritePattern {
+public:
+  VectorCreateToLogicElementwise(MLIRContext *context)
+      : RewritePattern(VectorCreateOp::getOperationName(), 0, context) {}
+
+  /// Return `<%a, %b, index>` if the given value is defined by operation `OpTy`
+  /// and its operand is subindices `%a[index]` and `%b[index]`.
+  static std::optional<std::tuple<Value, Value, unsigned>>
+  getVectorizableOperands(Value value) {
+    auto op = value.getDefiningOp<OpTy>();
+    if (!op || !(op->getOperand(0).getType() == op->getOperand(1).getType() &&
+                 op->getOperand(0).getType() == op->getResult(0).getType()))
+      return std::nullopt;
+
+    if (auto lhsSubindex = op.getLhs().template getDefiningOp<SubindexOp>())
+      if (auto rhsSubindex = op.getRhs().template getDefiningOp<SubindexOp>())
+        if (lhsSubindex.getIndex() == rhsSubindex.getIndex())
+          return std::make_tuple(lhsSubindex.getInput(), rhsSubindex.getInput(),
+                                 lhsSubindex.getIndex());
+    return std::nullopt;
+  }
+
+  LogicalResult
+  matchAndRewrite(Operation *op,
+                  mlir::PatternRewriter &rewriter) const override {
+    auto vectorCreateOp = cast<VectorCreateOp>(op);
+    // Pattern match the first operand.
+    auto firstOperand =
+        getVectorizableOperands(vectorCreateOp.getOperands().front());
+    if (!firstOperand)
+      return failure();
+    Value firstLhsParent, firstRhsParent;
+    unsigned firstIdx;
+    std::tie(firstLhsParent, firstRhsParent, firstIdx) = *firstOperand;
+    // If the index is not zero or types don't match, bail out.
+    if (firstIdx != 0 || firstLhsParent.getType() != vectorCreateOp.getType() ||
+        firstRhsParent.getType() != vectorCreateOp.getType())
+      return failure();
+
+    // Check that all operands have the same parent values.
+    if (llvm::all_of(llvm::enumerate(vectorCreateOp.getOperands().drop_front()),
+                     [&](auto elem) {
+                       auto idx = elem.index() + 1;
+                       auto operand = getVectorizableOperands(elem.value());
+                       if (!operand)
+                         return false;
+                       auto [lhs, rhs, index] = *operand;
+                       return lhs == firstLhsParent && rhs == firstRhsParent &&
+                              index == idx;
+                     })) {
+      replaceOpWithNewOpAndCopyName<ResultOpType>(
+          rewriter, vectorCreateOp, firstLhsParent, firstRhsParent);
+      return success();
+    }
+
+    return failure();
+  }
+};
+} // namespace
+
+void VectorCreateOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                 MLIRContext *context) {
+  results.add<VectorCreateToLogicElementwise<OrPrimOp, ElementwiseOrPrimOp>,
+              VectorCreateToLogicElementwise<AndPrimOp, ElementwiseAndPrimOp>,
+              VectorCreateToLogicElementwise<XorPrimOp, ElementwiseXorPrimOp>>(
+      context);
 }
 
 namespace {
