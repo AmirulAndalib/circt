@@ -169,6 +169,7 @@ def BundleCreateOp : FIRRTLOp<"bundlecreate"> {
   let assemblyFormat = "$fields attr-dict `:` functional-type($fields, $result)";
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def VectorCreateOp : FIRRTLOp<"vectorcreate"> {

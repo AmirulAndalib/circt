@@ -2897,7 +2897,20 @@ FIRRTLType impl::inferBitwiseResult(FIRRTLType lhs, FIRRTLType rhs,
 
 FIRRTLType impl::inferElementwiseResult(FIRRTLType lhs, FIRRTLType rhs,
                                         std::optional<Location> loc) {
-  if (!areTypesEquivalent(lhs, rhs)) {
+  auto base = lhs.dyn_cast<FIRRTLBaseType>();
+  if (!base) {
+    if (loc)
+      mlir::emitError(*loc, "operands must have a base type");
+    return {};
+  }
+  // TODO: Remove following conditions if we start allowing element wise
+  // operations to have uninferred widths.
+  if (base.hasUninferredWidth()) {
+    if (loc)
+      mlir::emitError(*loc, "operands must not have an uninferred width type");
+    return {};
+  }
+  if (lhs != rhs) {
     if (loc)
       mlir::emitError(
           *loc, "operands of elementwise operations must have the same type");

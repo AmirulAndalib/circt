@@ -2613,4 +2613,25 @@ firrtl.module @ElementWise(in %a: !firrtl.vector<uint<1>, 2>, in %b: !firrtl.vec
   firrtl.strictconnect %c_2, %12 : !firrtl.vector<uint<1>, 2>
 }
 
+// CHECK-LABEL: @ElementWiseNest
+firrtl.module @ElementWiseNest(in %a: !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>, in %b: !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>, out %c: !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>) {
+  // CHECK-NEXT: %0 = firrtl.elementwise_or %a, %b
+  // CHECK-NEXT: firrtl.strictconnect %c, %0
+  // CHECK-NEXT: }
+  %0 = firrtl.subindex %b[0] : !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>
+  %1 = firrtl.subfield %0[e] : !firrtl.bundle<e: vector<uint<3>, 2>>
+  %2 = firrtl.subindex %1[1] : !firrtl.vector<uint<3>, 2>
+  %3 = firrtl.subindex %1[0] : !firrtl.vector<uint<3>, 2>
+  %4 = firrtl.subindex %a[0] : !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>
+  %5 = firrtl.subfield %4[e] : !firrtl.bundle<e: vector<uint<3>, 2>>
+  %6 = firrtl.subindex %5[1] : !firrtl.vector<uint<3>, 2>
+  %7 = firrtl.subindex %5[0] : !firrtl.vector<uint<3>, 2>
+  %8 = firrtl.or %7, %3 : (!firrtl.uint<3>, !firrtl.uint<3>) -> !firrtl.uint<3>
+  %9 = firrtl.or %6, %2 : (!firrtl.uint<3>, !firrtl.uint<3>) -> !firrtl.uint<3>
+  %10 = firrtl.vectorcreate %8, %9 : (!firrtl.uint<3>, !firrtl.uint<3>) -> !firrtl.vector<uint<3>, 2>
+  %11 = firrtl.bundlecreate %10 : (!firrtl.vector<uint<3>, 2>) -> !firrtl.bundle<e: vector<uint<3>, 2>>
+  %12 = firrtl.vectorcreate %11 : (!firrtl.bundle<e: vector<uint<3>, 2>>) -> !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>
+  firrtl.strictconnect %c, %12 : !firrtl.vector<bundle<e: vector<uint<3>, 2>>, 1>
+}
+
 }
