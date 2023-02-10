@@ -78,14 +78,14 @@ firrtl.module @complex(in %p : !firrtl.uint<1>, in %q : !firrtl.uint<1>) {
   %w = firrtl.wire : !firrtl.uint<2>
 
   firrtl.when %p : !firrtl.uint<1> {
-    %c1_ui2 = firrtl.constant 1 : !firrtl.uint<2>
-    firrtl.connect %w, %c1_ui2 : !firrtl.uint<2>, !firrtl.uint<2>
+    %c1_ui2 = firrtl.constant 1 : !firrtl.const.uint<2>
+    firrtl.connect %w, %c1_ui2 : !firrtl.uint<2>, !firrtl.const.uint<2>
   }
 
   firrtl.when %q : !firrtl.uint<1> {
   } else {
-    %c1_ui2 = firrtl.constant 1 : !firrtl.uint<2>
-    firrtl.connect %w, %c1_ui2 : !firrtl.uint<2>, !firrtl.uint<2>
+    %c1_ui2 = firrtl.constant 1 : !firrtl.const.uint<2>
+    firrtl.connect %w, %c1_ui2 : !firrtl.uint<2>, !firrtl.const.uint<2>
   }
 }
 
@@ -140,7 +140,6 @@ firrtl.module @CheckInitialization(in %p : !firrtl.uint<1>, out %out: !firrtl.ve
 
 firrtl.circuit "CheckConstInitInNonConstCondition" {
 firrtl.module @CheckConstInitInNonConstCondition(in %p: !firrtl.uint<1>, in %in: !firrtl.const.uint<2>, out %out: !firrtl.const.uint<2>) {
-  // expected-error @+1 {{type mismatch between destination '!firrtl.const.uint<2>' and source '!firrtl.uint<2>'}}
   firrtl.when %p : !firrtl.uint<1> {
     // expected-error @+1 {{'const' sink "out" initialization is dependent on a non-'const' condition}}
     firrtl.connect %out, %in : !firrtl.const.uint<2>, !firrtl.const.uint<2>

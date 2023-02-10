@@ -114,7 +114,8 @@ void SFCCompatPass::runOnOperation() {
                       type, builder.getBoolAttr(false));
                 })
             .Case<IntType>([&](IntType type) -> Value {
-              return builder.create<ConstantOp>(type, getIntZerosAttr(type));
+              return builder.create<ConstantOp>(type.getConstType(true),
+                                                getIntZerosAttr(type));
             })
             .Case<BundleType, FVectorType>([&](auto type) -> Value {
               auto width = circt::firrtl::getBitWidth(type);
@@ -129,6 +130,10 @@ void SFCCompatPass::runOnOperation() {
     inv.replaceAllUsesWith(replacement);
     inv.erase();
     madeModifications = true;
+
+    if (isConst(replacement.getType()) &&
+        failed(propogateConstToUsersOf(replacement)))
+      signalPassFailure();
   }
 
   if (!madeModifications)
