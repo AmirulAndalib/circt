@@ -367,8 +367,8 @@ struct ESIPortsPass : public LowerESIPortsBase<ESIPortsPass> {
   void runOnOperation() override;
 
 private:
-  bool updateFunc(HWModuleOp mod);
-  void updateInstance(HWModuleOp mod, InstanceOp inst);
+  bool updateFunc(HWMutableModuleLike mod);
+  void updateInstance(HWMutableModuleLike mod, InstanceOp inst);
 
   bool updateFunc(HWModuleExternOp mod);
   void updateInstance(HWModuleExternOp mod, InstanceOp inst);
@@ -385,7 +385,8 @@ void ESIPortsPass::runOnOperation() {
   // Find all externmodules and try to modify them. Remember the modified ones.
   DenseMap<StringRef, HWModuleExternOp> externModsMutated;
   for (auto mod : top.getOps<HWModuleExternOp>())
-    if (updateFunc(mod))
+    if (mod->getAttrOfType<BoolAttr>(ExtModBundleSignalsAttrName).getValue() &&
+        updateFunc(mod))
       externModsMutated[mod.getName()] = mod;
 
   // Find all instances and update them.
@@ -397,10 +398,10 @@ void ESIPortsPass::runOnOperation() {
 
   // Find all modules and try to modify them to have wires with valid/ready
   // semantics. Remember the modified ones.
-  DenseMap<StringRef, HWModuleOp> modsMutated;
-  for (auto mod : top.getOps<HWModuleOp>())
+  DenseMap<StringAttr, HWModuleOp> modsMutated;
+  for (auto mod : top.getOps<HWMutableModuleLike>())
     if (updateFunc(mod))
-      modsMutated[mod.getName()] = mod;
+      modsMutated[SymbolTable::getSymbolName(mod)] = mod;
 
   // Find all instances and update them.
   top.walk([&modsMutated, this](InstanceOp inst) {
@@ -420,14 +421,19 @@ static StringAttr appendToRtlName(StringAttr base, StringRef suffix) {
 
 /// Convert all input and output ChannelTypes into valid/ready wires. Try not to
 /// change the order and materialize ops in reasonably intuitive locations.
-bool ESIPortsPass::updateFunc(HWModuleOp mod) {
-  auto funcType = mod.getFunctionType();
+bool ESIPortsPass::updateFunc(HWMutableModuleLike mod) {
+  // auto funcType = mod.getFunctionType();
+  Block *body = nullptr;
+  if (mod->getNumRegions() == 1 && mod->getRegion(0).getBlocks().size() == 1)
+    body = &mod->getRegion(0).getBlocks().front();
+
   // Build ops in the module.
-  ImplicitLocOpBuilder modBuilder(mod.getLoc(), mod.getBody());
+  ImplicitLocOpBuilder modBuilder(mod.getLoc(), mod);
   Type i1 = modBuilder.getI1Type();
 
   // Get information to be used later on.
-  hw::OutputOp outOp = cast<hw::OutputOp>(mod.getBodyBlock()->getTerminator());
+  // hw::OutputOp outOp =
+  // cast<hw::OutputOp>(mod.getBodyBlock()->getTerminator());
 
   bool updated = false;
 
@@ -442,8 +448,8 @@ bool ESIPortsPass::updateFunc(HWModuleOp mod) {
   SmallVector<Attribute> newArgNames;
   SmallVector<Attribute> newArgLocs;
 
-  for (size_t argNum = 0, blockArgNum = 0, e = mod.getNumArguments();
-       argNum < e; ++argNum, ++blockArgNum) {
+  for (size_t argNum = 0, blockArgNum = 0, e = mod.getNumInputs(); argNum < e;
+       ++argNum, ++blockArgNum) {
     Type argTy = funcType.getInput(argNum);
     auto argNameAttr = getModuleArgumentNameAttr(mod, argNum);
     auto argLocAttr = getModuleArgumentLocAttr(mod, argNum);
