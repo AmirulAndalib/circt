@@ -10,22 +10,56 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "circt/Analysis/ControlFlowLoopAnalysis.h"
+#include "circt/Analysis/DebugAnalysis.h"
 #include "circt/Analysis/DependenceAnalysis.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Analysis/OpCountAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
+#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Scheduling/Problems.h"
 #include "mlir/Dialect/Affine/IR/AffineMemoryOpInterfaces.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
+using namespace mlir::affine;
+using namespace circt;
 using namespace circt::analysis;
+using namespace circt::scheduling;
 
 //===----------------------------------------------------------------------===//
-// DependenceAnalysis passes.
+// DebugAnalysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct TestDebugAnalysisPass
+    : public PassWrapper<TestDebugAnalysisPass, OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestDebugAnalysisPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override { return "test-debug-analysis"; }
+  StringRef getDescription() const override {
+    return "Perform debug analysis and emit results as attributes";
+  }
+};
+} // namespace
+
+void TestDebugAnalysisPass::runOnOperation() {
+  auto *context = &getContext();
+  auto &analysis = getAnalysis<DebugAnalysis>();
+  for (auto *op : analysis.debugOps) {
+    op->setAttr("debug.only", UnitAttr::get(context));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// DependenceAnalysis
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -54,7 +88,7 @@ void TestDependenceAnalysisPass::runOnOperation() {
     SmallVector<Attribute> deps;
 
     for (auto dep : analysis.getDependences(op)) {
-      if (dep.dependenceType != mlir::DependenceResult::HasDependence)
+      if (dep.dependenceType != DependenceResult::HasDependence)
         continue;
 
       SmallVector<Attribute> comps;
@@ -76,7 +110,7 @@ void TestDependenceAnalysisPass::runOnOperation() {
 }
 
 //===----------------------------------------------------------------------===//
-// DependenceAnalysis passes.
+// SchedulingAnalysis
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -113,65 +147,7 @@ void TestSchedulingAnalysisPass::runOnOperation() {
 }
 
 //===----------------------------------------------------------------------===//
-// ControlFlowLoopAnalysis passes.
-//===----------------------------------------------------------------------===//
-
-namespace {
-struct TestControlFlowLoopAnalysisPass
-    : public PassWrapper<TestControlFlowLoopAnalysisPass,
-                         OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestControlFlowLoopAnalysisPass)
-
-  void runOnOperation() override;
-  StringRef getArgument() const override { return "test-cf-loop-analysis"; }
-  StringRef getDescription() const override {
-    return "Perform cf loop analysis and emit results as attributes";
-  }
-};
-} // namespace
-
-static SmallVector<Attribute> &
-lookupOrInsert(DenseMap<Block *, SmallVector<Attribute>> &map, Block *key) {
-  if (map.count(key) == 0) {
-    map.try_emplace(key, SmallVector<Attribute>());
-  }
-  return map.find(key)->getSecond();
-}
-
-void TestControlFlowLoopAnalysisPass::runOnOperation() {
-  Region &r = getOperation().getRegion();
-  ControlFlowLoopAnalysis analysis(r);
-  if (failed(analysis.analyzeRegion())) {
-    signalPassFailure();
-    return;
-  }
-  OpBuilder builder(r);
-  DenseMap<Block *, SmallVector<Attribute>> blockMap;
-  for (const LoopInfo &info : analysis.topLevelLoops) {
-    Block *header = info.loopHeader;
-    lookupOrInsert(blockMap, header).push_back(builder.getStringAttr("header"));
-
-    for (auto *latch : info.loopLatches)
-      lookupOrInsert(blockMap, latch).push_back(builder.getStringAttr("latch"));
-
-    for (auto *inLoop : info.inLoop)
-      lookupOrInsert(blockMap, inLoop)
-          .push_back(builder.getStringAttr("inLoop"));
-
-    for (auto *exit : info.exitBlocks)
-      lookupOrInsert(blockMap, exit).push_back(builder.getStringAttr("exit"));
-  }
-
-  for (auto it : blockMap) {
-    OperationState opState(builder.getUnknownLoc(), "block.info");
-    opState.addAttribute("loopInfo", builder.getArrayAttr(it.getSecond()));
-    builder.setInsertionPointToStart(it.getFirst());
-    builder.create(opState);
-  }
-}
-
-//===----------------------------------------------------------------------===//
-// InferTopModule passes.
+// InstanceGraph
 //===----------------------------------------------------------------------===//
 
 namespace {
@@ -198,10 +174,93 @@ void InferTopModulePass::runOnOperation() {
 
   llvm::SmallVector<Attribute, 4> attrs;
   for (auto *node : *res)
-    attrs.push_back(node->getModule().moduleNameAttr());
+    attrs.push_back(node->getModule().getModuleNameAttr());
 
   analysis.getParent()->setAttr("test.top",
                                 ArrayAttr::get(&getContext(), attrs));
+}
+
+//===----------------------------------------------------------------------===//
+// FIRRTL Instance Info
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct FIRRTLInstanceInfoPass
+    : public PassWrapper<FIRRTLInstanceInfoPass,
+                         OperationPass<firrtl::CircuitOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FIRRTLInstanceInfoPass)
+
+  void runOnOperation() override;
+  StringRef getArgument() const override { return "test-firrtl-instance-info"; }
+  StringRef getDescription() const override {
+    return "Run firrtl::InstanceInfo analysis and show the results.  This pass "
+           "is intended to be used for testing purposes only.";
+  }
+};
+} // namespace
+
+static llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const bool a) {
+  if (a)
+    return os << "true";
+  return os << "false";
+}
+
+static void printCircuitInfo(firrtl::CircuitOp op,
+                             firrtl::InstanceInfo &iInfo) {
+  OpPrintingFlags flags;
+  flags.skipRegions();
+  llvm::errs() << "  - operation: ";
+  op->print(llvm::errs(), flags);
+  llvm::errs() << "\n"
+               << "    hasDut: " << iInfo.hasDut() << "\n"
+               << "    dut: ";
+  if (auto dutNode = iInfo.getDut())
+    dutNode->print(llvm::errs(), flags);
+  else
+    llvm::errs() << "null";
+  llvm::errs() << "\n"
+               << "    effectiveDut: ";
+  iInfo.getEffectiveDut()->print(llvm::errs(), flags);
+  llvm::errs() << "\n";
+}
+
+static void printModuleInfo(igraph::ModuleOpInterface op,
+                            firrtl::InstanceInfo &iInfo) {
+  OpPrintingFlags flags;
+  flags.skipRegions();
+  llvm::errs() << "  - operation: ";
+  op->print(llvm::errs(), flags);
+  llvm::errs() << "\n"
+               << "    isDut: " << iInfo.isDut(op) << "\n"
+               << "    anyInstanceUnderDut: " << iInfo.anyInstanceUnderDut(op)
+               << "\n"
+               << "    allInstancesUnderDut: " << iInfo.allInstancesUnderDut(op)
+               << "\n"
+               << "    anyInstanceUnderEffectiveDut: "
+               << iInfo.anyInstanceUnderEffectiveDut(op) << "\n"
+               << "    allInstancesUnderEffectiveDut: "
+               << iInfo.allInstancesUnderEffectiveDut(op) << "\n"
+               << "    anyInstanceUnderLayer: "
+               << iInfo.anyInstanceUnderLayer(op) << "\n"
+               << "    allInstancesUnderLayer: "
+               << iInfo.allInstancesUnderLayer(op) << "\n"
+               << "    anyInstanceInDesign: " << iInfo.anyInstanceInDesign(op)
+               << "\n"
+               << "    allInstancesInDesign: " << iInfo.allInstancesInDesign(op)
+               << "\n"
+               << "    anyInstanceInEffectiveDesign: "
+               << iInfo.anyInstanceInEffectiveDesign(op) << "\n"
+               << "    allInstancesInEffectiveDesign: "
+               << iInfo.allInstancesInEffectiveDesign(op) << "\n";
+}
+
+void FIRRTLInstanceInfoPass::runOnOperation() {
+  auto &iInfo = getAnalysis<firrtl::InstanceInfo>();
+
+  printCircuitInfo(getOperation(), iInfo);
+  for (auto op :
+       getOperation().getBodyBlock()->getOps<igraph::ModuleOpInterface>())
+    printModuleInfo(op, iInfo);
 }
 
 //===----------------------------------------------------------------------===//
@@ -211,17 +270,20 @@ void InferTopModulePass::runOnOperation() {
 namespace circt {
 namespace test {
 void registerAnalysisTestPasses() {
-  mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+  registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestDependenceAnalysisPass>();
   });
-  mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+  registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<TestSchedulingAnalysisPass>();
   });
-  mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
-    return std::make_unique<TestControlFlowLoopAnalysisPass>();
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<TestDebugAnalysisPass>();
   });
-  mlir::registerPass([]() -> std::unique_ptr<::mlir::Pass> {
+  registerPass([]() -> std::unique_ptr<Pass> {
     return std::make_unique<InferTopModulePass>();
+  });
+  registerPass([]() -> std::unique_ptr<Pass> {
+    return std::make_unique<FIRRTLInstanceInfoPass>();
   });
 }
 } // namespace test

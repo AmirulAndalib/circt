@@ -9,31 +9,70 @@ add_compile_definitions("MLIR_PYTHON_PACKAGE_PREFIX=circt.")
 ################################################################################
 # Declare native Python extension
 ################################################################################
+set(LLVM_OPTIONAL_SOURCES
+  RTGTestModule.cpp
+)
 
+set(PYTHON_BINDINGS_SOURCES
+  CIRCTModule.cpp
+  ESIModule.cpp
+  HWModule.cpp
+  MSFTModule.cpp
+  OMModule.cpp
+  RTGModule.cpp
+  RTGToolModule.cpp
+  SeqModule.cpp
+  SupportModule.cpp
+  SVModule.cpp
+  # Headers must be included explicitly so they are installed.
+  CIRCTModules.h
+  PybindUtils.h
+)
+
+set(PYTHON_BINDINGS_LINK_LIBS
+  CIRCTCAPIArc
+  CIRCTCAPIComb
+  CIRCTCAPIConversion
+  CIRCTCAPIDC
+  CIRCTCAPIDebug
+  CIRCTCAPIEmit
+  CIRCTCAPIESI
+  CIRCTCAPIExportVerilog
+  CIRCTCAPIFSM
+  CIRCTCAPIHandshake
+  CIRCTCAPIHW
+  CIRCTCAPIHWArith
+  CIRCTCAPILTL
+  CIRCTCAPIMSFT
+  CIRCTCAPIOM
+  CIRCTCAPIRTG
+  CIRCTCAPIRtgTool
+  CIRCTCAPISeq
+  CIRCTCAPISMT
+  CIRCTCAPISV
+  CIRCTCAPIVerif
+  CIRCTCAPITransforms
+  # needed for mlirFrozenRewritePatternSetDestroy
+  # but not the actual passes
+  MLIRCAPITransforms
+)
+
+if (CIRCT_INCLUDE_TESTS)
+  list(APPEND PYTHON_BINDINGS_SOURCES RTGTestModule.cpp)
+  list(APPEND PYTHON_BINDINGS_LINK_LIBS CIRCTCAPIRTGTest)
+endif()
 
 declare_mlir_python_extension(CIRCTBindingsPythonExtension
   MODULE_NAME _circt
   SOURCES
-    CIRCTModule.cpp
-    ESIModule.cpp
-    HWModule.cpp
-    MSFTModule.cpp
-    SVModule.cpp
+    ${PYTHON_BINDINGS_SOURCES}
   EMBED_CAPI_LINK_LIBS
-    CIRCTCAPIComb
-    CIRCTCAPIESI
-    CIRCTCAPIMSFT
-    CIRCTCAPIHW
-    CIRCTCAPIHWArith
-    CIRCTCAPISeq
-    CIRCTCAPISV
-    CIRCTCAPIExportVerilog
-    CIRCTCAPIFSM
-    CIRCTCAPIHandshake
-    MLIRCAPITransforms
+    ${PYTHON_BINDINGS_LINK_LIBS}
   PRIVATE_LINK_LIBS
     LLVMSupport
 )
+
+add_dependencies(CIRCTBindingsPythonExtension circt-headers)
 
 ################################################################################
 # Declare Python sources
@@ -44,6 +83,7 @@ declare_mlir_python_sources(CIRCTBindingsPythonSources
   SOURCES
     __init__.py
     support.py
+    rtgtool_support.py
 )
 
 ################################################################################
@@ -63,8 +103,15 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/CombOps.td
   SOURCES
     dialects/comb.py
-    dialects/_comb_ops_ext.py
   DIALECT_NAME comb)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/DebugOps.td
+  SOURCES
+    dialects/debug.py
+  DIALECT_NAME dbg)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -72,8 +119,15 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/ESIOps.td
   SOURCES
     dialects/esi.py
-    dialects/_esi_ops_ext.py
   DIALECT_NAME esi)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/HandshakeOps.td
+  SOURCES
+    dialects/handshake.py
+  DIALECT_NAME handshake)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -81,7 +135,6 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/HWOps.td
   SOURCES
     dialects/hw.py
-    dialects/_hw_ops_ext.py
   DIALECT_NAME hw)
 
 declare_mlir_dialect_python_bindings(
@@ -90,8 +143,33 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/MSFTOps.td
   SOURCES
     dialects/msft.py
-    dialects/_msft_ops_ext.py
   DIALECT_NAME msft)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/OMOps.td
+  SOURCES
+    dialects/om.py
+  DIALECT_NAME om)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/RTGOps.td
+  SOURCES
+    dialects/rtg.py
+  DIALECT_NAME rtg)
+
+if (CIRCT_INCLUDE_TESTS)
+  declare_mlir_dialect_python_bindings(
+    ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+    ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+    TD_FILE dialects/RTGTestOps.td
+    SOURCES
+      dialects/rtgtest.py
+    DIALECT_NAME rtgtest)
+endif()
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -99,7 +177,6 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/SeqOps.td
   SOURCES
     dialects/seq.py
-    dialects/_seq_ops_ext.py
   DIALECT_NAME seq)
 
 declare_mlir_dialect_python_bindings(
@@ -108,7 +185,6 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/SVOps.td
   SOURCES
     dialects/sv.py
-    dialects/_sv_ops_ext.py
   DIALECT_NAME sv)
 
 declare_mlir_dialect_python_bindings(
@@ -117,7 +193,6 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/FSMOps.td
   SOURCES
     dialects/fsm.py
-    dialects/_fsm_ops_ext.py
   DIALECT_NAME fsm)
 
 declare_mlir_dialect_python_bindings(
@@ -126,8 +201,39 @@ declare_mlir_dialect_python_bindings(
   TD_FILE dialects/HWArithOps.td
   SOURCES
     dialects/hwarith.py
-    dialects/_hwarith_ops_ext.py
   DIALECT_NAME hwarith)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/LTLOps.td
+  SOURCES
+    dialects/ltl.py
+  DIALECT_NAME ltl)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/VerifOps.td
+  SOURCES
+    dialects/verif.py
+  DIALECT_NAME verif)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/SMTOps.td
+  SOURCES
+    dialects/smt.py
+  DIALECT_NAME smt)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/EmitOps.td
+  SOURCES
+    dialects/emit.py
+  DIALECT_NAME emit)
 
 ################################################################################
 # Build composite binaries

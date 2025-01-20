@@ -25,7 +25,7 @@ firrtl.circuit "Arithmetic" {
     // CHECK-DAG: %c0_i4 = hw.constant 0 : i4
     // CHECK-DAG: %false = hw.constant false
     // CHECK-NEXT: [[UIN3EXT:%.+]] = comb.concat %false, %uin3c : i1, i3
-    // CHECK-NEXT: [[ADDRES:%.+]] = comb.add bin %c0_i4, [[UIN3EXT]] : i4
+    // CHECK-NEXT: [[ADDRES:%.+]] = comb.add bin [[UIN3EXT]], %c0_i4 : i4
     %1 = firrtl.add %uin0c, %uin3c : (!firrtl.uint<0>, !firrtl.uint<3>) -> !firrtl.uint<4>
     firrtl.connect %out1, %1 : !firrtl.uint<4>, !firrtl.uint<4>
 
@@ -77,6 +77,16 @@ firrtl.circuit "Arithmetic" {
     firrtl.connect %wire, %sin0c : !firrtl.sint<0>, !firrtl.sint<0>
 
     // CHECK-NEXT: hw.output
+  }
+
+  // Check that a zero-width value shifted right produces a zero.
+  // See: https://github.com/llvm/circt/issues/6652
+  // CHECK-LABEL: hw.module @ShrZW
+  firrtl.module @ShrZW(in %x: !firrtl.uint<0>, out %out: !firrtl.uint<1>) attributes {convention = #firrtl<convention scalarized>} {
+    %0 = firrtl.shr %x, 5 : (!firrtl.uint<0>) -> !firrtl.uint<0>
+    firrtl.connect %out, %0 : !firrtl.uint<1>, !firrtl.uint<0>
+    // CHECK:      %[[false:.+]] = hw.constant false
+    // CHECK-NEXT: hw.output %false
   }
 
 }

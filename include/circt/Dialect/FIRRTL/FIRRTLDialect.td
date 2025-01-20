@@ -26,17 +26,18 @@ def FIRRTLDialect : Dialect {
   let summary = "Types and operations for firrtl dialect";
   let description = [{
     This dialect defines the `firrtl` dialect, which is used to lower from Chisel
-    code to Verilog.  For more information, see the [FIRRTL GitHub
-    page](https://github.com/freechipsproject/firrtl).
+    code to Verilog.  For more information, see the [FIRRTL Spec
+    page](https://github.com/chipsalliance/firrtl-spec).
   }];
 
   let hasConstantMaterializer = 1;
   let useDefaultTypePrinterParser = 0;
   let useDefaultAttributePrinterParser = 1;
-  let useFoldAPI = kEmitFoldAdaptorFolder;
 
   let dependentDialects = [
-    "circt::hw::HWDialect"
+    "circt::hw::HWDialect",
+    "circt::om::OMDialect",
+    "circt::sv::SVDialect"
   ];
 
   let extraClassDeclaration = [{

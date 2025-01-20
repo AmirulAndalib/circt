@@ -8,9 +8,16 @@ add_circt_conversion_library(CIRCTMooreToCore
   Core
 
   LINK_LIBS PUBLIC
-  CIRCTMoore
-  CIRCTLLHD
-  CIRCTHW
   CIRCTComb
+  CIRCTDebug
+  CIRCTHW
+  CIRCTLLHD
+  CIRCTMoore
+  CIRCTSim
+  CIRCTVerif
+  MLIRControlFlowDialect
+  MLIRFuncDialect
+  MLIRSCFDialect
+  MLIRSideEffectInterfaces
   MLIRTransforms
 )

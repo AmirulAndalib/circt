@@ -6,17 +6,31 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "DialectModules.h"
+#include "CIRCTModules.h"
 
+#include "circt-c/Conversion.h"
+#include "circt-c/Dialect/Arc.h"
 #include "circt-c/Dialect/Comb.h"
+#include "circt-c/Dialect/DC.h"
+#include "circt-c/Dialect/Debug.h"
 #include "circt-c/Dialect/ESI.h"
+#include "circt-c/Dialect/Emit.h"
 #include "circt-c/Dialect/FSM.h"
 #include "circt-c/Dialect/HW.h"
 #include "circt-c/Dialect/HWArith.h"
 #include "circt-c/Dialect/Handshake.h"
+#include "circt-c/Dialect/LTL.h"
 #include "circt-c/Dialect/MSFT.h"
+#include "circt-c/Dialect/OM.h"
+#include "circt-c/Dialect/RTG.h"
+#include "circt-c/Transforms.h"
+#ifdef CIRCT_INCLUDE_TESTS
+#include "circt-c/Dialect/RTGTest.h"
+#endif
+#include "circt-c/Dialect/SMT.h"
 #include "circt-c/Dialect/SV.h"
 #include "circt-c/Dialect/Seq.h"
+#include "circt-c/Dialect/Verif.h"
 #include "circt-c/ExportVerilog.h"
 #include "mlir-c/Bindings/Python/Interop.h"
 #include "mlir-c/IR.h"
@@ -31,12 +45,18 @@
 namespace py = pybind11;
 
 static void registerPasses() {
+  registerArcPasses();
+  registerCombPasses();
+  registerDCPasses();
   registerSeqPasses();
   registerSVPasses();
   registerFSMPasses();
   registerHWArithPasses();
+  registerHWPasses();
   registerHandshakePasses();
-  mlirRegisterTransformsPasses();
+  mlirRegisterCIRCTConversionPasses();
+  mlirRegisterCIRCTTransformsPasses();
+  mlirRegisterTransformsCSE();
 }
 
 PYBIND11_MODULE(_circt, m) {
@@ -57,6 +77,14 @@ PYBIND11_MODULE(_circt, m) {
         mlirDialectHandleRegisterDialect(comb, context);
         mlirDialectHandleLoadDialect(comb, context);
 
+        MlirDialectHandle debug = mlirGetDialectHandle__debug__();
+        mlirDialectHandleRegisterDialect(debug, context);
+        mlirDialectHandleLoadDialect(debug, context);
+
+        MlirDialectHandle emit = mlirGetDialectHandle__emit__();
+        mlirDialectHandleRegisterDialect(emit, context);
+        mlirDialectHandleLoadDialect(emit, context);
+
         MlirDialectHandle esi = mlirGetDialectHandle__esi__();
         mlirDialectHandleRegisterDialect(esi, context);
         mlirDialectHandleLoadDialect(esi, context);
@@ -73,6 +101,20 @@ PYBIND11_MODULE(_circt, m) {
         mlirDialectHandleRegisterDialect(hwarith, context);
         mlirDialectHandleLoadDialect(hwarith, context);
 
+        MlirDialectHandle om = mlirGetDialectHandle__om__();
+        mlirDialectHandleRegisterDialect(om, context);
+        mlirDialectHandleLoadDialect(om, context);
+
+        MlirDialectHandle rtg = mlirGetDialectHandle__rtg__();
+        mlirDialectHandleRegisterDialect(rtg, context);
+        mlirDialectHandleLoadDialect(rtg, context);
+
+#ifdef CIRCT_INCLUDE_TESTS
+        MlirDialectHandle rtgtest = mlirGetDialectHandle__rtgtest__();
+        mlirDialectHandleRegisterDialect(rtgtest, context);
+        mlirDialectHandleLoadDialect(rtgtest, context);
+#endif
+
         MlirDialectHandle seq = mlirGetDialectHandle__seq__();
         mlirDialectHandleRegisterDialect(seq, context);
         mlirDialectHandleLoadDialect(seq, context);
@@ -88,6 +130,18 @@ PYBIND11_MODULE(_circt, m) {
         MlirDialectHandle handshake = mlirGetDialectHandle__handshake__();
         mlirDialectHandleRegisterDialect(handshake, context);
         mlirDialectHandleLoadDialect(handshake, context);
+
+        MlirDialectHandle ltl = mlirGetDialectHandle__ltl__();
+        mlirDialectHandleRegisterDialect(ltl, context);
+        mlirDialectHandleLoadDialect(ltl, context);
+
+        MlirDialectHandle verif = mlirGetDialectHandle__verif__();
+        mlirDialectHandleRegisterDialect(verif, context);
+        mlirDialectHandleLoadDialect(verif, context);
+
+        MlirDialectHandle smt = mlirGetDialectHandle__smt__();
+        mlirDialectHandleRegisterDialect(smt, context);
+        mlirDialectHandleLoadDialect(smt, context);
       },
       "Register CIRCT dialects on a PyMlirContext.");
 
@@ -108,6 +162,20 @@ PYBIND11_MODULE(_circt, m) {
   circt::python::populateDialectMSFTSubmodule(msft);
   py::module hw = m.def_submodule("_hw", "HW API");
   circt::python::populateDialectHWSubmodule(hw);
+  py::module seq = m.def_submodule("_seq", "Seq API");
+  circt::python::populateDialectSeqSubmodule(seq);
+  py::module om = m.def_submodule("_om", "OM API");
+  circt::python::populateDialectOMSubmodule(om);
+  py::module rtg = m.def_submodule("_rtg", "RTG API");
+  circt::python::populateDialectRTGSubmodule(rtg);
+  py::module rtgtool = m.def_submodule("_rtgtool", "RTGTool API");
+  circt::python::populateDialectRTGToolSubmodule(rtgtool);
+#ifdef CIRCT_INCLUDE_TESTS
+  py::module rtgtest = m.def_submodule("_rtgtest", "RTGTest API");
+  circt::python::populateDialectRTGTestSubmodule(rtgtest);
+#endif
   py::module sv = m.def_submodule("_sv", "SV API");
   circt::python::populateDialectSVSubmodule(sv);
+  py::module support = m.def_submodule("_support", "CIRCT support");
+  circt::python::populateSupportSubmodule(support);
 }

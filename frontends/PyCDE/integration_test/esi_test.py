@@ -1,131 +1,159 @@
-# REQUIRES: esi-cosim, rtl-sim
+# REQUIRES: esi-runtime, esi-cosim, rtl-sim
 # RUN: rm -rf %t
+# RUN: mkdir %t && cd %t
 # RUN: %PYTHON% %s %t 2>&1
-# RUN: esi-cosim-runner.py --no-aux-files --tmpdir %t --schema %t/runtime/schema.capnp %s `ls %t/hw/*.sv | grep -v driver.sv`
-# PY: from esi_test import run_cosim
-# PY: run_cosim(tmpdir, rpcschemapath, simhostport)
+# RUN: esi-cosim.py -- %PYTHON% %S/test_software/esi_test.py cosim env
 
 import pycde
-from pycde import (Clock, Input, InputChannel, OutputChannel, Module, generator,
-                   types)
-from pycde import esi
-from pycde.constructs import Wire
+from pycde import (AppID, Clock, Module, Reset, modparams, generator)
+from pycde.bsp import get_bsp
+from pycde.common import Constant, Input, Output
+from pycde.constructs import ControlReg, Reg, Wire
+from pycde.esi import ChannelService, FuncService, MMIO, MMIOReadWriteCmdType
+from pycde.types import (Bits, Channel, UInt)
+from pycde.behavioral import If, Else, EndIf
+from pycde.handshake import Func
 
 import sys
 
 
-@esi.ServiceDecl
-class HostComms:
-  to_host = esi.ToServer(types.any)
-  from_host = esi.FromServer(types.any)
-  req_resp = esi.ToFromServer(to_server_type=types.i16,
-                              to_client_type=types.i32)
+class LoopbackInOutAdd(Module):
+  """Loopback the request from the host, adding 7 to the first 15 bits."""
+  clk = Clock()
+  rst = Reset()
 
-
-class Producer(Module):
-  clk = Input(types.i1)
-  int_out = OutputChannel(types.i32)
+  add_amt = Constant(UInt(16), 11)
 
   @generator
   def construct(ports):
-    chan = HostComms.from_host("loopback_in", types.i32)
-    ports.int_out = chan
+    loopback = Wire(Channel(UInt(16)))
+    args = FuncService.get_call_chans(AppID("add"),
+                                      arg_type=UInt(24),
+                                      result=loopback)
 
-
-class Consumer(Module):
-  clk = Input(types.i1)
-  int_in = InputChannel(types.i32)
-
-  @generator
-  def construct(ports):
-    HostComms.to_host(ports.int_in, "loopback_out")
-
-
-class LoopbackInOutAdd7(Module):
-
-  @generator
-  def construct(ports):
-    loopback = Wire(types.channel(types.i16))
-    from_host = HostComms.req_resp(loopback, "loopback_inout")
-    ready = Wire(types.i1)
-    data, valid = from_host.unwrap(ready)
-    plus7 = data.as_uint(15) + types.ui8(7)
-    data_chan, data_ready = loopback.type.wrap(plus7.as_bits(), valid)
+    ready = Wire(Bits(1))
+    data, valid = args.unwrap(ready)
+    plus7 = data + LoopbackInOutAdd.add_amt.value
+    data_chan, data_ready = loopback.type.wrap(plus7.as_uint(16), valid)
+    data_chan_buffered = data_chan.buffer(ports.clk, ports.rst, 5)
     ready.assign(data_ready)
-    loopback.assign(data_chan)
+    loopback.assign(data_chan_buffered)
 
 
-class Mid(Module):
-  clk = Clock(types.i1)
-  rst = Input(types.i1)
+@modparams
+def MMIOClient(add_amt: int):
+
+  class MMIOClient(Module):
+    """A module which requests an MMIO address space and upon an MMIO read
+    request, returns the <address offset into its space> + add_amt."""
+
+    @generator
+    def build(ports):
+      mmio_read_bundle = MMIO.read(appid=AppID("mmio_client", add_amt))
+
+      address_chan_wire = Wire(Channel(UInt(32)))
+      address, address_valid = address_chan_wire.unwrap(1)
+      response_data = (address + add_amt).as_bits(64)
+      response_chan, response_ready = Channel(Bits(64)).wrap(
+          response_data, address_valid)
+
+      address_chan = mmio_read_bundle.unpack(data=response_chan)['offset']
+      address_chan_wire.assign(address_chan)
+
+  return MMIOClient
+
+
+class MMIOReadWriteClient(Module):
+  clk = Clock()
+  rst = Reset()
+
+  @generator
+  def build(ports):
+    mmio_read_write_bundle = MMIO.read_write(appid=AppID("mmio_rw_client"))
+
+    cmd_chan_wire = Wire(Channel(MMIOReadWriteCmdType))
+    resp_ready_wire = Wire(Bits(1))
+    cmd, cmd_valid = cmd_chan_wire.unwrap(resp_ready_wire)
+
+    add_amt = Reg(UInt(64),
+                  name="add_amt",
+                  clk=ports.clk,
+                  rst=ports.rst,
+                  rst_value=0,
+                  ce=cmd_valid & cmd.write & (cmd.offset == 0x8).as_bits())
+    add_amt.assign(cmd.data.as_uint())
+    with If(cmd.write):
+      response_data = Bits(64)(0)
+    with Else():
+      response_data = (cmd.offset + add_amt).as_bits(64)
+    EndIf()
+    response_chan, response_ready = Channel(Bits(64)).wrap(
+        response_data, cmd_valid)
+    resp_ready_wire.assign(response_ready)
+
+    cmd_chan = mmio_read_write_bundle.unpack(data=response_chan)['cmd']
+    cmd_chan_wire.assign(cmd_chan)
+
+
+class ConstProducer(Module):
+  clk = Clock()
+  rst = Reset()
 
   @generator
   def construct(ports):
-    p = Producer(clk=ports.clk)
-    Consumer(clk=ports.clk, int_in=p.int_out)
+    const = UInt(32)(42)
+    xact = Wire(Bits(1))
+    valid = ~ControlReg(ports.clk, ports.rst, [xact], [Bits(1)(0)])
+    ch, ready = Channel(UInt(32)).wrap(const, valid)
+    xact.assign(ready & valid)
+    ChannelService.to_host(AppID("const_producer"), ch)
 
-    LoopbackInOutAdd7()
+
+class JoinAddFunc(Func):
+  # This test is broken since the DC dialect flow is broken. Leaving the code
+  # here in case it gets fixed in the future.
+  # https://github.com/llvm/circt/issues/7949 is the latest layer of the onion.
+
+  a = Input(UInt(32))
+  b = Input(UInt(32))
+  x = Output(UInt(32))
+
+  @generator
+  def construct(ports):
+    ports.x = (ports.a + ports.b).as_uint(32)
+
+
+class Join(Module):
+  # This test is broken since the JoinAddFunc function is broken.
+  clk = Clock()
+  rst = Reset()
+
+  @generator
+  def construct(ports):
+    a = ChannelService.from_host(AppID("join_a"), UInt(32))
+    b = ChannelService.from_host(AppID("join_b"), UInt(32))
+    f = JoinAddFunc(clk=ports.clk, rst=ports.rst, a=a, b=b)
+    ChannelService.to_host(AppID("join_x"), f.x)
 
 
 class Top(Module):
-  clk = Clock(types.i1)
-  rst = Input(types.i1)
+  clk = Clock()
+  rst = Reset()
 
   @generator
   def construct(ports):
-    Mid(clk=ports.clk, rst=ports.rst)
+    LoopbackInOutAdd(clk=ports.clk, rst=ports.rst, appid=AppID("loopback"))
+    for i in range(4, 18, 5):
+      MMIOClient(i)()
+    MMIOReadWriteClient(clk=ports.clk, rst=ports.rst)
+    ConstProducer(clk=ports.clk, rst=ports.rst)
+
+    # Disable broken test.
+    # Join(clk=ports.clk, rst=ports.rst)
 
 
 if __name__ == "__main__":
-  s = pycde.System(esi.CosimBSP(Top),
-                   name="ESILoopback",
-                   output_directory=sys.argv[1],
-                   sw_api_langs=["python"])
+  bsp = get_bsp(sys.argv[2] if len(sys.argv) > 2 else None)
+  s = pycde.System(bsp(Top), name="ESILoopback", output_directory=sys.argv[1])
   s.compile()
   s.package()
-
-
-def run_cosim(tmpdir, schema_path, rpchostport):
-  import os
-  import time
-  sys.path.append(os.path.join(tmpdir, "runtime"))
-  import ESILoopback as esi_sys
-  from ESILoopback.common import Cosim
-
-  top = esi_sys.top(Cosim(schema_path, rpchostport))
-
-  assert top.bsp.req_resp_read_any() is None
-  assert top.bsp.req_resp[0].read(blocking_timeout=None) is None
-  assert top.bsp.to_host_read_any() is None
-  assert top.bsp.to_host[0].read(blocking_timeout=None) is None
-
-  assert top.bsp.req_resp[0].write(5) is True
-  time.sleep(0.05)
-  assert top.bsp.to_host_read_any() is None
-  assert top.bsp.to_host[0].read(blocking_timeout=None) is None
-  assert top.bsp.req_resp[0].read() == 12
-  assert top.bsp.req_resp[0].read(blocking_timeout=None) is None
-
-  assert top.bsp.req_resp[0].write(9) is True
-  time.sleep(0.05)
-  assert top.bsp.to_host_read_any() is None
-  assert top.bsp.to_host[0].read(blocking_timeout=None) is None
-  assert top.bsp.req_resp_read_any() == 16
-  assert top.bsp.req_resp_read_any() is None
-  assert top.bsp.req_resp[0].read(blocking_timeout=None) is None
-
-  assert top.bsp.from_host[0].write(9) is True
-  time.sleep(0.05)
-  assert top.bsp.req_resp_read_any() is None
-  assert top.bsp.req_resp[0].read(blocking_timeout=None) is None
-  assert top.bsp.to_host_read_any() == 9
-  assert top.bsp.to_host[0].read(blocking_timeout=None) is None
-
-  assert top.bsp.from_host[0].write(9) is True
-  time.sleep(0.05)
-  assert top.bsp.req_resp_read_any() is None
-  assert top.bsp.req_resp[0].read(blocking_timeout=None) is None
-  assert top.bsp.to_host[0].read() == 9
-  assert top.bsp.to_host_read_any() is None
-
-  print("Success: all tests pass!")

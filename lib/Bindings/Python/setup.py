@@ -6,9 +6,9 @@
 # Note that this includes a relatively large build of LLVM (~2400 C++ files)
 # and can take a considerable amount of time, especially with defaults.
 # To install:
-#   pip install . --use-feature=in-tree-build
+#   pip install .
 # To build a wheel:
-#   pip wheel . --use-feature=in-tree-build
+#   pip wheel .
 #
 # It is recommended to build with Ninja and ccache. To do so, set environment
 # variables by prefixing to above invocations:
@@ -64,9 +64,22 @@ class CMakeBuild(build_py):
     llvm_dir = os.getenv("CIRCT_LLVM_DIR")
     if not llvm_dir:
       llvm_dir = os.path.join(circt_dir, "llvm", "llvm")
+
+    # Use Ninja if available.
+    exist_ninja = shutil.which("ninja") is not None
+    cmake_generator = ["-G", "Ninja"] if exist_ninja else []
+
+    # Use lld if available.
+    exist_lld = shutil.which("lld") is not None
+    cmake_linker = ["-DLLVM_USE_LINKER=lld"] if exist_lld else []
     cmake_args = [
         "-DCMAKE_BUILD_TYPE=Release",  # not used on MSVC, but no harm
         "-DCMAKE_INSTALL_PREFIX={}".format(os.path.abspath(cmake_install_dir)),
+        # Use the minimum macOS deployment target that supports all c++17
+        # features.
+        #
+        # See: Notes column of https://developer.apple.com/xcode/cpp/#c++17
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15",
         "-DPython3_EXECUTABLE={}".format(sys.executable.replace("\\", "/")),
         "-DLLVM_ENABLE_PROJECTS=mlir",
         "-DLLVM_EXTERNAL_PROJECTS=circt",
@@ -74,7 +87,9 @@ class CMakeBuild(build_py):
         "-DLLVM_TARGETS_TO_BUILD=host",
         "-DMLIR_ENABLE_BINDINGS_PYTHON=ON",
         "-DCIRCT_BINDINGS_PYTHON_ENABLED=ON",
-    ]
+        "-DCIRCT_RELEASE_TAG_ENABLED=ON",
+        "-DCIRCT_RELEASE_TAG=firtool"
+    ] + cmake_linker + cmake_generator
 
     # HACK: CMake fails to auto-detect static linked Python installations, which
     # happens to be what exists on manylinux. We detect this and give it a dummy
@@ -119,7 +134,7 @@ class NoopBuildExtension(build_ext):
 
 
 setup(
-    name="circt-python",
+    name="circt",
     version="0.0.1",
     author="Mike Urbach",
     author_email="mikeurbach@gmail.com",

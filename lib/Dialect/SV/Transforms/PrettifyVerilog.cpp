@@ -18,24 +18,31 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Support/LoweringOptions.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
 
-using namespace circt;
+namespace circt {
+namespace sv {
+#define GEN_PASS_DEF_PRETTIFYVERILOG
+#include "circt/Dialect/SV/SVPasses.h.inc"
+} // namespace sv
+} // namespace circt
 
+using namespace circt;
 //===----------------------------------------------------------------------===//
 // PrettifyVerilogPass
 //===----------------------------------------------------------------------===//
 
 namespace {
 struct PrettifyVerilogPass
-    : public sv::PrettifyVerilogBase<PrettifyVerilogPass> {
+    : public circt::sv::impl::PrettifyVerilogBase<PrettifyVerilogPass> {
   void runOnOperation() override;
 
 private:
@@ -97,7 +104,7 @@ static bool isSelfWrite(Value dst, Value src) {
         auto toField = dyn_cast<sv::StructFieldInOutOp>(dstOp);
         if (!toField)
           return false;
-        if (toField.getField() != extract.getField())
+        if (toField.getFieldAttr() != extract.getFieldNameAttr())
           return false;
         return isSelfWrite(toField.getInput(), extract.getInput());
       })
@@ -126,7 +133,7 @@ bool PrettifyVerilogPass::splitStructAssignment(OpBuilder &builder,
     // Inner injects are overwritten by outer injects.
     // Insert does not overwrite the store to be lowered.
     auto field = std::make_pair(inj.getLoc(), inj.getNewValue());
-    fields.try_emplace(inj.getFieldAttr(), field);
+    fields.try_emplace(inj.getFieldNameAttr(), field);
     src = inj.getInput();
   }
 
@@ -160,9 +167,9 @@ bool PrettifyVerilogPass::splitArrayAssignment(OpBuilder &builder,
     // TODO: consider breaking up array assignments into assignments
     // to individual fields.
     auto ty = hw::type_cast<hw::ArrayType>(op.getType());
-    if (ty.getSize() != 1)
+    if (ty.getNumElements() != 1)
       return false;
-    APInt zero(std::max(1u, llvm::Log2_64_Ceil(ty.getSize())), 0);
+    APInt zero(std::max(1u, llvm::Log2_64_Ceil(ty.getNumElements())), 0);
 
     Value value = op.getInputs()[0];
     auto loc = op.getLoc();
@@ -191,7 +198,8 @@ bool PrettifyVerilogPass::splitArrayAssignment(OpBuilder &builder,
       auto midL = dyn_cast_or_null<hw::ArrayCreateOp>(c[1].getDefiningOp());
       auto midR = dyn_cast_or_null<hw::ArrayCreateOp>(c[0].getDefiningOp());
 
-      auto size = hw::type_cast<hw::ArrayType>(concat.getType()).getSize();
+      auto size =
+          hw::type_cast<hw::ArrayType>(concat.getType()).getNumElements();
       if (lhs && midR) {
         auto baseIdx = getInt(lhs.getLowIndex());
         if (!baseIdx || *baseIdx != 0 || midR.getInputs().size() != 1)
@@ -228,7 +236,8 @@ bool PrettifyVerilogPass::splitArrayAssignment(OpBuilder &builder,
       if (arr != rhs.getInput() || arr.getType() != concat.getType())
         break;
 
-      auto lhsSize = hw::type_cast<hw::ArrayType>(lhs.getType()).getSize();
+      auto lhsSize =
+          hw::type_cast<hw::ArrayType>(lhs.getType()).getNumElements();
       auto lhsIdx = getInt(lhs.getLowIndex());
       auto rhsIdx = getInt(rhs.getLowIndex());
       if (!lhsIdx || *lhsIdx != 0)
@@ -339,8 +348,12 @@ bool PrettifyVerilogPass::prettifyUnaryOperator(Operation *op) {
   for (auto *user : op->getUsers()) {
     if (isa<comb::ExtractOp, hw::ArraySliceOp>(user))
       return false;
+    // TODO: We should use the condition used in ExportVerilog regarding
+    // allowExprInEventControl.
     if (!options.allowExprInEventControl &&
-        isa<sv::AlwaysFFOp, sv::AlwaysOp>(user))
+        isa<sv::AlwaysFFOp, sv::AlwaysOp, sv::AssertConcurrentOp,
+            sv::AssumeConcurrentOp, sv::CoverConcurrentOp, sv::AssertPropertyOp,
+            sv::AssumePropertyOp, sv::CoverPropertyOp>(user))
       return false;
   }
 

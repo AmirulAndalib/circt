@@ -91,10 +91,11 @@ ParseResult ConstantOp::parse(OpAsmParser &parser, OperationState &result) {
 LogicalResult AddOp::inferReturnTypes(MLIRContext *context,
                                       std::optional<Location> loc,
                                       ValueRange operands, DictionaryAttr attrs,
+                                      mlir::OpaqueProperties properties,
                                       mlir::RegionRange regions,
                                       SmallVectorImpl<Type> &results) {
-  auto lhs = operands[0].getType().cast<IntegerType>();
-  auto rhs = operands[1].getType().cast<IntegerType>();
+  auto lhs = cast<IntegerType>(operands[0].getType());
+  auto rhs = cast<IntegerType>(operands[1].getType());
   IntegerType::SignednessSemantics signedness;
   unsigned resultWidth = inferAddResultType(signedness, lhs, rhs);
 
@@ -109,10 +110,11 @@ LogicalResult AddOp::inferReturnTypes(MLIRContext *context,
 LogicalResult SubOp::inferReturnTypes(MLIRContext *context,
                                       std::optional<Location> loc,
                                       ValueRange operands, DictionaryAttr attrs,
+                                      mlir::OpaqueProperties properties,
                                       mlir::RegionRange regions,
                                       SmallVectorImpl<Type> &results) {
-  auto lhs = operands[0].getType().cast<IntegerType>();
-  auto rhs = operands[1].getType().cast<IntegerType>();
+  auto lhs = cast<IntegerType>(operands[0].getType());
+  auto rhs = cast<IntegerType>(operands[1].getType());
   // The result type rules are identical to the ones for an addition
   // With one exception: all results are signed!
   IntegerType::SignednessSemantics signedness;
@@ -142,10 +144,11 @@ getSignedInheritedSignedness(IntegerType lhs, IntegerType rhs) {
 LogicalResult MulOp::inferReturnTypes(MLIRContext *context,
                                       std::optional<Location> loc,
                                       ValueRange operands, DictionaryAttr attrs,
+                                      mlir::OpaqueProperties properties,
                                       mlir::RegionRange regions,
                                       SmallVectorImpl<Type> &results) {
-  auto lhs = operands[0].getType().cast<IntegerType>();
-  auto rhs = operands[1].getType().cast<IntegerType>();
+  auto lhs = cast<IntegerType>(operands[0].getType());
+  auto rhs = cast<IntegerType>(operands[1].getType());
   // the result width stays the same no matter the signedness
   unsigned resultWidth = lhs.getWidth() + rhs.getWidth();
   IntegerType::SignednessSemantics signedness =
@@ -162,10 +165,11 @@ LogicalResult MulOp::inferReturnTypes(MLIRContext *context,
 LogicalResult DivOp::inferReturnTypes(MLIRContext *context,
                                       std::optional<Location> loc,
                                       ValueRange operands, DictionaryAttr attrs,
+                                      mlir::OpaqueProperties properties,
                                       mlir::RegionRange regions,
                                       SmallVectorImpl<Type> &results) {
-  auto lhs = operands[0].getType().cast<IntegerType>();
-  auto rhs = operands[1].getType().cast<IntegerType>();
+  auto lhs = cast<IntegerType>(operands[0].getType());
+  auto rhs = cast<IntegerType>(operands[1].getType());
   // The result width is always at least as large as the bit width of lhs
   unsigned resultWidth = lhs.getWidth();
 

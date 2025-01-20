@@ -16,6 +16,8 @@
 include "FIRRTLDialect.td"
 include "mlir/IR/EnumAttr.td"
 
+let cppNamespace = "::circt::firrtl" in {
+
 //===----------------------------------------------------------------------===//
 // Name Kinds
 //===----------------------------------------------------------------------===//
@@ -28,10 +30,50 @@ def InterestingName: I32EnumAttrCase<"InterestingName", 1, "interesting_name">;
 def NameKindEnumImpl: I32EnumAttr<"NameKindEnum", "name kind",
               [DroppableName, InterestingName]> {
   let genSpecializedAttr = 0;
-  let cppNamespace = "::circt::firrtl";
 }
 
 def NameKindAttr: EnumAttr<FIRRTLDialect, NameKindEnumImpl, "name_kind">;
+
+//===----------------------------------------------------------------------===//
+// Module Instantiation Conventions
+//===----------------------------------------------------------------------===//
+
+def Convention : I32EnumAttr<"Convention", "lowering convention", [
+                           I32EnumAttrCase<"Internal", 0, "internal">,
+                           I32EnumAttrCase<"Scalarized", 1, "scalarized">]> {
+  let genSpecializedAttr = 0;
+}
+
+def ConventionAttr : EnumAttr<FIRRTLDialect, Convention, "convention">;
+
+//===----------------------------------------------------------------------===//
+// Layer Lowering Conventions
+//===----------------------------------------------------------------------===//
+
+def LayerConvention : I32EnumAttr<"LayerConvention", "layer convention", [
+  I32EnumAttrCase<"Bind", 0, "bind">,
+  I32EnumAttrCase<"Inline", 1, "inline">
+]> {
+
+  let genSpecializedAttr = 0;
+}
+
+def LayerConventionAttr : EnumAttr<FIRRTLDialect, LayerConvention, "layerconvention">;
+
+//===----------------------------------------------------------------------===//
+// Layer Specialization
+//===----------------------------------------------------------------------===//
+
+def LayerSpecialization :
+    I32EnumAttr<"LayerSpecialization", "layer specialization", [
+  I32EnumAttrCase<"Enable", 0, "enable">,
+  I32EnumAttrCase<"Disable", 1, "disable">
+]> {
+  let genSpecializedAttr = 0;
+}
+
+def LayerSpecializationAttr :
+    EnumAttr<FIRRTLDialect, LayerSpecialization, "layerspecialization">;
 
 //===----------------------------------------------------------------------===//
 // Read Under Write Behaviour
@@ -70,5 +112,19 @@ def AtEdge   : I32EnumAttrCase<"AtEdge", 2, "edge">;
 
 def EventControlAttr : I32EnumAttr<"EventControl", "edge control trigger",
                                    [AtPosEdge, AtNegEdge, AtEdge]>  {}
+
+//===----------------------------------------------------------------------===//
+// OM Targets
+//===----------------------------------------------------------------------===//
+
+def DontTouch : I32EnumAttrCase<"DontTouch", 0, "dont_touch">;
+def Instance : I32EnumAttrCase<"Instance", 1, "instance">;
+def MemberInstance: I32EnumAttrCase<"MemberInstance", 2, "member_instance">;
+def MemberReference: I32EnumAttrCase<"MemberReference", 3, "member_reference">;
+def Reference: I32EnumAttrCase<"Reference", 4, "reference">;
+def TargetKind : I32EnumAttr<"TargetKind", "object model target kind",
+  [DontTouch, Instance, MemberInstance, MemberReference, Reference]>  {}
+
+}
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLENUMS_TD

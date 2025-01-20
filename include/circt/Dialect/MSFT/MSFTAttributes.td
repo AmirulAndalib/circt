@@ -11,7 +11,7 @@ include "mlir/IR/EnumAttr.td"
 // "Forward-declare" these HW attributes rather than including or duplicating
 // them here. This lets us to refer to them in ODS, but delegates to HW in C++.
 // These are used to represent parameters to MSFTModuleExternOp.
-def ParamDeclAttr : Attr<CPred<"$_self.isa<hw::ParamDeclAttr>()">>;
+def ParamDeclAttr : Attr<CPred<"llvm::isa<hw::ParamDeclAttr>($_self)">>;
 def ParamDeclArrayAttr : TypedArrayAttrBase<ParamDeclAttr, "parameter array">;
 
 def PrimitiveType : I32EnumAttr<"PrimitiveType",
@@ -72,18 +72,4 @@ def LocationVector : MSFT_Attr<"LocationVector"> {
 
   let hasCustomAssemblyFormat = 1;
   let genVerifyDecl = 1;
-}
-
-def AppIDAttr : MSFT_Attr<"AppID"> {
-  let summary = "An application relevant instance identifier";
-  let description = [{
-    Identifies an instance which is visible through multiple hierarchy levels.
-    Indended to make locating an instance easier in the instance hierarchy.
-  }];
-
-  let parameters = (ins "StringAttr":$name, "uint64_t":$index);
-  let mnemonic = "appid";
-  let assemblyFormat = [{
-    `<` $name `[` $index `]` `>`
-  }];
 }

@@ -18,21 +18,28 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/APSInt.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-remove-resets"
 
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_SFCCOMPAT
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
+
 using namespace circt;
 using namespace firrtl;
 
-struct SFCCompatPass : public SFCCompatBase<SFCCompatPass> {
+struct SFCCompatPass
+    : public circt::firrtl::impl::SFCCompatBase<SFCCompatPass> {
   void runOnOperation() override;
 };
 
@@ -44,41 +51,57 @@ void SFCCompatPass::runOnOperation() {
 
   bool madeModifications = false;
   SmallVector<InvalidValueOp> invalidOps;
-  for (auto &op : llvm::make_early_inc_range(getOperation().getOps())) {
+
+  auto fullResetAttr = StringAttr::get(&getContext(), fullResetAnnoClass);
+  auto isFullResetAnno = [fullResetAttr](Annotation anno) {
+    auto annoClassAttr = anno.getClassAttr();
+    return annoClassAttr == fullResetAttr;
+  };
+  bool fullResetExists = AnnotationSet::removePortAnnotations(
+      getOperation(),
+      [&](unsigned argNum, Annotation anno) { return isFullResetAnno(anno); });
+  getOperation()->walk([isFullResetAnno, &fullResetExists](Operation *op) {
+    fullResetExists |= AnnotationSet::removeAnnotations(op, isFullResetAnno);
+  });
+  madeModifications |= fullResetExists;
+
+  auto result = getOperation()->walk([&](Operation *op) {
     // Populate invalidOps for later handling.
     if (auto inv = dyn_cast<InvalidValueOp>(op)) {
       invalidOps.push_back(inv);
-      continue;
+      return WalkResult::advance();
     }
     auto reg = dyn_cast<RegResetOp>(op);
     if (!reg)
-      continue;
+      return WalkResult::advance();
 
-    // If the `RegResetOp` has an invalidated initialization, then replace it
-    // with a `RegOp`.
-    if (walkDrivers(reg.getResetValue(), true, false, false,
-                    [](FieldRef dst, FieldRef src) {
-                      return src.isa<InvalidValueOp>();
-                    })) {
+    // If the `RegResetOp` has an invalidated initialization and we
+    // are not running FART, then replace it with a `RegOp`.
+    if (!fullResetExists && walkDrivers(reg.getResetValue(), true, true, false,
+                                        [](FieldRef dst, FieldRef src) {
+                                          return src.isa<InvalidValueOp>();
+                                        })) {
       ImplicitLocOpBuilder builder(reg.getLoc(), reg);
       RegOp newReg = builder.create<RegOp>(
-          reg.getType(), reg.getClockVal(), reg.getName(), reg.getNameKind(),
-          reg.getAnnotations(), reg.getInnerSymAttr());
-      reg.replaceAllUsesWith(newReg.getResult());
+          reg.getResult().getType(), reg.getClockVal(), reg.getNameAttr(),
+          reg.getNameKindAttr(), reg.getAnnotationsAttr(),
+          reg.getInnerSymAttr(), reg.getForceableAttr());
+      reg.replaceAllUsesWith(newReg);
       reg.erase();
       madeModifications = true;
-      continue;
+      return WalkResult::advance();
     }
 
     // If the `RegResetOp` has an asynchronous reset and the reset value is not
     // a module-scoped constant when looking through wires and nodes, then
     // generate an error.  This implements the SFC's CheckResets pass.
-    if (!reg.getResetSignal().getType().isa<AsyncResetType>())
-      continue;
+    if (!isa<AsyncResetType>(reg.getResetSignal().getType()))
+      return WalkResult::advance();
     if (walkDrivers(
             reg.getResetValue(), true, true, true,
             [&](FieldRef dst, FieldRef src) {
-              if (src.isa<ConstantOp, InvalidValueOp, SpecialConstantOp>())
+              if (src.isa<ConstantOp, InvalidValueOp, SpecialConstantOp,
+                          AggregateConstantOp>())
                 return true;
               auto diag = emitError(reg.getLoc());
               auto [fieldName, rootKnown] = getFieldName(dst);
@@ -94,9 +117,12 @@ void SFCCompatPass::runOnOperation() {
                   << (rootKnown ? ("\"" + fieldName + "\"") : "here");
               return false;
             }))
-      continue;
+      return WalkResult::advance();
+    return WalkResult::interrupt();
+  });
+
+  if (result.wasInterrupted())
     return signalPassFailure();
-  }
 
   // Convert all invalid values to zero.
   for (auto inv : invalidOps) {
@@ -108,7 +134,7 @@ void SFCCompatPass::runOnOperation() {
     }
     ImplicitLocOpBuilder builder(inv.getLoc(), inv);
     Value replacement =
-        TypeSwitch<FIRRTLType, Value>(inv.getType())
+        FIRRTLTypeSwitch<FIRRTLType, Value>(inv.getType())
             .Case<ClockType, AsyncResetType, ResetType>(
                 [&](auto type) -> Value {
                   return builder.create<SpecialConstantOp>(

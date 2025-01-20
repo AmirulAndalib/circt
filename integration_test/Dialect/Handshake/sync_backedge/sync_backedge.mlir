@@ -1,18 +1,20 @@
 // REQUIRES: iverilog,cocotb
 
-// This test is executed with all different buffering strategies
+// Test the original HandshakeToHW flow.
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// RUN: hlstool %s --dynamic-hw --input-level core --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables > %t.sv
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder="%S,%S/.." %t.sv 2>&1 | FileCheck %s
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=allFIFO --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// RUN: hlstool %s --dynamic-hw --input-level core --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables > %t.sv && \
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder="%S,%S/.." %t.sv 2>&1 | FileCheck %s
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// Test the DC lowering flow.
+// TODO: This test does not pass with DC as DC to HW does not support buffer initValues.
+// RUNx: hlstool %s --dynamic-hw --dc --input-level core --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables > %t.sv
+// RUNx: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder="%S,%S/.." %t.sv %esi_prims 2>&1 | FileCheck %s
 
-// RUN: hlstool %s --dynamic-hw --ir-input-level 1 --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// RUNx: hlstool %s --dynamic-hw --dc --input-level core --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables > %t.sv
+// RUNx: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=sync_backedge --pythonFolder="%S,%S/.." %t.sv %esi_prims 2>&1 | FileCheck %s
 
 // CHECK: ** TEST
 // CHECK: ** TESTS=[[N:.*]] PASS=[[N]] FAIL=0 SKIP=0
@@ -29,7 +31,7 @@ handshake.func @top(%arg0: i64, %arg1: none, ...) -> (i64, none) attributes {arg
   %trueResult_0, %falseResult_1 = cond_br %6#0, %3#1 : none
   // introduce additional delay to simulate a slow branch
   %buffer = buffer [10] seq %trueResult_0 : none
-  %result, %index = control_merge %buffer, %falseResult_1 : none
+  %result, %index = control_merge %buffer, %falseResult_1 : none, index
   %7:2 = fork [2] %result : none
   %8 = mux %index [%trueResult, %falseResult] : index, i64
   %9:2 = fork [2] %8 : i64

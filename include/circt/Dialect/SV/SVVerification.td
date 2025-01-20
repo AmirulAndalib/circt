@@ -10,6 +10,7 @@
 // declarations.
 //
 //===----------------------------------------------------------------------===//
+include "circt/Dialect/LTL/LTLTypes.td"
 
 /// Immediate assertions, like `assert`.
 def ImmediateAssert: I32EnumAttrCase<"Immediate", 0, "immediate">;
@@ -26,13 +27,17 @@ def DeferAssertAttr : I32EnumAttr<
   let cppNamespace = "circt::sv";
 }
 
+/// A constraint checking no substitutions if no message.
+def NoSubstitutionsIfNoMessage : PredOpTrait<"has message if has substitutions",
+  CPred<"($message && !$message->empty()) || $substitutions.empty()">>;
+
 /// A constraint forcing `cover` ops to have no message.
 def NoMessageVerif : PredOpTrait<"has no message",
   CPred<"!$message && $substitutions.empty()">>;
 
 /// Immediate verification operations defined by the SV standard.
 class ImmediateVerifOp<string mnemonic, list<Trait> traits = []> :
-    SVOp<mnemonic, [ProceduralOp] # traits> {
+    SVOp<mnemonic, [ProceduralOp, NoSubstitutionsIfNoMessage] # traits> {
   let arguments = (ins
     I1:$expression,
     DeferAssertAttr:$defer,
@@ -92,7 +97,7 @@ def CoverOp : ImmediateVerifOp<"cover", [NoMessageVerif]> {
 
 /// Concurrent verification operations defined by the SV standard.
 class ConcurrentVerifOp<string mnemonic, list<Trait> traits = []> :
-    SVOp<mnemonic, traits> {
+    SVOp<mnemonic, [NoSubstitutionsIfNoMessage] # traits> {
   let arguments = (ins
     EventControlAttr:$event, I1:$clock, I1:$property,
     OptionalAttr<StrAttr>:$label,
@@ -153,5 +158,58 @@ def CoverConcurrentOp : ConcurrentVerifOp<"cover.concurrent",
     Specify that a specific property should be monitored for coverage, i.e., a
     simulation will watch if it occurrs and how many times it occurs.  See
     section 16.5 of the SystemVerilog 2017 specification.
+  }];
+}
+
+
+/// Property Assertions/Assumptions/Cover analogous to SVA property verification ops.
+class PropertyVerifOp<string mnemonic, list<Trait> traits = [AttrSizedOperandSegments]> :
+    SVOp<mnemonic, traits> {
+  let arguments = (ins
+    LTLAnyPropertyType:$property,
+    OptionalAttr<EventControlAttr>:$event, Optional<I1>:$clock, 
+    Optional<I1>:$disable,
+    OptionalAttr<StrAttr>:$label);
+
+  let assemblyFormat = [{
+    $property (`on` $event^)? ($clock^)? (`disable_iff` $disable^)?
+    (`label` $label^)? attr-dict `:` type($property)
+  }];
+
+  let builders = [
+    // no clock or event
+    OpBuilder<(ins "mlir::Value":$property,
+      "mlir::Value":$disable,
+       CArg<"StringAttr","StringAttr()">: $label),
+      [{ build(odsBuilder, odsState, property, EventControlAttr{}, Value(), disable, label); }]>
+  ];
+
+  let hasVerifier = true;
+}
+
+def AssertPropertyOp : PropertyVerifOp<"assert_property"> {
+  let summary = "property assertion -- can be disabled and clocked";
+  let description = [{
+    Assert that a given SVA-style property holds. This is only checked when 
+    the disable signal is low and a clock event occurs. This is analogous to 
+    the verif.assert operation, but with a flipped enable polarity.
+  }];
+}
+
+def AssumePropertyOp : PropertyVerifOp<"assume_property"> {
+  let summary = "property assumption -- can be disabled and clocked";
+  let description = [{
+    Assume that a given SVA-style property holds. This is only considered when 
+    the disable signal is low and a clock event occurs. This is analogous to 
+    the verif.assume operation, but with a flipped enable polarity.
+  }];
+}
+
+def CoverPropertyOp : PropertyVerifOp<"cover_property"> {
+  let summary = "property cover point -- can be disabled and clocked";
+  let description = [{
+    Cover when a given SVA-style property holds. This is only checked when 
+    the disable signal is low and a clock event occurs. This is analogous to 
+    the verif.cover operation, but with a flipped enable polarity.
   }];
 }

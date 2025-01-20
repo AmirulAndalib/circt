@@ -138,11 +138,11 @@ module attributes {calyx.entrypoint = "main"} {
 // -----
 // CHECK: module attributes {calyx.entrypoint = "A"} {
 module attributes {calyx.entrypoint = "A"} {
-  // CHECK: hw.module.extern @prim(%in: i32) -> (out: i32) attributes {filename = "test.v"}
-  hw.module.extern @prim(%in: i32) -> (out: i32) attributes {filename = "test.v"}
+  // CHECK: hw.module.extern @prim(in %in : i32, out out : i32) attributes {filename = "test.v"}
+  hw.module.extern @prim(in %in : i32, out out : i32) attributes {filename = "test.v"}
 
-  // CHECK: hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
-  hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
+  // CHECK: hw.module.extern @params<WIDTH: i32>(in %in : !hw.int<#hw.param.decl.ref<"WIDTH">>, out out : !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
+  hw.module.extern @params<WIDTH: i32>(in %in : !hw.int<#hw.param.decl.ref<"WIDTH">>, out out : !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
 
   // CHECK-LABEL: calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done})
   calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done}) {
@@ -172,8 +172,8 @@ module attributes {calyx.entrypoint = "A"} {
 // -----
 // CHECK: module attributes {calyx.entrypoint = "A"} {
 module attributes {calyx.entrypoint = "A"} {
-  // CHECK: hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>, %clk: i1 {calyx.clk}, %go: i1 {calyx.go}) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>, done: i1 {calyx.done}) attributes {filename = "test.v"}
-  hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>, %clk: i1 {calyx.clk}, %go: i1 {calyx.go}) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>, done: i1 {calyx.done}) attributes {filename = "test.v"}
+  // CHECK: hw.module.extern @params<WIDTH: i32>(in %in : !hw.int<#hw.param.decl.ref<"WIDTH">>, in %clk : i1 {calyx.clk}, in %go : i1 {calyx.go}, out out : !hw.int<#hw.param.decl.ref<"WIDTH">>, out done : i1 {calyx.done}) attributes {filename = "test.v"}
+  hw.module.extern @params<WIDTH: i32>(in %in : !hw.int<#hw.param.decl.ref<"WIDTH">>, in %clk : i1 {calyx.clk}, in %go : i1 {calyx.go}, out out : !hw.int<#hw.param.decl.ref<"WIDTH">>, out done: i1 {calyx.done}) attributes {filename = "test.v"}
 
   // CHECK-LABEL: calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done})
   calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done}) {
@@ -230,3 +230,304 @@ module attributes {calyx.entrypoint = "main"} {
     calyx.control {}
   } {static = 1}
 }
+
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%in: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out: i32, %done: i1 {done}) {
+  calyx.component @main(%in: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out: i32, %done: i1 {done}) {
+    // CHECK: %true = hw.constant true
+    %c1_1 = hw.constant 1 : i1
+    // CHECK: %m1.addr0, %m1.clk, %m1.reset, %m1.content_en, %m1.write_en, %m1.write_data, %m1.read_data, %m1.done = calyx.seq_mem @m1 <[64] x 32> [6] : i6, i1, i1, i1, i1, i32, i32, i1
+    %m1.addr0, %m1.clk, %m1.reset, %m1.content_en, %m1.write_en, %m1.write_data, %m1.read_data, %m1.done = calyx.seq_mem @m1 <[64] x 32> [6] : i6, i1, i1, i1, i1, i32, i32, i1
+
+    calyx.wires {
+      // CHECK: calyx.assign %done = %m1.done : i1
+      calyx.assign %done = %m1.done : i1
+      // CHECK: calyx.assign %m1.write_en = %go : i1
+      calyx.assign %m1.write_en = %go : i1
+      // CHECK: calyx.assign %m1.content_en = %go : i1
+      calyx.assign %m1.content_en = %go : i1
+      // CHECK: calyx.assign %m1.write_data = %in : i32
+      calyx.assign %m1.write_data = %in : i32
+      // CHECK: calyx.assign %out = %m1.read_data : i32
+      calyx.assign %out = %m1.read_data : i32
+    }
+    calyx.control {}
+  } {static = 1}
+}
+
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+  calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+    %p.in, %p.write_en, %p.clk, %p.reset, %p.out, %p.done = calyx.register @p : i3, i1, i1, i1, i3, i1
+    %incr.left, %incr.right, %incr.out = calyx.std_add @incr : i3, i3, i3
+    %l.left, %l.right, %l.out = calyx.std_lt @l : i3, i3, i1
+    %c1_3 = hw.constant 1 : i3
+    %c1_1 = hw.constant 1 : i1
+    %c6_3 = hw.constant 6 : i3
+
+    calyx.wires {
+      // CHECK: calyx.static_group latency<1> @A {
+      calyx.static_group latency<1> @A {
+        calyx.assign %incr.left = %p.out : i3
+        calyx.assign %incr.right = %c1_3 : i3
+        calyx.assign %p.in = %incr.out : i3
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %p.write_en = %0 : i1
+      }
+      calyx.assign %l.left = %p.out : i3
+      calyx.assign %l.right = %c6_3 : i3
+    }
+    calyx.control {
+      calyx.while %l.out {
+        calyx.enable @A
+      }
+    }
+  }
+}
+
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+  calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+    %p.in, %p.write_en, %p.clk, %p.reset, %p.out, %p.done = calyx.register @p : i3, i1, i1, i1, i3, i1
+    %incr.left, %incr.right, %incr.out = calyx.std_add @incr : i3, i3, i3
+    %l.left, %l.right, %l.out = calyx.std_lt @l : i3, i3, i1
+    %c1_3 = hw.constant 1 : i3
+    %c1_1 = hw.constant 1 : i1
+    %c6_3 = hw.constant 6 : i3
+
+    calyx.wires {
+      // CHECK: calyx.static_group latency<1> @A {
+      calyx.static_group latency<1> @A {
+        calyx.assign %incr.left = %p.out : i3
+        calyx.assign %incr.right = %c1_3 : i3
+        calyx.assign %p.in = %incr.out : i3
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %p.write_en = %0 : i1
+      }
+      calyx.assign %l.left = %p.out : i3
+      calyx.assign %l.right = %c6_3 : i3
+    }
+    calyx.control {
+      // CHECK: calyx.static_repeat 10 {
+      calyx.static_repeat 10 {
+        calyx.enable @A
+      }
+    }
+  }
+}
+        
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+  calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+    %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i2, i1, i1, i1, i2, i1
+    %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i2, i1, i1, i1, i2, i1
+    %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i2, i1, i1, i1, i2, i1
+    %c0_2 = hw.constant 0 : i2
+    %c1_2 = hw.constant 1 : i2
+    %c2_2 = hw.constant 2 : i2
+    %c1_1 = hw.constant 1 : i1
+
+    calyx.wires {
+      // CHECK: calyx.static_group latency<2> @A {
+      calyx.static_group latency<2> @A {
+        calyx.assign %a.in = %c0_2 : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %a.write_en = %0 ? %c1_1 : i1
+        calyx.assign %b.in = %c1_2 : i2
+        // CHECK: %1 = calyx.cycle 1
+        %1 = calyx.cycle 1
+        calyx.assign %b.write_en = %1 ? %c1_1 : i1
+      }
+
+      // CHECK: calyx.static_group latency<1> @C {
+      calyx.static_group latency<1> @C {
+        calyx.assign %c.in = %c2_2 : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %c.write_en = %0 ? %c1_1 : i1
+      }
+
+    }
+    calyx.control {
+      // CHECK: calyx.static_par {
+      calyx.static_par {
+        calyx.enable @A
+        calyx.enable @C
+      }
+    }
+  }
+}
+
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+  calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+    %a.in, %a.write_en, %a.clk, %a.reset, %a.out, %a.done = calyx.register @a : i2, i1, i1, i1, i2, i1
+    %b.in, %b.write_en, %b.clk, %b.reset, %b.out, %b.done = calyx.register @b : i2, i1, i1, i1, i2, i1
+
+    %c0_2 = hw.constant 0 : i2
+    %c2_2 = hw.constant 0 : i2
+    %c1_1 = hw.constant 1 : i1
+
+    calyx.wires {
+      // CHECK: calyx.static_group latency<1> @A {
+      calyx.static_group latency<1> @A {
+        calyx.assign %a.in =%c0_2  : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %a.write_en = %0 ? %c1_1 : i1
+      }
+      // CHECK: calyx.static_group latency<1> @B {
+      calyx.static_group latency<1> @B {
+        calyx.assign %b.in =%c2_2  : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %b.write_en = %0 ? %c1_1 : i1
+      }
+    }
+    calyx.control {
+      // CHECK: calyx.static_seq {
+      calyx.static_seq { 
+        calyx.enable @A
+        calyx.enable @B
+      }
+    }
+  }
+}
+
+
+// -----
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL: calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+  calyx.component @main(%go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%done: i1 {done}) {
+    %d.in, %d.write_en, %d.clk, %d.reset, %d.out, %d.done = calyx.register @d : i2, i1, i1, i1, i2, i1
+    %r1.in, %r1.write_en, %r1.clk, %r1.reset, %r1.out, %r1.done = calyx.register @r1 : i1, i1, i1, i1, i1, i1
+    %c.in, %c.write_en, %c.clk, %c.reset, %c.out, %c.done = calyx.register @c : i2, i1, i1, i1, i2, i1
+
+    %c0_2 = hw.constant 0 : i2
+    %c1_2 = hw.constant 1 : i2
+    %c1_1 = hw.constant 1 : i1
+
+
+    calyx.wires {
+      // CHECK: calyx.static_group latency<1> @C {
+      calyx.static_group latency<1> @C {
+        calyx.assign %c.in = %c0_2 : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %c.write_en = %0 ? %c1_1 : i1
+      }
+
+      // CHECK: calyx.static_group latency<1> @D {
+      calyx.static_group latency<1> @D {
+        calyx.assign %d.in = %c1_2 : i2
+        // CHECK: %0 = calyx.cycle 0
+        %0 = calyx.cycle 0
+        calyx.assign %d.write_en = %0 ? %c1_1 : i1
+      }
+
+    }
+    calyx.control {
+      // CHECK: calyx.static_if %r1.out {
+      calyx.static_if %r1.out {
+        calyx.enable @C
+      } else {
+          calyx.enable @D
+      }
+    }
+  }
+}
+
+// -----
+
+module attributes {calyx.entrypoint = "main"} {
+  // CHECK-LABEL:   calyx.component @main(%in0: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+  calyx.component @main(%in0: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+    %true = hw.constant true
+    %mem_1.addr0, %mem_1.clk, %mem_1.reset, %mem_1.content_en, %mem_1.write_en, %mem_1.write_data, %mem_1.read_data, %mem_1.done = calyx.seq_mem @mem_1 <[8] x 32> [3] {external = true} : i3, i1, i1, i1, i1, i32, i32, i1
+    %mem_0.addr0, %mem_0.clk, %mem_0.reset, %mem_0.content_en, %mem_0.write_en, %mem_0.write_data, %mem_0.read_data, %mem_0.done = calyx.seq_mem @mem_0 <[8] x 32> [3] {external = true} : i3, i1, i1, i1, i1, i32, i32, i1
+    %main_1_instance.in1, %main_1_instance.clk, %main_1_instance.reset, %main_1_instance.go, %main_1_instance.done = calyx.instance @main_1_instance of @main_1 : i32, i1, i1, i1, i1
+    calyx.wires {
+      calyx.group @init_main_1_instance {
+        calyx.assign %main_1_instance.reset = %true : i1
+        calyx.assign %main_1_instance.go = %true : i1
+        calyx.group_done %main_1_instance.done : i1
+      }
+    }
+    calyx.control {
+      calyx.seq {
+        calyx.seq {
+          calyx.enable @init_main_1_instance
+          // CHECK: calyx.invoke @main_1_instance[arg_mem_0 = mem_0, arg_mem_1 = mem_1](%main_1_instance.in1 = %in0) -> (i32)
+          calyx.invoke @main_1_instance[arg_mem_0 = mem_0, arg_mem_1 = mem_1](%main_1_instance.in1 = %in0) -> (i32)
+        }
+      }
+    }
+  } {toplevel}
+  // CHECK-LABEL: calyx.component @main_1(%in1: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+  calyx.component @main_1(%in1: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+    %true = hw.constant true
+    %c1_i32 = hw.constant 1 : i32
+    %func_1_instance.in0, %func_1_instance.in2, %func_1_instance.clk, %func_1_instance.reset, %func_1_instance.go, %func_1_instance.done = calyx.instance @func_1_instance of @func_1 : i32, i32, i1, i1, i1, i1
+    %arg_mem_1.addr0, %arg_mem_1.clk, %arg_mem_1.reset, %arg_mem_1.content_en, %arg_mem_1.write_en, %arg_mem_1.write_data, %arg_mem_1.read_data, %arg_mem_1.done = calyx.seq_mem @arg_mem_1 <[8] x 32> [3] : i3, i1, i1, i1, i1, i32, i32, i1
+    %arg_mem_0.addr0, %arg_mem_0.clk, %arg_mem_0.reset, %arg_mem_0.content_en, %arg_mem_0.write_en, %arg_mem_0.write_data, %arg_mem_0.read_data, %arg_mem_0.done = calyx.seq_mem @arg_mem_0 <[8] x 32> [3] : i3, i1, i1, i1, i1, i32, i32, i1
+    calyx.wires {
+      calyx.group @init_func_1_instance {
+        calyx.assign %func_1_instance.reset = %true : i1
+        calyx.assign %func_1_instance.go = %true : i1
+        calyx.group_done %func_1_instance.done : i1
+      }
+    }
+    calyx.control {
+      calyx.seq {
+        calyx.seq {
+          calyx.enable @init_func_1_instance
+          // CHECK: calyx.invoke @func_1_instance[arg_mem_0 = arg_mem_0, arg_mem_1 = arg_mem_1](%func_1_instance.in0 = %c1_i32, %func_1_instance.in2 = %in1) -> (i32, i32)
+          calyx.invoke @func_1_instance[arg_mem_0 = arg_mem_0, arg_mem_1 = arg_mem_1](%func_1_instance.in0 = %c1_i32, %func_1_instance.in2 = %in1) -> (i32, i32)
+        }
+      }
+    }
+  }
+  // CHECK-LABEL: calyx.component @func_1(%in0: i32, %in2: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+  calyx.component @func_1(%in0: i32, %in2: i32, %clk: i1 {clk}, %reset: i1 {reset}, %go: i1 {go}) -> (%done: i1 {done}) {
+    %true = hw.constant true
+    %std_slice_1.in, %std_slice_1.out = calyx.std_slice @std_slice_1 : i32, i3
+    %std_slice_0.in, %std_slice_0.out = calyx.std_slice @std_slice_0 : i32, i3
+    %arg_mem_1.addr0, %arg_mem_1.clk, %arg_mem_1.reset, %arg_mem_1.content_en, %arg_mem_1.write_en, %arg_mem_1.write_data, %arg_mem_1.read_data, %arg_mem_1.done = calyx.seq_mem @arg_mem_1 <[8] x 32> [3] : i3, i1, i1, i1, i1, i32, i32, i1
+    %arg_mem_0.addr0, %arg_mem_0.clk, %arg_mem_0.reset, %arg_mem_0.content_en, %arg_mem_0.write_en, %arg_mem_0.write_data, %arg_mem_0.read_data, %arg_mem_0.done = calyx.seq_mem @arg_mem_0 <[8] x 32> [3] : i3, i1, i1, i1, i1, i32, i32, i1
+    calyx.wires {
+      calyx.group @bb0_0 {
+        calyx.assign %std_slice_1.in = %in2 : i32
+        calyx.assign %arg_mem_1.addr0 = %std_slice_1.out : i3
+        calyx.assign %arg_mem_1.write_data = %in0 : i32
+        calyx.assign %arg_mem_1.write_en = %true : i1
+        calyx.assign %arg_mem_1.content_en = %true : i1
+        calyx.group_done %arg_mem_1.done : i1
+      }
+      calyx.group @bb0_1 {
+        calyx.assign %std_slice_0.in = %in2 : i32
+        calyx.assign %arg_mem_0.addr0 = %std_slice_0.out : i3
+        calyx.assign %arg_mem_0.write_data = %in0 : i32
+        calyx.assign %arg_mem_0.write_en = %true : i1
+        calyx.assign %arg_mem_0.content_en = %true : i1
+        calyx.group_done %arg_mem_0.done : i1
+      }
+    }
+    calyx.control {
+      calyx.seq {
+        calyx.seq {
+          calyx.enable @bb0_0
+          calyx.enable @bb0_1
+        }
+      }
+    }
+  }
+}
+

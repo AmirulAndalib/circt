@@ -1,49 +1,82 @@
 add_circt_dialect_library(CIRCTFIRRTLTransforms
   AddSeqMemPorts.cpp
+  AdvancedLayerSink.cpp
+  AssignOutputDirs.cpp
   BlackBoxReader.cpp
-  CheckCombCycles.cpp
   CheckCombLoops.cpp
+  CheckLayers.cpp
+  CheckRecursiveInstantiation.cpp
+  CreateCompanionAssume.cpp
   CreateSiFiveMetadata.cpp
   Dedup.cpp
+  DropConst.cpp
   DropName.cpp
-  EmitOMIR.cpp
+  EliminateWires.cpp
   ExpandWhens.cpp
   ExtractInstances.cpp
+  FinalizeIR.cpp
   FlattenMemory.cpp
   GrandCentral.cpp
   IMConstProp.cpp
   IMDeadCodeElim.cpp
-  InferResets.cpp
   InferReadWrite.cpp
+  InferResets.cpp
   InferWidths.cpp
   InjectDUTHierarchy.cpp
   InnerSymbolDCE.cpp
   LegacyWiring.cpp
+  Lint.cpp
+  LayerMerge.cpp
+  LayerSink.cpp
   LowerAnnotations.cpp
   LowerCHIRRTL.cpp
+  LowerClasses.cpp
+  LowerDPI.cpp
+  LowerIntmodules.cpp
   LowerIntrinsics.cpp
+  LowerLayers.cpp
+  LowerMatches.cpp
   LowerMemory.cpp
+  LowerOpenAggs.cpp
+  LowerSignatures.cpp
   LowerTypes.cpp
   LowerXMR.cpp
-  MergeConnections.cpp
+  MaterializeDebugInfo.cpp
   MemToRegOfVec.cpp
+  MergeConnections.cpp
   ModuleInliner.cpp
-  PrefixModules.cpp
+  ModuleSummary.cpp
+  PassiveWires.cpp
   PrintFIRRTLFieldSource.cpp
   PrintInstanceGraph.cpp
   PrintNLATable.cpp
+  ProbesToSignals.cpp
   RandomizeRegisterInit.cpp
-  ResolveTraces.cpp
+  RegisterOptimizer.cpp
   RemoveUnusedPorts.cpp
+  ResolvePaths.cpp
+  ResolveTraces.cpp
   SFCCompat.cpp
-  WireDFT.cpp
+  SpecializeLayers.cpp
+  SpecializeOption.cpp
+  VBToBV.cpp
+  Vectorization.cpp
 
   DEPENDS
   CIRCTFIRRTLTransformsIncGen
+  MLIROMIncGen
+  MLIROMAttrIncGen
+  MLIROMOpInterfacesIncGen
 
   LINK_LIBS PUBLIC
   CIRCTFIRRTL
+  CIRCTFIRRTLAnalysis
+  CIRCTDebug
+  CIRCTEmit
   CIRCTHW
+  CIRCTOM
+  CIRCTSeq
+  CIRCTSim
   CIRCTSV
   CIRCTSupport
   MLIRIR

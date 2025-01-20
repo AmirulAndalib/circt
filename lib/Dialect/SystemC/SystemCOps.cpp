@@ -14,9 +14,10 @@
 #include "circt/Dialect/HW/CustomDirectiveImpl.h"
 #include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/ModuleImplementation.h"
-#include "mlir/IR/FunctionImplementation.h"
+#include "circt/Support/CustomDirectiveImpl.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -40,7 +41,7 @@ static LogicalResult verifyUniqueNamesInRegion(
   bool portsVerified = true;
 
   for (auto arg : llvm::zip(argNames, operation->getRegion(0).getArguments())) {
-    StringRef argName = std::get<0>(arg).cast<StringAttr>().getValue();
+    StringRef argName = cast<StringAttr>(std::get<0>(arg)).getValue();
     BlockArgument argValue = std::get<1>(arg);
 
     if (portNames.count(argName)) {
@@ -98,15 +99,16 @@ static LogicalResult verifyUniqueNamesInRegion(
 // SCModuleOp
 //===----------------------------------------------------------------------===//
 
-static hw::PortDirection getDirection(Type type) {
-  return TypeSwitch<Type, hw::PortDirection>(type)
-      .Case<InOutType>([](auto ty) { return hw::PortDirection::INOUT; })
-      .Case<InputType>([](auto ty) { return hw::PortDirection::INPUT; })
-      .Case<OutputType>([](auto ty) { return hw::PortDirection::OUTPUT; });
+static hw::ModulePort::Direction getDirection(Type type) {
+  return TypeSwitch<Type, hw::ModulePort::Direction>(type)
+      .Case<InOutType>([](auto ty) { return hw::ModulePort::Direction::InOut; })
+      .Case<InputType>([](auto ty) { return hw::ModulePort::Direction::Input; })
+      .Case<OutputType>(
+          [](auto ty) { return hw::ModulePort::Direction::Output; });
 }
 
 SCModuleOp::PortDirectionRange
-SCModuleOp::getPortsOfDirection(hw::PortDirection direction) {
+SCModuleOp::getPortsOfDirection(hw::ModulePort::Direction direction) {
   std::function<bool(const BlockArgument &)> predicateFn =
       [&](const BlockArgument &arg) -> bool {
     return getDirection(arg.getType()) == direction;
@@ -114,21 +116,19 @@ SCModuleOp::getPortsOfDirection(hw::PortDirection direction) {
   return llvm::make_filter_range(getArguments(), predicateFn);
 }
 
-void SCModuleOp::getPortInfoList(SmallVectorImpl<hw::PortInfo> &portInfoList) {
+SmallVector<::circt::hw::PortInfo> SCModuleOp::getPortList() {
+  SmallVector<hw::PortInfo> ports;
   for (int i = 0, e = getNumArguments(); i < e; ++i) {
     hw::PortInfo info;
-    info.name = getPortNames()[i].cast<StringAttr>();
+    info.name = cast<StringAttr>(getPortNames()[i]);
     info.type = getSignalBaseType(getArgument(i).getType());
-    info.direction = getDirection(info.type);
-    portInfoList.push_back(info);
+    info.dir = getDirection(info.type);
+    ports.push_back(info);
   }
+  return ports;
 }
 
 mlir::Region *SCModuleOp::getCallableRegion() { return &getBody(); }
-
-ArrayRef<mlir::Type> SCModuleOp::getCallableResults() {
-  return getResultTypes();
-}
 
 StringRef SCModuleOp::getModuleName() {
   return (*this)
@@ -209,16 +209,26 @@ void SCModuleOp::print(OpAsmPrinter &p) {
   p.printRegion(getBody(), false, false);
 }
 
-static Type wrapPortType(Type type, hw::PortDirection direction) {
-  if (auto inoutTy = type.dyn_cast<hw::InOutType>())
+/// Returns the argument types of this function.
+ArrayRef<Type> SCModuleOp::getArgumentTypes() {
+  return getFunctionType().getInputs();
+}
+
+/// Returns the result types of this function.
+ArrayRef<Type> SCModuleOp::getResultTypes() {
+  return getFunctionType().getResults();
+}
+
+static Type wrapPortType(Type type, hw::ModulePort::Direction direction) {
+  if (auto inoutTy = dyn_cast<hw::InOutType>(type))
     type = inoutTy.getElementType();
 
   switch (direction) {
-  case hw::PortDirection::INOUT:
+  case hw::ModulePort::Direction::InOut:
     return InOutType::get(type);
-  case hw::PortDirection::INPUT:
+  case hw::ModulePort::Direction::Input:
     return InputType::get(type);
-  case hw::PortDirection::OUTPUT:
+  case hw::ModulePort::Direction::Output:
     return OutputType::get(type);
   }
   llvm_unreachable("Impossible port direction");
@@ -251,7 +261,7 @@ void SCModuleOp::build(OpBuilder &odsBuilder, OperationState &odsState,
   SmallVector<Type> portTypes;
   for (auto port : ports) {
     portNames.push_back(StringAttr::get(ctxt, port.getName()));
-    portTypes.push_back(wrapPortType(port.type, port.direction));
+    portTypes.push_back(wrapPortType(port.type, port.dir));
   }
   build(odsBuilder, odsState, name, ArrayAttr::get(ctxt, portNames), portTypes);
 }
@@ -259,9 +269,14 @@ void SCModuleOp::build(OpBuilder &odsBuilder, OperationState &odsState,
 void SCModuleOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                        StringAttr name, const hw::ModulePortInfo &ports,
                        ArrayRef<NamedAttribute> attributes) {
-  SmallVector<hw::PortInfo> portInfos(ports.inputs);
-  portInfos.append(ports.outputs);
-  build(odsBuilder, odsState, name, portInfos, attributes);
+  MLIRContext *ctxt = odsBuilder.getContext();
+  SmallVector<Attribute> portNames;
+  SmallVector<Type> portTypes;
+  for (auto port : ports) {
+    portNames.push_back(StringAttr::get(ctxt, port.getName()));
+    portTypes.push_back(wrapPortType(port.type, port.dir));
+  }
+  build(odsBuilder, odsState, name, ArrayAttr::get(ctxt, portNames), portTypes);
 }
 
 void SCModuleOp::getAsmBlockArgumentNames(mlir::Region &region,
@@ -271,7 +286,7 @@ void SCModuleOp::getAsmBlockArgumentNames(mlir::Region &region,
 
   ArrayAttr portNames = getPortNames();
   for (size_t i = 0, e = getNumArguments(); i != e; ++i) {
-    auto str = portNames[i].cast<StringAttr>().getValue();
+    auto str = cast<StringAttr>(portNames[i]).getValue();
     setNameFn(getArgument(i), str);
   }
 }
@@ -291,7 +306,7 @@ LogicalResult SCModuleOp::verify() {
   }
 
   for (auto portName : getPortNames()) {
-    if (portName.cast<StringAttr>().getValue().empty())
+    if (cast<StringAttr>(portName).getValue().empty())
       return emitOpError("port name must not be empty");
   }
 
@@ -360,37 +375,37 @@ OpFoldResult ConvertOp::fold(FoldAdaptor) {
 
     // Either both the input and intermediate types are signed or both are
     // unsigned.
-    bool inputSigned = inputType.isa<SignedType, IntBaseType>();
-    bool intermediateSigned = intermediateType.isa<SignedType, IntBaseType>();
+    bool inputSigned = isa<SignedType, IntBaseType>(inputType);
+    bool intermediateSigned = isa<SignedType, IntBaseType>(intermediateType);
     if (inputSigned ^ intermediateSigned)
       return {};
 
     // Converting 4-valued to 2-valued and back may lose information.
-    if (inputType.isa<LogicVectorBaseType, LogicType>() &&
-        !intermediateType.isa<LogicVectorBaseType, LogicType>())
+    if (isa<LogicVectorBaseType, LogicType>(inputType) &&
+        !isa<LogicVectorBaseType, LogicType>(intermediateType))
       return {};
 
     auto inputBw = getBitWidth(inputType);
     auto intermediateBw = getBitWidth(intermediateType);
 
     if (!inputBw && intermediateBw) {
-      if (inputType.isa<IntBaseType, UIntBaseType>() && *intermediateBw >= 64)
+      if (isa<IntBaseType, UIntBaseType>(inputType) && *intermediateBw >= 64)
         return other.getInput();
       // We cannot support input types of signed, unsigned, and vector types
       // since they have no upper bound for the bit-width.
     }
 
     if (!intermediateBw) {
-      if (intermediateType.isa<BitVectorBaseType, LogicVectorBaseType>())
+      if (isa<BitVectorBaseType, LogicVectorBaseType>(intermediateType))
         return other.getInput();
 
-      if (!inputBw && inputType.isa<IntBaseType, UIntBaseType>() &&
-          intermediateType.isa<SignedType, UnsignedType>())
+      if (!inputBw && isa<IntBaseType, UIntBaseType>(inputType) &&
+          isa<SignedType, UnsignedType>(intermediateType))
         return other.getInput();
 
       if (inputBw && *inputBw <= 64 &&
-          intermediateType
-              .isa<IntBaseType, UIntBaseType, SignedType, UnsignedType>())
+          isa<IntBaseType, UIntBaseType, SignedType, UnsignedType>(
+              intermediateType))
         return other.getInput();
 
       // We have to be careful with the signed and unsigned types as they often
@@ -439,17 +454,17 @@ void InstanceDeclOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   setNameFn(getInstanceHandle(), getName());
 }
 
-Operation *InstanceDeclOp::getReferencedModule(const hw::HWSymbolCache *cache) {
+StringRef InstanceDeclOp::getInstanceName() { return getName(); }
+StringAttr InstanceDeclOp::getInstanceNameAttr() { return getNameAttr(); }
+
+Operation *
+InstanceDeclOp::getReferencedModuleCached(const hw::HWSymbolCache *cache) {
   if (cache)
     if (auto *result = cache->getDefinition(getModuleNameAttr()))
       return result;
 
   auto topLevelModuleOp = (*this)->getParentOfType<ModuleOp>();
   return topLevelModuleOp.lookupSymbol(getModuleName());
-}
-
-Operation *InstanceDeclOp::getReferencedModule() {
-  return getReferencedModule(/*cache=*/nullptr);
 }
 
 LogicalResult
@@ -515,6 +530,12 @@ InstanceDeclOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   return success();
 }
 
+SmallVector<hw::PortInfo> InstanceDeclOp::getPortList() {
+  return cast<hw::PortList>(SymbolTable::lookupNearestSymbolFrom(
+                                getOperation(), getReferencedModuleNameAttr()))
+      .getPortList();
+}
+
 //===----------------------------------------------------------------------===//
 // DestructorOp
 //===----------------------------------------------------------------------===//
@@ -561,7 +582,7 @@ ParseResult BindPortOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parser.resolveOperand(channel, types[1], result.operands))
     return failure();
 
-  if (auto moduleType = types[0].dyn_cast<ModuleType>()) {
+  if (auto moduleType = dyn_cast<ModuleType>(types[0])) {
     auto ports = moduleType.getPorts();
     uint64_t index = 0;
     for (auto port : ports) {
@@ -583,9 +604,7 @@ ParseResult BindPortOp::parse(OpAsmParser &parser, OperationState &result) {
 
 void BindPortOp::print(OpAsmPrinter &p) {
   p << " " << getInstance() << "["
-    << getInstance()
-           .getType()
-           .cast<ModuleType>()
+    << cast<ModuleType>(getInstance().getType())
            .getPorts()[getPortId().getZExtValue()]
            .name
     << "] to " << getChannel();
@@ -594,7 +613,7 @@ void BindPortOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult BindPortOp::verify() {
-  auto ports = getInstance().getType().cast<ModuleType>().getPorts();
+  auto ports = cast<ModuleType>(getInstance().getType()).getPorts();
   if (getPortId().getZExtValue() >= ports.size())
     return emitOpError("port #")
            << getPortId().getZExtValue() << " does not exist, there are only "
@@ -608,8 +627,8 @@ LogicalResult BindPortOp::verify() {
                          << channelType << " channel due to base type mismatch";
 
   // Verify that the port/channel directions are valid.
-  if ((portType.isa<InputType>() && channelType.isa<OutputType>()) ||
-      (portType.isa<OutputType>() && channelType.isa<InputType>()))
+  if ((isa<InputType>(portType) && isa<OutputType>(channelType)) ||
+      (isa<OutputType>(portType) && isa<InputType>(channelType)))
     return emitOpError() << portType << " port cannot be bound to "
                          << channelType
                          << " channel due to port direction mismatch";
@@ -618,9 +637,7 @@ LogicalResult BindPortOp::verify() {
 }
 
 StringRef BindPortOp::getPortName() {
-  return getInstance()
-      .getType()
-      .cast<ModuleType>()
+  return cast<ModuleType>(getInstance().getType())
       .getPorts()[getPortId().getZExtValue()]
       .name.getValue();
 }
@@ -699,9 +716,10 @@ LogicalResult VariableOp::verify() {
 void InteropVerilatedOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                                Operation *module, StringAttr name,
                                ArrayRef<Value> inputs) {
-  auto [argNames, resultNames] =
-      hw::instance_like_impl::getHWModuleArgAndResultNames(module);
-  build(odsBuilder, odsState, hw::getModuleType(module).getResults(), name,
+  auto mod = cast<hw::HWModuleLike>(module);
+  auto argNames = odsBuilder.getArrayAttr(mod.getInputNames());
+  auto resultNames = odsBuilder.getArrayAttr(mod.getOutputNames());
+  build(odsBuilder, odsState, mod.getHWModuleType().getOutputTypes(), name,
         FlatSymbolRefAttr::get(SymbolTable::getSymbolName(module)), argNames,
         resultNames, inputs);
 }
@@ -1068,7 +1086,7 @@ void FuncOp::getAsmBlockArgumentNames(mlir::Region &region,
     return;
 
   for (auto [arg, name] : llvm::zip(getArguments(), getArgNames()))
-    setNameFn(arg, name.cast<StringAttr>().getValue());
+    setNameFn(arg, cast<StringAttr>(name).getValue());
 }
 
 LogicalResult FuncOp::verify() {
@@ -1083,7 +1101,7 @@ LogicalResult FuncOp::verify() {
     return emitOpError("incorrect number of argument names");
 
   for (auto portName : getArgNames()) {
-    if (portName.cast<StringAttr>().getValue().empty())
+    if (cast<StringAttr>(portName).getValue().empty())
       return emitOpError("arg name must not be empty");
   }
 

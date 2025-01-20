@@ -19,8 +19,12 @@
 
 namespace circt {
 
+#define GEN_PASS_DECL_PIPELINETOHW
+#include "circt/Conversion/Passes.h.inc"
+
 /// Create an SCF to Calyx conversion pass.
-std::unique_ptr<mlir::Pass> createPipelineToHWPass();
+std::unique_ptr<mlir::Pass>
+createPipelineToHWPass(const PipelineToHWOptions &options = {});
 
 } // namespace circt
 

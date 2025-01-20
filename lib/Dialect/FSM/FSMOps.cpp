@@ -11,8 +11,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectImplementation.h"
-#include "mlir/IR/FunctionImplementation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/Support/FormatVariadic.h"
 
 using namespace mlir;
@@ -57,16 +57,16 @@ StateOp MachineOp::getInitialStateOp() {
 
 StringAttr MachineOp::getArgName(size_t i) {
   if (auto args = getArgNames())
-    return (*args)[i].cast<StringAttr>();
-  else
-    return StringAttr::get(getContext(), "in" + std::to_string(i));
+    return cast<StringAttr>((*args)[i]);
+
+  return StringAttr::get(getContext(), "in" + std::to_string(i));
 }
 
 StringAttr MachineOp::getResName(size_t i) {
   if (auto resNameAttrs = getResNames())
-    return (*resNameAttrs)[i].cast<StringAttr>();
-  else
-    return StringAttr::get(getContext(), "out" + std::to_string(i));
+    return cast<StringAttr>((*resNameAttrs)[i]);
+
+  return StringAttr::get(getContext(), "out" + std::to_string(i));
 }
 
 /// Get the port information of the machine.
@@ -76,7 +76,9 @@ void MachineOp::getHWPortInfo(SmallVectorImpl<hw::PortInfo> &ports) {
   for (unsigned i = 0, e = machineType.getNumInputs(); i < e; ++i) {
     hw::PortInfo port;
     port.name = getArgName(i);
-    port.direction = circt::hw::PortDirection::INPUT;
+    if (!port.name)
+      port.name = StringAttr::get(getContext(), "in" + std::to_string(i));
+    port.dir = circt::hw::ModulePort::Direction::Input;
     port.type = machineType.getInput(i);
     port.argNum = i;
     ports.push_back(port);
@@ -85,7 +87,9 @@ void MachineOp::getHWPortInfo(SmallVectorImpl<hw::PortInfo> &ports) {
   for (unsigned i = 0, e = machineType.getNumResults(); i < e; ++i) {
     hw::PortInfo port;
     port.name = getResName(i);
-    port.direction = circt::hw::PortDirection::OUTPUT;
+    if (!port.name)
+      port.name = StringAttr::get(getContext(), "out" + std::to_string(i));
+    port.dir = circt::hw::ModulePort::Direction::Output;
     port.type = machineType.getResult(i);
     port.argNum = i;
     ports.push_back(port);
@@ -94,9 +98,9 @@ void MachineOp::getHWPortInfo(SmallVectorImpl<hw::PortInfo> &ports) {
 
 ParseResult MachineOp::parse(OpAsmParser &parser, OperationState &result) {
   auto buildFuncType =
-      [](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,
-         function_interface_impl::VariadicFlag,
-         std::string &) { return builder.getFunctionType(argTypes, results); };
+      [&](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,
+          function_interface_impl::VariadicFlag,
+          std::string &) { return builder.getFunctionType(argTypes, results); };
 
   return function_interface_impl::parseFunctionOp(
       parser, result, /*allowVariadic=*/false,
@@ -171,6 +175,45 @@ LogicalResult MachineOp::verify() {
   return success();
 }
 
+SmallVector<::circt::hw::PortInfo> MachineOp::getPortList() {
+  SmallVector<hw::PortInfo> ports;
+  auto argNames = getArgNames();
+  auto argTypes = getFunctionType().getInputs();
+  for (unsigned i = 0, e = argTypes.size(); i < e; ++i) {
+    bool isInOut = false;
+    auto type = argTypes[i];
+
+    if (auto inout = dyn_cast<hw::InOutType>(type)) {
+      isInOut = true;
+      type = inout.getElementType();
+    }
+
+    auto direction = isInOut ? hw::ModulePort::Direction::InOut
+                             : hw::ModulePort::Direction::Input;
+
+    ports.push_back(
+        {{argNames ? cast<StringAttr>((*argNames)[i])
+                   : StringAttr::get(getContext(), Twine("input") + Twine(i)),
+          type, direction},
+         i,
+         {},
+         {}});
+  }
+
+  auto resultNames = getResNames();
+  auto resultTypes = getFunctionType().getResults();
+  for (unsigned i = 0, e = resultTypes.size(); i < e; ++i) {
+    ports.push_back({{resultNames ? cast<StringAttr>((*resultNames)[i])
+                                  : StringAttr::get(getContext(),
+                                                    Twine("output") + Twine(i)),
+                      resultTypes[i], hw::ModulePort::Direction::Output},
+                     i,
+                     {},
+                     {}});
+  }
+  return ports;
+}
+
 //===----------------------------------------------------------------------===//
 // InstanceOp
 //===----------------------------------------------------------------------===//
@@ -191,7 +234,7 @@ LogicalResult InstanceOp::verify() {
 
 void InstanceOp::getAsmResultNames(
     function_ref<void(Value, StringRef)> setNameFn) {
-  setNameFn(getInstance(), getSymName());
+  setNameFn(getInstance(), getName());
 }
 
 //===----------------------------------------------------------------------===//
@@ -240,7 +283,7 @@ LogicalResult TriggerOp::verify() { return verifyCallerTypes(*this); }
 // HWInstanceOp
 //===----------------------------------------------------------------------===//
 
-Operation *HWInstanceOp::getReferencedModule() { return getMachineOp(); }
+// InstanceOpInterface interface
 
 /// Lookup the machine for the symbol.  This returns null on invalid IR.
 MachineOp HWInstanceOp::getMachineOp() {
@@ -249,6 +292,18 @@ MachineOp HWInstanceOp::getMachineOp() {
 }
 
 LogicalResult HWInstanceOp::verify() { return verifyCallerTypes(*this); }
+
+SmallVector<hw::PortInfo> HWInstanceOp::getPortList() {
+  return getMachineOp().getPortList();
+}
+
+/// Module name is the same as the machine name.
+StringRef HWInstanceOp::getModuleName() { return getMachine(); }
+FlatSymbolRefAttr HWInstanceOp::getModuleNameAttr() { return getMachineAttr(); }
+
+mlir::StringAttr HWInstanceOp::getInstanceNameAttr() { return getNameAttr(); }
+
+llvm::StringRef HWInstanceOp::getInstanceName() { return getName(); }
 
 //===----------------------------------------------------------------------===//
 // StateOp
@@ -261,6 +316,18 @@ void StateOp::build(OpBuilder &builder, OperationState &state,
   output->push_back(new Block());
   builder.setInsertionPointToEnd(&output->back());
   builder.create<fsm::OutputOp>(state.location);
+  Region *transitions = state.addRegion();
+  transitions->push_back(new Block());
+  state.addAttribute("sym_name", builder.getStringAttr(stateName));
+}
+
+void StateOp::build(OpBuilder &builder, OperationState &state,
+                    StringRef stateName, ValueRange outputs) {
+  OpBuilder::InsertionGuard guard(builder);
+  Region *output = state.addRegion();
+  output->push_back(new Block());
+  builder.setInsertionPointToEnd(&output->back());
+  builder.create<fsm::OutputOp>(state.location, outputs);
   Region *transitions = state.addRegion();
   transitions->push_back(new Block());
   state.addAttribute("sym_name", builder.getStringAttr(stateName));
@@ -347,16 +414,29 @@ LogicalResult OutputOp::verify() {
 //===----------------------------------------------------------------------===//
 
 void TransitionOp::build(OpBuilder &builder, OperationState &state,
-                         StringRef nextState) {
-  state.addRegion(); // guard
-  state.addRegion(); // action
-  state.addAttribute("nextState",
-                     FlatSymbolRefAttr::get(builder.getStringAttr(nextState)));
+                         StateOp nextState) {
+  build(builder, state, nextState.getName());
 }
 
 void TransitionOp::build(OpBuilder &builder, OperationState &state,
-                         StateOp nextState) {
-  build(builder, state, nextState.getName());
+                         StringRef nextState,
+                         llvm::function_ref<void()> guardCtor,
+                         llvm::function_ref<void()> actionCtor) {
+  state.addAttribute("nextState",
+                     FlatSymbolRefAttr::get(builder.getStringAttr(nextState)));
+  OpBuilder::InsertionGuard guard(builder);
+
+  Region *guardRegion = state.addRegion(); // guard
+  if (guardCtor) {
+    builder.createBlock(guardRegion);
+    guardCtor();
+  }
+
+  Region *actionRegion = state.addRegion(); // action
+  if (actionCtor) {
+    builder.createBlock(actionRegion);
+    actionCtor();
+  }
 }
 
 Block *TransitionOp::ensureGuard(OpBuilder &builder) {
@@ -395,7 +475,7 @@ bool TransitionOp::isAlwaysTaken() {
 
   if (auto constantOp =
           guardReturn.getOperand().getDefiningOp<mlir::arith::ConstantOp>())
-    return constantOp.getValue().cast<BoolAttr>().getValue();
+    return cast<BoolAttr>(constantOp.getValue()).getValue();
 
   return false;
 }
@@ -408,7 +488,7 @@ LogicalResult TransitionOp::canonicalize(TransitionOp op,
       if (auto constantOp = guardReturn.getOperand()
                                 .getDefiningOp<mlir::arith::ConstantOp>()) {
         // Simplify when the guard region returns a constant value.
-        if (constantOp.getValue().cast<BoolAttr>().getValue()) {
+        if (cast<BoolAttr>(constantOp.getValue()).getValue()) {
           // Replace the original return op with a new one without any operands
           // if the constant is TRUE.
           rewriter.setInsertionPoint(guardReturn);

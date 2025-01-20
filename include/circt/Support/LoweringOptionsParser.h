@@ -47,7 +47,9 @@ struct LoweringOptionsOption
                 "explicitBitcast, emitReplicatedOpsToHeader, "
                 "locationInfoStyle={plain,wrapInAtSquareBracket,none}, "
                 "disallowPortDeclSharing, printDebugInfo, "
-                "disallowExpressionInliningInPorts, disallowMuxInlining"),
+                "disallowExpressionInliningInPorts, disallowMuxInlining, "
+                "emitWireInPort, emitBindComments, omitVersionComment, "
+                "caseInsensitiveKeywords"),
             llvm::cl::cat(cat), llvm::cl::value_desc("option")} {}
 };
 

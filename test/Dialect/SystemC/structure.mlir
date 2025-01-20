@@ -62,6 +62,8 @@ systemc.module @signals () {
   %signal0 = systemc.signal : !systemc.signal<!systemc.uint<32>>
   // CHECK-NEXT: %signal1 = systemc.signal : !systemc.signal<i1>
   %signal1 = systemc.signal : !systemc.signal<i1>
+  // CHECK-NEXT: %signal2 = systemc.signal : !systemc.signal<i1>
+  %ignoredName1 = systemc.signal name "signal2" : !systemc.signal<i1>
 
   // CHECK-NEXT: %namedSignal = systemc.signal named : !systemc.signal<i1>
   %namedSignal = systemc.signal named : !systemc.signal<i1>
@@ -101,6 +103,8 @@ systemc.module @instanceDecl (%input0: !systemc.in<!systemc.uint<32>>) {
   %moduleInstance0 = systemc.instance.decl @adder : !systemc.module<adder(summand_a: !systemc.in<!systemc.uint<32>>, summand_b: !systemc.in<!systemc.uint<32>>, sum: !systemc.out<!systemc.uint<32>>)>
   // CHECK-NEXT: %moduleInstance1 = systemc.instance.decl @moduleVisibility : !systemc.module<moduleVisibility()>
   %moduleInstance1 = systemc.instance.decl @moduleVisibility : !systemc.module<moduleVisibility()>
+  // CHECK-NEXT: %moduleInstance2 = systemc.instance.decl @moduleVisibility : !systemc.module<moduleVisibility()>
+  %ignoredName = systemc.instance.decl name "moduleInstance2" @moduleVisibility : !systemc.module<moduleVisibility()>
   // CHECK-NEXT: systemc.ctor
   systemc.ctor {
     // CHECK-NEXT: systemc.instance.bind_port %moduleInstance0["summand_a"] to %input0 : !systemc.module<adder(summand_a: !systemc.in<!systemc.uint<32>>, summand_b: !systemc.in<!systemc.uint<32>>, sum: !systemc.out<!systemc.uint<32>>)>, !systemc.in<!systemc.uint<32>>
@@ -150,11 +154,11 @@ systemc.module @member_access () {
   }
 }
 
-hw.module.extern @inst() -> ()
-hw.module.extern @instWithArgs(%a: i32, %b: i8) -> (c: i32, d: i8)
+hw.module.extern @inst()
+hw.module.extern @instWithArgs(in %a: i32, in %b: i8, out c: i32, out d: i8)
 
 // CHECK-LABEL: @verilatorInteropInHwModule
-hw.module @verilatorInteropInHwModule(%arg0: i32, %arg1: i8) -> () {
+hw.module @verilatorInteropInHwModule(in %arg0: i32, in %arg1: i8) {
   // CHECK-NEXT: %verilated.c, %verilated.d = systemc.interop.verilated "verilated" @instWithArgs (a: %arg0: i32, b: %arg1: i8) -> (c: i32, d: i8)
   %verilated.c, %verilated.d = systemc.interop.verilated "verilated" @instWithArgs (a: %arg0: i32, b: %arg1: i8) -> (c: i32, d: i8)
 }
@@ -174,4 +178,12 @@ systemc.module @sensitivity (%in: !systemc.in<i1>, %out: !systemc.out<i1>, %inou
     // CHECK-NEXT: systemc.sensitive
     systemc.sensitive
   }
+}
+
+// CHECK-LABEL: systemc.module @funcNames
+systemc.module @funcNames () {
+  // CHECK: %func1 = systemc.func
+  // CHECK: %func2 = systemc.func
+  %func1 = systemc.func {}
+  %ignoredName = systemc.func name "func2" {}
 }

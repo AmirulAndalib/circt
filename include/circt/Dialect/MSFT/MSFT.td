@@ -17,7 +17,7 @@ include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/OpBase.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
-include "mlir/IR/FunctionInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
@@ -36,7 +36,6 @@ def MSFTDialect : Dialect {
 
   let hasConstantMaterializer = 1;
   let useDefaultAttributePrinterParser = 1;
-  let useFoldAPI = kEmitFoldAdaptorFolder;
 
   let extraClassDeclaration = [{
     /// Register all MSFT attributes.
@@ -51,7 +50,6 @@ class MSFTOp<string mnemonic, list<Trait> traits = []> :
 
 include "circt/Dialect/MSFT/MSFTAttributes.td"
 include "circt/Dialect/MSFT/MSFTOpInterfaces.td"
-include "circt/Dialect/MSFT/MSFTOps.td"
 include "circt/Dialect/MSFT/MSFTPDOps.td"
 include "circt/Dialect/MSFT/MSFTConstructs.td"
 include "circt/Dialect/MSFT/MSFTPasses.td"

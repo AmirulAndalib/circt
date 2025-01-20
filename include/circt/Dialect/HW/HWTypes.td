@@ -39,12 +39,20 @@ def HWNonInOutType : DialectType<HWDialect,
 
 def InOutType : DialectType<HWDialect,
     CPred<"::circt::hw::type_isa<circt::hw::InOutType>($_self)">,
-          "InOutType", "InOutType">;
+          "InOutType", "::circt::hw::InOutType">;
+
+class InOutTypeOf<list<Type> allowedTypes>
+  : ContainerType<AnyTypeOf<allowedTypes>, CPred<"::circt::hw::type_isa<::circt::hw::InOutType>($_self)">,
+    "::circt::hw::type_cast<::circt::hw::InOutType>($_self).getElementType()", "InOutType">;
 
 // A handle to refer to circt::hw::ArrayType in ODS.
 def ArrayType : DialectType<HWDialect,
     CPred<"::circt::hw::type_isa<circt::hw::ArrayType>($_self)">,
           "an ArrayType", "::circt::hw::TypeAliasOr<circt::hw::ArrayType>">;
+
+def UnpackedArrayType : DialectType<HWDialect,
+    CPred<"::circt::hw::type_isa<circt::hw::UnpackedArrayType>($_self)">,
+          "an Unpacked ArrayType", "::circt::hw::TypeAliasOr<circt::hw::UnpackedArrayType>">;
 
 // A handle to refer to circt::hw::StructType in ODS.
 def StructType : DialectType<HWDialect,
@@ -54,7 +62,7 @@ def StructType : DialectType<HWDialect,
 // A handle to refer to circt::hw::UnionType in ODS.
 def UnionType : DialectType<HWDialect,
     CPred<"::circt::hw::type_isa<circt::hw::UnionType>($_self)">,
-          "a UnionType", "::circt::hw::TypeAliasOr<hw::UnionType>">;
+          "a UnionType", "::circt::hw::TypeAliasOr<::circt::hw::UnionType>">;
 
 // A handle to refer to circt::hw::EnumType in ODS.
 def EnumType : DialectType<HWDialect,
@@ -72,22 +80,21 @@ def HWAggregateType : DialectType<HWDialect,
       ::circt::hw::UnpackedArrayType,
       ::circt::hw::StructType>}]>;
 
-//===----------------------------------------------------------------------===//
-// Type Definitions
-//===----------------------------------------------------------------------===//
+// A handle to refer to circt::hw::ModuleType in ODS.
+def ModuleType : DialectType<HWDialect,
+    CPred<"isa<circt::hw::ModuleType>($_self)">,
+          "a module", "::circt::hw::ModuleType">;
 
-/// Points to a name within a module.
-def HWInnerRefAttr : Attr<
-  CPred<"$_self.isa<::circt::hw::InnerRefAttr>()">,
-        "name reference attribute"> {
-  let returnType = "::circt::hw::InnerRefAttr";
-  let storageType = "::circt::hw::InnerRefAttr";
-  let convertFromStorage = "$_self";
-}
+// A handle to refer to circt::hw::StringType in ODS.
+def HWStringType :
+    DialectType<HWDialect,
+      CPred<"::circt::hw::type_isa<circt::hw::StringType>($_self)">,
+      "a HW string", "::circt::hw::StringType">,
+    BuildableType<"::circt::hw::StringType::get($_builder.getContext())">;
 
 /// A flat symbol reference or a reference to a name within a module.
 def NameRefAttr : Attr<
-  CPred<"$_self.isa<::mlir::FlatSymbolRefAttr, ::circt::hw::InnerRefAttr>()">,
+  CPred<"llvm::isa<::mlir::FlatSymbolRefAttr, ::circt::hw::InnerRefAttr>($_self)">,
   "name reference attribute">{
   let returnType = "::mlir::Attribute";
   let convertFromStorage = "$_self";
@@ -103,7 +110,7 @@ def NameRefArrayAttr : TypedArrayAttrBase<NameRefAttr,
 def InnerSymProperties : AttrDef<HWDialect, "InnerSymProperties"> {
   let mnemonic = "innerSymProps";
   let parameters = (ins
-         "mlir::StringAttr":$name,
+         "::mlir::StringAttr":$name,
          DefaultValuedParameter<"uint64_t", "0">:$fieldID,
          DefaultValuedParameter<"::mlir::StringAttr", "public">:$sym_visibility
                      );
@@ -116,6 +123,7 @@ def InnerSymProperties : AttrDef<HWDialect, "InnerSymProperties"> {
   let hasCustomAssemblyFormat = 1;
   // The assembly format is as follows:
   // "`<` `@` $name `,` $fieldID `,` $sym_visibility `>`";
+  let genVerifyDecl = 1;
 }
 
 
@@ -143,19 +151,30 @@ def InnerSymAttr : AttrDef<HWDialect, "InnerSym"> {
     }]>
   ];
   let extraClassDeclaration = [{
+    using ElementType = InnerSymPropertiesAttr;
+    
     /// Get the inner sym name for fieldID, if it exists.
-    mlir::StringAttr getSymIfExists(unsigned fieldID) const;
+    mlir::StringAttr getSymIfExists(uint64_t fieldID) const;
+
     /// Get the inner sym name for fieldID=0, if it exists.
     mlir::StringAttr getSymName() const { return getSymIfExists(0); }
+
     /// Get the number of inner symbols defined.
     size_t size() const { return getProps().size(); }
+
     /// Check if this is an empty array, no sym names stored.
     bool empty() const { return getProps().empty(); }
+
+    /// Return an InnerSymAttr with the inner symbol for the specified fieldID removed.
+    InnerSymAttr erase(uint64_t fieldID) const;
+
     using iterator = mlir::ArrayRef<InnerSymPropertiesAttr>::iterator;
     /// Iterator begin for all the InnerSymProperties.
     iterator begin() const { return getProps().begin(); }
+
     /// Iterator end for all the InnerSymProperties.
     iterator end() const { return getProps().end(); }
+
     /// Invoke the func, for all sym names. Return success(),
     /// if the callback function never returns failure().
     mlir::LogicalResult walkSymbols(llvm::function_ref<

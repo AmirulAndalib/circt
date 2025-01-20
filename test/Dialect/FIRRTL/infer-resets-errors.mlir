@@ -6,7 +6,6 @@
 // - github.com/sifive/$internal:
 //   - test/scala/firrtl/FullAsyncResetTransform.scala
 
-
 //===----------------------------------------------------------------------===//
 // Reset Inference
 //===----------------------------------------------------------------------===//
@@ -41,7 +40,7 @@ firrtl.circuit "top" {
     // expected-note @+1 {{sync drive here:}}
     firrtl.connect %w2, %reset2 : !firrtl.reset, !firrtl.uint<1>
     firrtl.connect %out, %w2 : !firrtl.reset, !firrtl.reset
-    firrtl.when %en  {
+    firrtl.when %en : !firrtl.uint<1>  {
       firrtl.connect %out, %w0 : !firrtl.reset, !firrtl.reset
     } else  {
       firrtl.connect %out, %w1 : !firrtl.reset, !firrtl.reset
@@ -61,7 +60,7 @@ firrtl.circuit "top" {
     // expected-note @+1 {{sync drive here:}}
     firrtl.connect %w2, %reset1 : !firrtl.reset, !firrtl.uint<1>
     firrtl.connect %out, %w1 : !firrtl.reset, !firrtl.reset
-    firrtl.when %en  {
+    firrtl.when %en : !firrtl.uint<1>  {
       firrtl.connect %out, %w2 : !firrtl.reset, !firrtl.reset
     }
   }
@@ -152,22 +151,52 @@ firrtl.circuit "top" {
 }
 
 //===----------------------------------------------------------------------===//
-// Full Async Reset
+// Full Reset
 //===----------------------------------------------------------------------===//
 
 // -----
 // Reset annotation cannot target module
 firrtl.circuit "top" {
-  // expected-error @+1 {{FullAsyncResetAnnotation' cannot target module; must target port or wire/node instead}}
-  firrtl.module @top() attributes {annotations = [{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]} {
+  // expected-error @+1 {{'FullResetAnnotation' cannot target module; must target port or wire/node instead}}
+  firrtl.module @top() attributes {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} {
   }
 }
 
 // -----
+// Reset annotation resetType must match type of signal
+firrtl.circuit "top" {
+  firrtl.module @top() {
+    // expected-error @below {{'FullResetAnnotation' with resetType == 'async' must target async reset, but targets '!firrtl.uint<1>'}}
+    %innerReset = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} : !firrtl.uint<1>
+    // expected-error @below {{'FullResetAnnotation' with resetType == 'sync' must target sync reset, but targets '!firrtl.asyncreset'}}
+    %innerReset2 = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "sync"}]} : !firrtl.asyncreset
+    // expected-error @below {{'FullResetAnnotation' with resetType == 'sync' must target sync reset, but targets '!firrtl.uint<2>'}}
+    %innerReset3 = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "sync"}]} : !firrtl.uint<2>
+  }
+}
+
+// -----
+// Reset annotation cannot target reset signals which are inferred to the wrong type
+firrtl.circuit "top" {
+  firrtl.module @top() {
+   // expected-error @below {{'FullResetAnnotation' with resetType == 'async' must target async reset, but targets '!firrtl.uint<1>'}}
+    %innerReset = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} : !firrtl.reset
+    %invalid = firrtl.invalidvalue : !firrtl.reset
+    firrtl.matchingconnect %innerReset, %invalid : !firrtl.reset
+
+    // expected-error @below {{'FullResetAnnotation' with resetType == 'sync' must target sync reset, but targets '!firrtl.asyncreset'}}
+    %innerReset2 = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "sync"}]} : !firrtl.reset
+    %asyncWire = firrtl.wire : !firrtl.asyncreset
+    firrtl.connect %innerReset2, %asyncWire : !firrtl.reset, !firrtl.asyncreset
+  }
+}
+
+
+// -----
 // Ignore reset annotation cannot target port
 firrtl.circuit "top" {
-  // expected-error @+1 {{IgnoreFullAsyncResetAnnotation' cannot target port; must target module instead}}
-  firrtl.module @top(in %reset: !firrtl.asyncreset) attributes {portAnnotations =[[{class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation"}]]} {
+  // expected-error @+1 {{ExcludeFromFullResetAnnotation' cannot target port/wire/node; must target module instead}}
+  firrtl.module @top(in %reset: !firrtl.asyncreset) attributes {portAnnotations =[[{class = "circt.ExcludeFromFullResetAnnotation"}]]} {
   }
 }
 
@@ -175,14 +204,14 @@ firrtl.circuit "top" {
 // Ignore reset annotation cannot target wire/node
 firrtl.circuit "top" {
   firrtl.module @top() {
-    // expected-error @+1 {{IgnoreFullAsyncResetAnnotation' cannot target wire/node; must target module instead}}
-    %0 = firrtl.wire {annotations = [{class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation"}]} : !firrtl.asyncreset
-    // expected-error @+1 {{IgnoreFullAsyncResetAnnotation' cannot target wire/node; must target module instead}}
-    %1 = firrtl.node %0 {annotations = [{class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation"}]} : !firrtl.asyncreset
+    // expected-error @+1 {{ExcludeFromFullResetAnnotation' cannot target port/wire/node; must target module instead}}
+    %0 = firrtl.wire {annotations = [{class = "circt.ExcludeFromFullResetAnnotation"}]} : !firrtl.asyncreset
+    // expected-error @+1 {{ExcludeFromFullResetAnnotation' cannot target port/wire/node; must target module instead}}
+    %1 = firrtl.node %0 {annotations = [{class = "circt.ExcludeFromFullResetAnnotation"}]} : !firrtl.asyncreset
     // expected-error @+1 {{reset annotations must target module, port, or wire/node}}
-    %2 = firrtl.asUInt %0 {annotations = [{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]} : (!firrtl.asyncreset) -> !firrtl.uint<1>
+    %2 = firrtl.asUInt %0 {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} : (!firrtl.asyncreset) -> !firrtl.uint<1>
     // expected-error @+1 {{reset annotations must target module, port, or wire/node}}
-    %3 = firrtl.asUInt %0 {annotations = [{class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation"}]} : (!firrtl.asyncreset) -> !firrtl.uint<1>
+    %3 = firrtl.asUInt %0 {annotations = [{class = "circt.ExcludeFromFullResetAnnotation"}]} : (!firrtl.asyncreset) -> !firrtl.uint<1>
   }
 }
 
@@ -190,12 +219,12 @@ firrtl.circuit "top" {
 // Cannot have multiple reset annotations on a module
 firrtl.circuit "top" {
   // expected-error @+2 {{multiple reset annotations on module 'top'}}
-  // expected-note @+1 {{conflicting "sifive.enterprise.firrtl.FullAsyncResetAnnotation":}}
-  firrtl.module @top(in %outerReset: !firrtl.asyncreset) attributes {portAnnotations = [[{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]]} {
-    // expected-note @+1 {{conflicting "sifive.enterprise.firrtl.FullAsyncResetAnnotation":}}
-    %innerReset = firrtl.wire {annotations = [{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]} : !firrtl.asyncreset
-    // expected-note @+1 {{conflicting "sifive.enterprise.firrtl.FullAsyncResetAnnotation":}}
-    %anotherReset = firrtl.node %innerReset {annotations = [{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]} : !firrtl.asyncreset
+  // expected-note @+1 {{conflicting "circt.FullResetAnnotation":}}
+  firrtl.module @top(in %outerReset: !firrtl.asyncreset) attributes {portAnnotations = [[{class = "circt.FullResetAnnotation", resetType = "async"}]]} {
+    // expected-note @+1 {{conflicting "circt.FullResetAnnotation":}}
+    %innerReset = firrtl.wire {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} : !firrtl.asyncreset
+    // expected-note @+1 {{conflicting "circt.FullResetAnnotation":}}
+    %anotherReset = firrtl.node %innerReset {annotations = [{class = "circt.FullResetAnnotation", resetType = "async"}]} : !firrtl.asyncreset
   }
 }
 
@@ -204,21 +233,21 @@ firrtl.circuit "top" {
 firrtl.circuit "Top" {
   // expected-error @+1 {{module 'Foo' instantiated in different reset domains}}
   firrtl.module @Foo(in %clock: !firrtl.clock) {
-    %reg = firrtl.reg %clock : !firrtl.uint<8>
+    %reg = firrtl.reg %clock : !firrtl.clock, !firrtl.uint<8>
   }
   // expected-note @+1 {{reset domain 'otherReset' of module 'Child' declared here:}}
-  firrtl.module @Child(in %clock: !firrtl.clock, in %otherReset: !firrtl.asyncreset) attributes {portAnnotations = [[],[{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]]} {
+  firrtl.module @Child(in %clock: !firrtl.clock, in %otherReset: !firrtl.asyncreset) attributes {portAnnotations = [[],[{class = "circt.FullResetAnnotation", resetType = "async"}]]} {
     // expected-note @+1 {{instance 'child/inst' is in reset domain rooted at 'otherReset' of module 'Child'}}
     %inst_clock = firrtl.instance inst @Foo(in clock: !firrtl.clock)
     firrtl.connect %inst_clock, %clock : !firrtl.clock, !firrtl.clock
   }
-  firrtl.module @Other(in %clock: !firrtl.clock) attributes {annotations = [{class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation"}]} {
+  firrtl.module @Other(in %clock: !firrtl.clock) attributes {annotations = [{class = "circt.ExcludeFromFullResetAnnotation"}]} {
     // expected-note @+1 {{instance 'other/inst' is in no reset domain}}
     %inst_clock = firrtl.instance inst @Foo(in clock: !firrtl.clock)
     firrtl.connect %inst_clock, %clock : !firrtl.clock, !firrtl.clock
   }
   // expected-note @+1 {{reset domain 'reset' of module 'Top' declared here:}}
-  firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.asyncreset) attributes {portAnnotations = [[],[{class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation"}]]} {
+  firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.asyncreset) attributes {portAnnotations = [[],[{class = "circt.FullResetAnnotation", resetType = "async"}]]} {
     %child_clock, %child_otherReset = firrtl.instance child @Child(in clock: !firrtl.clock, in otherReset: !firrtl.asyncreset)
     %other_clock = firrtl.instance other @Other(in clock: !firrtl.clock)
     // expected-note @+1 {{instance 'foo' is in reset domain rooted at 'reset' of module 'Top'}}
@@ -232,13 +261,23 @@ firrtl.circuit "Top" {
 // -----
 
 firrtl.circuit "UninferredReset" {
-  // expected-error @+1 {{has an abstract reset type port "reset" after InferResets}}
+  // expected-error @+2 {{a port "reset" with abstract reset type was unable to be inferred by InferResets}}
+  // expected-note @+1 {{the module with this uninferred reset port was defined here}}
   firrtl.module @UninferredReset(in %reset: !firrtl.reset) {}
 }
 
 // -----
 
 firrtl.circuit "UninferredRefReset" {
-  // expected-error @+1 {{has an abstract reset type port "reset" after InferResets}}
-  firrtl.module @UninferredRefReset(in %reset: !firrtl.ref<reset>) {}
+  firrtl.module @UninferredRefReset() {}
+  // expected-error @+2 {{a port "reset" with abstract reset type was unable to be inferred by InferResets}}
+  // expected-note @+1 {{the module with this uninferred reset port was defined here}}
+  firrtl.module private @UninferredRefResetPriv(out %reset: !firrtl.probe<reset>) {}
+}
+
+// -----
+// Invalid FullResetAnnotation resetType
+firrtl.circuit "Top" {
+  // expected-error @+1 {{'FullResetAnnotation' requires resetType == 'sync' | 'async', but got resetType == "potato"}}
+  firrtl.module @Top(in %reset: !firrtl.asyncreset) attributes {portAnnotations = [[{class = "circt.FullResetAnnotation", resetType = "potato"}]]} {}
 }

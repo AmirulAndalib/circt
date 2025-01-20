@@ -16,6 +16,7 @@
 #ifndef DIALECT_MSFT_TRANSFORMS_PASSDETAILS_H
 #define DIALECT_MSFT_TRANSFORMS_PASSDETAILS_H
 
+#include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/MSFT/MSFTOps.h"
 #include "circt/Dialect/MSFT/MSFTPasses.h"
 #include "circt/Dialect/SV/SVOps.h"
@@ -25,10 +26,6 @@
 
 namespace circt {
 namespace msft {
-
-/// TODO: Migrate these to some sort of OpInterface shared with hw.
-bool isAnyModule(Operation *module);
-hw::ModulePortInfo getModulePortInfo(Operation *op);
 
 /// Utility for creating {0, 1, 2, ..., size}.
 SmallVector<unsigned> makeSequentialRange(unsigned size);
@@ -49,9 +46,6 @@ struct RemoveOpLowering : public OpConversionPattern<OpTy> {
     return success();
   }
 };
-
-#define GEN_PASS_CLASSES
-#include "circt/Dialect/MSFT/MSFTPasses.h.inc"
 
 } // namespace msft
 } // namespace circt

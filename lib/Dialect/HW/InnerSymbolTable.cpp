@@ -15,8 +15,6 @@
 #include "mlir/IR/Threading.h"
 #include "llvm/Support/Debug.h"
 
-#define DEBUG_TYPE "ist"
-
 using namespace circt;
 using namespace hw;
 
@@ -63,12 +61,7 @@ FailureOr<InnerSymbolTable> InnerSymbolTable::get(Operation *op) {
 
 LogicalResult InnerSymbolTable::walkSymbols(Operation *op,
                                             InnerSymCallbackFn callback) {
-  using llvm::dbgs;
-  LLVM_DEBUG(dbgs() << "===----- InnerSymbolTable -----===\n";
-             dbgs() << "Walking inner symbols for @"
-                    << SymbolTable::getSymbolName(op) << "\n");
   auto walkSym = [&](StringAttr name, const InnerSymTarget &target) {
-    LLVM_DEBUG(dbgs() << " - @" << name << " -> " << target << "\n");
     assert(name && !name.getValue().empty());
     return callback(name, target);
   };
@@ -85,6 +78,15 @@ LogicalResult InnerSymbolTable::walkSymbols(Operation *op,
     return success();
   };
 
+  // Check for ports
+  if (auto mod = dyn_cast<PortList>(op)) {
+    for (auto [i, port] : llvm::enumerate(mod.getPortList())) {
+      if (auto symAttr = port.getSym())
+        if (failed(walkSyms(symAttr, InnerSymTarget(i, mod))))
+          return failure();
+    }
+  }
+
   // Walk the operation and add InnerSymbolTarget's to the table.
   return success(
       !op->walk<mlir::WalkOrder::PreOrder>([&](Operation *curOp) -> WalkResult {
@@ -93,15 +95,6 @@ LogicalResult InnerSymbolTable::walkSymbols(Operation *op,
                if (failed(walkSyms(symAttr, InnerSymTarget(symOp))))
                  return WalkResult::interrupt();
 
-           // Check for ports
-           // TODO: Add fields per port, once they work that way (use addSyms)
-           if (auto mod = dyn_cast<HWModuleLike>(curOp)) {
-             for (size_t i = 0, e = mod.getNumPorts(); i < e; ++i) {
-               if (auto symAttr = mod.getPortSymbolAttr(i))
-                 if (failed(walkSyms(symAttr, InnerSymTarget(i, curOp))))
-                   return WalkResult::interrupt();
-             }
-           }
            return WalkResult::advance();
          }).wasInterrupted());
 }
@@ -143,10 +136,9 @@ StringAttr InnerSymbolTable::getInnerSymbol(const InnerSymTarget &target) {
   // Obtain the base InnerSymAttr for the specified target.
   auto getBase = [](auto &target) -> hw::InnerSymAttr {
     if (target.isPort()) {
-      // TODO: This needs to be made to work with HWModuleLike
-      if (auto mod = dyn_cast<HWModuleLike>(target.getOp())) {
+      if (auto mod = dyn_cast<PortList>(target.getOp())) {
         assert(target.getPort() < mod.getNumPorts());
-        return mod.getPortSymbolAttr(target.getPort());
+        return mod.getPort(target.getPort()).getSym();
       }
     } else {
       // InnerSymbols only supported if op implements the interface.
@@ -206,7 +198,7 @@ InnerSymbolTableCollection::populateAndVerifyTables(Operation *innerRefNSOp) {
 // InnerRefNamespace
 //===----------------------------------------------------------------------===//
 
-InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) {
+InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) const {
   auto *mod = symTable.lookup(inner.getModule());
   if (!mod)
     return {};
@@ -214,7 +206,7 @@ InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) {
   return innerSymTables.getInnerSymbolTable(mod).lookup(inner.getName());
 }
 
-Operation *InnerRefNamespace::lookupOp(hw::InnerRefAttr inner) {
+Operation *InnerRefNamespace::lookupOp(hw::InnerRefAttr inner) const {
   auto *mod = symTable.lookup(inner.getModule());
   if (!mod)
     return nullptr;
@@ -244,12 +236,36 @@ LogicalResult verifyInnerRefNamespace(Operation *op) {
       return WalkResult(user.verifyInnerRefs(ns));
     return WalkResult::advance();
   };
+
+  SmallVector<Operation *> topLevelOps;
+  for (auto &op : op->getRegion(0).front()) {
+    // Gather operations with regions for parallel processing.
+    if (op.getNumRegions() != 0) {
+      topLevelOps.push_back(&op);
+      continue;
+    }
+    // Otherwise, handle right now -- not worth the cost.
+    if (verifySymbolUserFn(&op).wasInterrupted())
+      return failure();
+  }
   return mlir::failableParallelForEach(
-      op->getContext(), op->getRegion(0).front(), [&](auto &op) {
-        return success(!op.walk(verifySymbolUserFn).wasInterrupted());
+      op->getContext(), topLevelOps, [&](Operation *op) {
+        return success(!op->walk(verifySymbolUserFn).wasInterrupted());
       });
 }
 
 } // namespace detail
+
+bool InnerRefNamespaceLike::classof(mlir::Operation *op) {
+  return op->hasTrait<mlir::OpTrait::InnerRefNamespace>() ||
+         op->hasTrait<mlir::OpTrait::SymbolTable>();
+}
+
+bool InnerRefNamespaceLike::classof(
+    const mlir::RegisteredOperationName *opInfo) {
+  return opInfo->hasTrait<mlir::OpTrait::InnerRefNamespace>() ||
+         opInfo->hasTrait<mlir::OpTrait::SymbolTable>();
+}
+
 } // namespace hw
 } // namespace circt

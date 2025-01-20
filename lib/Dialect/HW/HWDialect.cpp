@@ -50,10 +50,12 @@ struct HWInlinerInterface : public mlir::DialectInlinerInterface {
 
   bool isLegalToInline(Operation *op, Region *, bool,
                        mlir::IRMapping &) const final {
-    return isa<ConstantOp>(op) || isa<BitcastOp>(op) ||
+    return isa<ConstantOp>(op) || isa<AggregateConstantOp>(op) ||
+           isa<EnumConstantOp>(op) || isa<BitcastOp>(op) ||
            isa<ArrayCreateOp>(op) || isa<ArrayConcatOp>(op) ||
            isa<ArraySliceOp>(op) || isa<ArrayGetOp>(op) ||
-           isa<StructCreateOp>(op) || isa<StructInjectOp>(op) ||
+           isa<StructCreateOp>(op) || isa<StructExplodeOp>(op) ||
+           isa<StructExtractOp>(op) || isa<StructInjectOp>(op) ||
            isa<UnionCreateOp>(op) || isa<UnionExtractOp>(op);
   }
 
@@ -89,13 +91,13 @@ void HWDialect::initialize() {
 Operation *HWDialect::materializeConstant(OpBuilder &builder, Attribute value,
                                           Type type, Location loc) {
   // Integer constants can materialize into hw.constant
-  if (auto intType = type.dyn_cast<IntegerType>())
-    if (auto attrValue = value.dyn_cast<IntegerAttr>())
+  if (auto intType = dyn_cast<IntegerType>(type))
+    if (auto attrValue = dyn_cast<IntegerAttr>(value))
       return builder.create<ConstantOp>(loc, type, attrValue);
 
   // Aggregate constants.
-  if (auto arrayAttr = value.dyn_cast<ArrayAttr>()) {
-    if (type.isa<StructType, ArrayType, UnpackedArrayType>())
+  if (auto arrayAttr = dyn_cast<ArrayAttr>(value)) {
+    if (isa<StructType, ArrayType, UnpackedArrayType>(type))
       return builder.create<AggregateConstantOp>(loc, type, arrayAttr);
   }
 
@@ -109,6 +111,3 @@ Operation *HWDialect::materializeConstant(OpBuilder &builder, Attribute value,
 
   return nullptr;
 }
-
-// Provide implementations for the enums we use.
-#include "circt/Dialect/HW/HWEnums.cpp.inc"

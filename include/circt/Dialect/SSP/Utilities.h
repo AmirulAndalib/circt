@@ -109,7 +109,7 @@ OperatorType loadOperatorType(ProblemT &prob, OperatorTypeOp oprOp,
   assert(!prob.hasOperatorType(opr));
   prob.insertOperatorType(opr);
   loadOperatorTypeProperties<ProblemT, OperatorTypePropertyTs...>(
-      prob, opr, oprOp.getPropertiesAttr());
+      prob, opr, oprOp.getSspPropertiesAttr());
   return opr;
 }
 
@@ -142,10 +142,10 @@ ProblemT loadProblem(InstanceOp instOp,
                      std::tuple<OperatorTypePropertyTs...> oprProps,
                      std::tuple<DependencePropertyTs...> depProps,
                      std::tuple<InstancePropertyTs...> instProps) {
-  auto prob = ProblemT::get(instOp);
+  ProblemT prob(instOp);
 
   loadInstanceProperties<ProblemT, InstancePropertyTs...>(
-      prob, instOp.getPropertiesAttr());
+      prob, instOp.getSspPropertiesAttr());
   if (auto instName = instOp.getSymNameAttr())
     prob.setInstanceName(instName);
 
@@ -171,7 +171,7 @@ ProblemT loadProblem(InstanceOp instOp,
   graphOp.walk([&](OperationOp opOp) {
     prob.insertOperation(opOp);
     loadOperationProperties<ProblemT, OperationPropertyTs...>(
-        prob, opOp, opOp.getPropertiesAttr());
+        prob, opOp, opOp.getSspPropertiesAttr());
     if (auto opName = opOp.getSymNameAttr())
       prob.setOperationName(opOp, opName);
 
@@ -325,7 +325,7 @@ saveProblem(ProblemT &prob, std::tuple<OperationPropertyTs...> opProps,
 
   // Set up instance.
   auto instOp = b.create<InstanceOp>(
-      builder.getStringAttr(ProblemT::PROBLEM_NAME),
+      builder.getStringAttr(ProblemT::name),
       saveInstanceProperties<ProblemT, InstancePropertyTs...>(prob, b));
   if (auto instName = prob.getInstanceName())
     instOp.setSymNameAttr(instName);
@@ -514,6 +514,18 @@ struct Default<scheduling::ModuloProblem> {
       Default<scheduling::Problem>::operationProperties;
   static constexpr auto operatorTypeProperties =
       Default<scheduling::SharedOperatorsProblem>::operatorTypeProperties;
+  static constexpr auto dependenceProperties =
+      Default<scheduling::CyclicProblem>::dependenceProperties;
+  static constexpr auto instanceProperties =
+      Default<scheduling::CyclicProblem>::instanceProperties;
+};
+
+template <>
+struct Default<scheduling::ChainingCyclicProblem> {
+  static constexpr auto operationProperties =
+      Default<scheduling::ChainingProblem>::operationProperties;
+  static constexpr auto operatorTypeProperties =
+      Default<scheduling::ChainingProblem>::operatorTypeProperties;
   static constexpr auto dependenceProperties =
       Default<scheduling::CyclicProblem>::dependenceProperties;
   static constexpr auto instanceProperties =

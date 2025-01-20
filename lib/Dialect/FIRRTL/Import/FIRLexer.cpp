@@ -111,15 +111,15 @@ std::string FIRToken::getStringValue(StringRef spelling) {
   return result;
 }
 
-/// Given a token containing a raw string, return its value, including removing
-/// the quote characters and unescaping the quotes of the string. The lexer has
-/// already verified that this token is valid.
-std::string FIRToken::getRawStringValue() const {
-  assert(getKind() == raw_string);
-  return getRawStringValue(getSpelling());
+/// Given a token containing a verbatim string, return its value, including
+/// removing the quote characters and unescaping the quotes of the string. The
+/// lexer has already verified that this token is valid.
+std::string FIRToken::getVerbatimStringValue() const {
+  assert(getKind() == verbatim_string);
+  return getVerbatimStringValue(getSpelling());
 }
 
-std::string FIRToken::getRawStringValue(StringRef spelling) {
+std::string FIRToken::getVerbatimStringValue(StringRef spelling) {
   // Start by dropping the quotes.
   StringRef bytes = spelling.drop_front().drop_back();
 
@@ -157,7 +157,7 @@ static StringAttr getMainBufferNameIdentifier(const llvm::SourceMgr &sourceMgr,
 }
 
 FIRLexer::FIRLexer(const llvm::SourceMgr &sourceMgr, MLIRContext *context)
-    : sourceMgr(sourceMgr), context(context),
+    : sourceMgr(sourceMgr),
       bufferNameIdentifier(getMainBufferNameIdentifier(sourceMgr, context)),
       curBuffer(
           sourceMgr.getMemoryBuffer(sourceMgr.getMainFileID())->getBuffer()),
@@ -186,9 +186,7 @@ std::optional<unsigned> FIRLexer::getIndentation(const FIRToken &tok) const {
   // Count the number of horizontal whitespace characters before the token.
   auto *bufStart = curBuffer.begin();
 
-  auto isHorizontalWS = [](char c) -> bool {
-    return c == ' ' || c == '\t' || c == ',';
-  };
+  auto isHorizontalWS = [](char c) -> bool { return c == ' ' || c == '\t'; };
   auto isVerticalWS = [](char c) -> bool {
     return c == '\n' || c == '\r' || c == '\f' || c == '\v';
   };
@@ -233,16 +231,18 @@ FIRToken FIRLexer::lexTokenImpl() {
     case '\t':
     case '\n':
     case '\r':
-    case ',':
       // Handle whitespace.
       continue;
 
+    case '`':
     case '_':
       // Handle identifiers.
       return lexIdentifierOrKeyword(tokStart);
 
     case '.':
       return formToken(FIRToken::period, tokStart);
+    case ',':
+      return formToken(FIRToken::comma, tokStart);
     case ':':
       return formToken(FIRToken::colon, tokStart);
     case '(':
@@ -250,6 +250,8 @@ FIRToken FIRLexer::lexTokenImpl() {
     case ')':
       return formToken(FIRToken::r_paren, tokStart);
     case '{':
+      if (*curPtr == '|')
+        return ++curPtr, formToken(FIRToken::l_brace_bar, tokStart);
       return formToken(FIRToken::l_brace, tokStart);
     case '}':
       return formToken(FIRToken::r_brace, tokStart);
@@ -258,8 +260,6 @@ FIRToken FIRLexer::lexTokenImpl() {
     case ']':
       return formToken(FIRToken::r_square, tokStart);
     case '<':
-      if (*curPtr == '-')
-        return ++curPtr, formToken(FIRToken::less_minus, tokStart);
       if (*curPtr == '=')
         return ++curPtr, formToken(FIRToken::less_equal, tokStart);
       return formToken(FIRToken::less, tokStart);
@@ -280,18 +280,23 @@ FIRToken FIRLexer::lexTokenImpl() {
       if (*curPtr == '[')
         return lexInlineAnnotation(tokStart);
       return emitError(tokStart, "unexpected character following '%'");
+    case '|':
+      if (*curPtr == '}')
+        return ++curPtr, formToken(FIRToken::r_brace_bar, tokStart);
+      // Unknown character, emit an error.
+      return emitError(tokStart, "unexpected character");
 
     case ';':
       skipComment();
       continue;
 
     case '"':
-      return lexString(tokStart, /*isRaw=*/false);
+      return lexString(tokStart, /*isVerbatim=*/false);
     case '\'':
-      return lexString(tokStart, /*isRaw=*/true);
+      return lexString(tokStart, /*isVerbatim=*/true);
 
-    case '+':
     case '-':
+    case '+':
     case '0':
     case '1':
     case '2':
@@ -347,9 +352,6 @@ FIRToken FIRLexer::lexInlineAnnotation(const char *tokStart) {
   bool stringMode = false;
   while (1) {
     switch (*curPtr++) {
-    case '\\':
-      ++curPtr;
-      break;
     case '"':
       stringMode = !stringMode;
       break;
@@ -365,6 +367,9 @@ FIRToken FIRLexer::lexInlineAnnotation(const char *tokStart) {
         break;
       ++depth;
       break;
+    case '\\':
+      ++curPtr;
+      [[fallthrough]];
     case 0:
       if (curPtr - 1 != curBuffer.end())
         break;
@@ -379,14 +384,25 @@ FIRToken FIRLexer::lexInlineAnnotation(const char *tokStart) {
 ///
 ///   LegalStartChar ::= [a-zA-Z_]
 ///   LegalIdChar    ::= LegalStartChar | [0-9] | '$'
-//
+///
 ///   Id ::= LegalStartChar (LegalIdChar)*
+///   LiteralId ::= [a-zA-Z0-9$_]+
 ///
 FIRToken FIRLexer::lexIdentifierOrKeyword(const char *tokStart) {
+  // Remember that this is a literalID
+  bool isLiteralId = *tokStart == '`';
+
   // Match the rest of the identifier regex: [0-9a-zA-Z_$-]*
   while (llvm::isAlpha(*curPtr) || llvm::isDigit(*curPtr) || *curPtr == '_' ||
          *curPtr == '$' || *curPtr == '-')
     ++curPtr;
+
+  // Consume the trailing '`' in a literal identifier.
+  if (isLiteralId) {
+    if (*curPtr != '`')
+      return emitError(tokStart, "unterminated literal identifier");
+    ++curPtr;
+  }
 
   StringRef spelling(tokStart, curPtr - tokStart);
 
@@ -403,11 +419,17 @@ FIRToken FIRLexer::lexIdentifierOrKeyword(const char *tokStart) {
     }
   }
 
-  // Check to see if this identifier is a keyword.
+  // See if the identifier is a keyword.  By default, it is an identifier.
   FIRToken::Kind kind = llvm::StringSwitch<FIRToken::Kind>(spelling)
 #define TOK_KEYWORD(SPELLING) .Case(#SPELLING, FIRToken::kw_##SPELLING)
 #include "FIRTokenKinds.def"
                             .Default(FIRToken::identifier);
+
+  // If this has the backticks of a literal identifier and it fell through the
+  // above switch, indicating that it was not found to e a keyword, then change
+  // its kind from identifier to literal identifier.
+  if (isLiteralId && kind == FIRToken::identifier)
+    kind = FIRToken::literal_identifier;
 
   return FIRToken(kind, spelling);
 }
@@ -434,24 +456,24 @@ void FIRLexer::skipComment() {
   }
 }
 
-/// StringLit      ::= '"' UnquotedString? '"'
-/// RawString      ::= '\'' UnquotedString? '\''
-/// UnquotedString ::= ( '\\\'' | '\\"' | ~[\r\n] )+?
+/// StringLit         ::= '"' UnquotedString? '"'
+/// VerbatimStringLit ::= '\'' UnquotedString? '\''
+/// UnquotedString    ::= ( '\\\'' | '\\"' | ~[\r\n] )+?
 ///
-FIRToken FIRLexer::lexString(const char *tokStart, bool isRaw) {
+FIRToken FIRLexer::lexString(const char *tokStart, bool isVerbatim) {
   while (1) {
     switch (*curPtr++) {
     case '"': // This is the end of the string literal.
-      if (isRaw)
+      if (isVerbatim)
         break;
       return formToken(FIRToken::string, tokStart);
     case '\'': // This is the end of the raw string.
-      if (!isRaw)
+      if (!isVerbatim)
         break;
-      return formToken(FIRToken::raw_string, tokStart);
+      return formToken(FIRToken::verbatim_string, tokStart);
     case '\\':
       // Ignore escaped '\'' or '"'
-      if (*curPtr == '\'' || *curPtr == '"')
+      if (*curPtr == '\'' || *curPtr == '"' || *curPtr == '\\')
         ++curPtr;
       else if (*curPtr == 'u' || *curPtr == 'U')
         return emitError(tokStart, "unicode escape not supported in string");
@@ -484,6 +506,8 @@ FIRToken FIRLexer::lexString(const char *tokStart, bool isRaw) {
 ///       ( '+' | '-' )? Digit+ '.' Digit+ ( 'E' ( '+' | '-' )? Digit+ )?
 ///   TripleLit ::=
 ///       Digit+ '.' Digit+ '.' Digit+
+///   Radix-specified Integer ::=
+///       ( '-' )? '0' ( 'b' | 'o' | 'd' | 'h' ) LegalDigit*
 ///
 FIRToken FIRLexer::lexNumber(const char *tokStart) {
   assert(llvm::isDigit(curPtr[-1]) || curPtr[-1] == '+' || curPtr[-1] == '-');
@@ -491,6 +515,40 @@ FIRToken FIRLexer::lexNumber(const char *tokStart) {
   // There needs to be at least one digit.
   if (!llvm::isDigit(*curPtr) && !llvm::isDigit(curPtr[-1]))
     return emitError(tokStart, "unexpected character after sign");
+
+  // If we encounter a "b", "o", "d", or "h", this is a radix-specified integer
+  // literal.  This is only supported for FIRRTL 2.4.0 or later.  This is always
+  // lexed, but rejected during parsing if the version is too old.
+  const char *oldPtr = curPtr;
+  if (curPtr[-1] == '-' && *curPtr == '0')
+    ++curPtr;
+  if (curPtr[-1] == '0') {
+    switch (*curPtr) {
+    case 'b':
+      ++curPtr;
+      while (*curPtr >= '0' && *curPtr <= '1')
+        ++curPtr;
+      return formToken(FIRToken::radix_specified_integer, tokStart);
+    case 'o':
+      ++curPtr;
+      while (*curPtr >= '0' && *curPtr <= '7')
+        ++curPtr;
+      return formToken(FIRToken::radix_specified_integer, tokStart);
+    case 'd':
+      ++curPtr;
+      while (llvm::isDigit(*curPtr))
+        ++curPtr;
+      return formToken(FIRToken::radix_specified_integer, tokStart);
+    case 'h':
+      ++curPtr;
+      while (llvm::isHexDigit(*curPtr))
+        ++curPtr;
+      return formToken(FIRToken::radix_specified_integer, tokStart);
+    default:
+      curPtr = oldPtr;
+      break;
+    }
+  }
 
   while (llvm::isDigit(*curPtr))
     ++curPtr;

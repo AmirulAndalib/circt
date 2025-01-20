@@ -9,15 +9,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
-#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/HW/InnerSymbolNamespace.h"
+#include "circt/Dialect/Seq/SeqAttributes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
@@ -25,6 +27,13 @@
 #include "llvm/Support/Parallel.h"
 #include <optional>
 #include <set>
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_LOWERMEMORY
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -72,23 +81,31 @@ FirMemory getSummary(MemOp op) {
     op.emitError("'firrtl.mem' should have simple type and known width");
     width = 0;
   }
-  uint32_t groupID = 0;
-  if (auto gID = op.getGroupIDAttr())
-    groupID = gID.getUInt();
-  return {numReadPorts,         numWritePorts,    numReadWritePorts,
-          (size_t)width,        op.getDepth(),    op.getReadLatency(),
-          op.getWriteLatency(), op.getMaskBits(), (size_t)op.getRuw(),
-          hw::WUW::PortOrder,   writeClockIDs,    op.getNameAttr(),
-          op.getMaskBits() > 1, groupID,          op.getInitAttr(),
+  return {numReadPorts,
+          numWritePorts,
+          numReadWritePorts,
+          (size_t)width,
+          op.getDepth(),
+          op.getReadLatency(),
+          op.getWriteLatency(),
+          op.getMaskBits(),
+          *seq::symbolizeRUW(unsigned(op.getRuw())),
+          seq::WUW::PortOrder,
+          writeClockIDs,
+          op.getNameAttr(),
+          op.getMaskBits() > 1,
+          op.getInitAttr(),
+          op.getPrefixAttr(),
           op.getLoc()};
 }
 
 namespace {
-struct LowerMemoryPass : public LowerMemoryBase<LowerMemoryPass> {
+struct LowerMemoryPass
+    : public circt::firrtl::impl::LowerMemoryBase<LowerMemoryPass> {
 
   /// Get the cached namespace for a module.
-  ModuleNamespace &getModuleNamespace(FModuleLike module) {
-    return moduleNamespaces.try_emplace(module, module).first->second;
+  hw::InnerSymbolNamespace &getModuleNamespace(FModuleLike moduleOp) {
+    return moduleNamespaces.try_emplace(moduleOp, moduleOp).first->second;
   }
 
   SmallVector<PortInfo> getMemoryModulePorts(const FirMemory &mem);
@@ -99,20 +116,23 @@ struct LowerMemoryPass : public LowerMemoryBase<LowerMemoryPass> {
                                     bool shouldDedup);
   FModuleOp createWrapperModule(MemOp op, const FirMemory &summary,
                                 bool shouldDedup);
-  InstanceOp emitMemoryInstance(MemOp op, FModuleOp module,
+  InstanceOp emitMemoryInstance(MemOp op, FModuleOp moduleOp,
                                 const FirMemory &summary);
   void lowerMemory(MemOp mem, const FirMemory &summary, bool shouldDedup);
-  LogicalResult runOnModule(FModuleOp module, bool shouldDedup);
+  LogicalResult runOnModule(FModuleOp moduleOp, bool shouldDedup);
   void runOnOperation() override;
 
   /// Cached module namespaces.
-  DenseMap<Operation *, ModuleNamespace> moduleNamespaces;
+  DenseMap<Operation *, hw::InnerSymbolNamespace> moduleNamespaces;
   CircuitNamespace circuitNamespace;
   SymbolTable *symbolTable;
 
   /// The set of all memories seen so far.  This is used to "deduplicate"
   /// memories by emitting modules one module for equivalent memories.
   std::map<FirMemory, FMemModuleOp> memories;
+
+  /// A sequence of operations that should be erased later.
+  SetVector<Operation *> operationsToErase;
 };
 } // end anonymous namespace
 
@@ -173,11 +193,15 @@ FMemModuleOp
 LowerMemoryPass::emitMemoryModule(MemOp op, const FirMemory &mem,
                                   const SmallVectorImpl<PortInfo> &ports) {
   // Get a non-colliding name for the memory module, and update the summary.
-  auto newName = circuitNamespace.newName(mem.modName.getValue(), "ext");
+  StringRef prefix = "";
+  if (mem.prefix)
+    prefix = mem.prefix.getValue();
+  auto newName =
+      circuitNamespace.newName(prefix + mem.modName.getValue(), "ext");
   auto moduleName = StringAttr::get(&getContext(), newName);
 
-  // Insert the memory module at the bottom of the circuit.
-  auto b = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
+  // Insert the memory module just above the current module.
+  OpBuilder b(op->getParentOfType<FModuleOp>());
   ++numCreatedMemModules;
   auto moduleOp = b.create<FMemModuleOp>(
       mem.loc, moduleName, ports, mem.numReadPorts, mem.numWritePorts,
@@ -201,14 +225,14 @@ LowerMemoryPass::getOrCreateMemModule(MemOp op, const FirMemory &summary,
 
   // Create a new module for this memory. This can update the name recorded in
   // the memory's summary.
-  auto module = emitMemoryModule(op, summary, ports);
+  auto moduleOp = emitMemoryModule(op, summary, ports);
 
   // Record the memory module.  We don't want to use this module for other
   // memories, then we don't add it to the table.
   if (shouldDedup)
-    memories[summary] = module;
+    memories[summary] = moduleOp;
 
-  return module;
+  return moduleOp;
 }
 
 void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
@@ -217,30 +241,35 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
   auto ports = getMemoryModulePorts(summary);
 
   // Get a non-colliding name for the memory module, and update the summary.
-  auto newName = circuitNamespace.newName(mem.getName());
+  StringRef prefix = "";
+  if (summary.prefix)
+    prefix = summary.prefix.getValue();
+  auto newName = circuitNamespace.newName(prefix + mem.getName());
+
   auto wrapperName = StringAttr::get(&getContext(), newName);
 
-  // Create the wrapper module, inserting it into the bottom of the circuit.
-  auto b = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
-  auto wrapper = b.create<FModuleOp>(mem->getLoc(), wrapperName, ports);
+  // Create the wrapper module, inserting it just before the current module.
+  OpBuilder b(mem->getParentOfType<FModuleOp>());
+  auto wrapper = b.create<FModuleOp>(
+      mem->getLoc(), wrapperName,
+      ConventionAttr::get(context, Convention::Internal), ports);
   SymbolTable::setSymbolVisibility(wrapper, SymbolTable::Visibility::Private);
 
   // Create an instance of the external memory module. The instance has the
   // same name as the target module.
   auto memModule = getOrCreateMemModule(mem, summary, ports, shouldDedup);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
-
-  auto memInst =
-      b.create<InstanceOp>(mem->getLoc(), memModule, memModule.moduleName(),
-                           mem.getNameKind(), mem.getAnnotations().getValue());
+  auto memInst = b.create<InstanceOp>(
+      mem->getLoc(), memModule, (mem.getName() + "_ext").str(),
+      mem.getNameKind(), mem.getAnnotations().getValue());
 
   // Wire all the ports together.
   for (auto [dst, src] : llvm::zip(wrapper.getBodyBlock()->getArguments(),
                                    memInst.getResults())) {
     if (wrapper.getPortDirection(dst.getArgNumber()) == Direction::Out)
-      b.create<StrictConnectOp>(mem->getLoc(), dst, src);
+      b.create<MatchingConnectOp>(mem->getLoc(), dst, src);
     else
-      b.create<StrictConnectOp>(mem->getLoc(), src, dst);
+      b.create<MatchingConnectOp>(mem->getLoc(), src, dst);
   }
 
   // Create an instance of the wrapper memory module, which will replace the
@@ -251,8 +280,8 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
   // module op, so we have to fix up the NLA to have the module as the leaf
   // element.
 
-  auto leafSym = memModule.moduleNameAttr();
-  auto leafAttr = FlatSymbolRefAttr::get(wrapper.moduleNameAttr());
+  auto leafSym = memModule.getModuleNameAttr();
+  auto leafAttr = FlatSymbolRefAttr::get(wrapper.getModuleNameAttr());
 
   // NLAs that we have already processed.
   llvm::SmallDenseMap<StringAttr, StringAttr> processedNLAs;
@@ -278,7 +307,7 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
       SmallVector<Attribute> newNamepath(namepath.begin(), namepath.end());
       if (!nla.isComponent())
         newNamepath.back() =
-            getInnerRefTo(inst, "", [&](FModuleOp mod) -> ModuleNamespace & {
+            getInnerRefTo(inst, [&](auto mod) -> hw::InnerSymbolNamespace & {
               return getModuleNamespace(mod);
             });
       newNamepath.push_back(leafAttr);
@@ -303,7 +332,7 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
     newAnnos.addAnnotations(newMemModAnnos);
     newAnnos.applyToOperation(memInst);
   }
-  mem->erase();
+  operationsToErase.insert(mem);
   ++numLoweredMems;
 }
 
@@ -314,8 +343,7 @@ static SmallVector<SubfieldOp> getAllFieldAccesses(Value structValue,
     assert(isa<SubfieldOp>(op));
     auto fieldAccess = cast<SubfieldOp>(op);
     auto elemIndex =
-        fieldAccess.getInput().getType().cast<BundleType>().getElementIndex(
-            field);
+        fieldAccess.getInput().getType().base().getElementIndex(field);
     if (elemIndex && *elemIndex == fieldAccess.getFieldIndex())
       accesses.push_back(fieldAccess);
   }
@@ -389,12 +417,10 @@ InstanceOp LowerMemoryPass::emitMemoryInstance(MemOp op, FModuleOp module,
       auto getDriver = [&](StringRef field) -> Operation * {
         auto accesses = getAllFieldAccesses(op.getResult(i), field);
         for (auto a : accesses) {
-          for (auto *connect : a->getUsers()) {
-            // If this is some use that isn't a connect, move on.
-            if (!isa<ConnectOp, StrictConnectOp>(connect))
-              continue;
-            // If this connect is driving a value to the field, return it.
-            if (connect->getOperand(0) == a)
+          for (auto *user : a->getUsers()) {
+            // If this is a connect driving a value to the field, return it.
+            if (auto connect = dyn_cast<FConnectLike>(user);
+                connect && connect.getDest() == a)
               return connect;
           }
         }
@@ -425,8 +451,8 @@ InstanceOp LowerMemoryPass::emitMemoryInstance(MemOp op, FModuleOp module,
         enConnect->moveAfter(andOp);
         // Erase the old mask connect.
         auto *maskField = maskConnect->getOperand(0).getDefiningOp();
-        maskConnect->erase();
-        maskField->erase();
+        operationsToErase.insert(maskConnect);
+        operationsToErase.insert(maskField);
       };
 
       if (memportKind == MemOp::PortKind::Read) {
@@ -469,63 +495,62 @@ InstanceOp LowerMemoryPass::emitMemoryInstance(MemOp op, FModuleOp module,
       op.getLoc(), portTypes, module.getNameAttr(), summary.getFirMemoryName(),
       op.getNameKind(), portDirections, portNames,
       /*annotations=*/ArrayRef<Attribute>(),
-      /*portAnnotations=*/ArrayRef<Attribute>(), /*lowerToBind=*/false,
+      /*portAnnotations=*/ArrayRef<Attribute>(),
+      /*layers=*/ArrayRef<Attribute>(), /*lowerToBind=*/false,
       op.getInnerSymAttr());
 
   // Update all users of the result of read ports
   for (auto [subfield, result] : returnHolder) {
     subfield->getResult(0).replaceAllUsesWith(inst.getResult(result));
-    subfield->erase();
+    operationsToErase.insert(subfield);
   }
 
   return inst;
 }
 
-LogicalResult LowerMemoryPass::runOnModule(FModuleOp module, bool shouldDedup) {
-  for (auto op :
-       llvm::make_early_inc_range(module.getBodyBlock()->getOps<MemOp>())) {
+LogicalResult LowerMemoryPass::runOnModule(FModuleOp moduleOp,
+                                           bool shouldDedup) {
+  assert(operationsToErase.empty() && "operationsToErase must be empty");
+
+  auto result = moduleOp.walk([&](MemOp op) {
     // Check that the memory has been properly lowered already.
-    if (!op.getDataType().isa<UIntType>())
-      return op->emitError(
-          "memories should be flattened before running LowerMemory");
+    if (!type_isa<UIntType>(op.getDataType())) {
+      op->emitError("memories should be flattened before running LowerMemory");
+      return WalkResult::interrupt();
+    }
 
     auto summary = getSummary(op);
-    if (!summary.isSeqMem())
-      continue;
+    if (summary.isSeqMem())
+      lowerMemory(op, summary, shouldDedup);
 
-    lowerMemory(op, summary, shouldDedup);
-  }
+    return WalkResult::advance();
+  });
+
+  if (result.wasInterrupted())
+    return failure();
+
+  for (Operation *op : operationsToErase)
+    op->erase();
+
+  operationsToErase.clear();
+
   return success();
 }
 
 void LowerMemoryPass::runOnOperation() {
   auto circuit = getOperation();
-  auto *body = circuit.getBodyBlock();
-  auto &instanceGraph = getAnalysis<InstanceGraph>();
+  auto &instanceInfo = getAnalysis<InstanceInfo>();
   symbolTable = &getAnalysis<SymbolTable>();
   circuitNamespace.add(circuit);
 
-  // Find the device under test and create a set of all modules underneath it.
-  // If no module is marked as the DUT, then the top module is the DUT.
-  auto *dut = instanceGraph.getTopLevelNode();
-  auto it = llvm::find_if(*body, [&](Operation &op) -> bool {
-    return AnnotationSet(&op).hasAnnotation(dutAnnoClass);
-  });
-  if (it != body->end())
-    dut = instanceGraph.lookup(&(*it));
-
-  // The set of all modules underneath the design under test module.
-  DenseSet<Operation *> dutModuleSet;
-  llvm::for_each(llvm::depth_first(dut), [&](hw::InstanceGraphNode *node) {
-    dutModuleSet.insert(node->getModule());
-  });
-
-  // We iterate the circuit from top-to-bottom to make sure that we get
-  // consistent memory names.
-  for (auto module : body->getOps<FModuleOp>()) {
-    // We don't dedup memories in the testharness with any other memories.
-    auto shouldDedup = dutModuleSet.contains(module);
-    if (failed(runOnModule(module, shouldDedup)))
+  // We iterate the circuit from top-to-bottom.  This ensures that we get
+  // consistent memory names.  (Memory modules will be inserted before the
+  // module we are processing to prevent these being unnecessarily visited.)
+  // Deduplication of memories is allowed if the module is under the "effective"
+  // design-under-test (DUT).
+  for (auto moduleOp : circuit.getBodyBlock()->getOps<FModuleOp>()) {
+    auto shouldDedup = instanceInfo.anyInstanceInEffectiveDesign(moduleOp);
+    if (failed(runOnModule(moduleOp, shouldDedup)))
       return signalPassFailure();
   }
 

@@ -15,17 +15,21 @@
 #ifndef CIRCT_DIALECT_HW_MODULEIMPLEMENTATION_H
 #define CIRCT_DIALECT_HW_MODULEIMPLEMENTATION_H
 
+#include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Support/LLVM.h"
-
 #include "mlir/IR/DialectImplementation.h"
 
 namespace circt {
 namespace hw {
 
+class HWModuleLike;
+
 namespace module_like_impl {
-/// Get the portname from an SSA value string, if said value name is not a
-/// number.
-StringAttr getPortNameAttr(MLIRContext *context, StringRef name);
+
+struct PortParse : OpAsmParser::Argument {
+  ModulePort::Direction direction;
+  std::string rawName;
+};
 
 /// This is a variant of mlir::parseFunctionSignature that allows names on
 /// result arguments.
@@ -41,6 +45,21 @@ ParseResult parseModuleFunctionSignature(
 void printModuleSignature(OpAsmPrinter &p, Operation *op,
                           ArrayRef<Type> argTypes, bool isVariadic,
                           ArrayRef<Type> resultTypes, bool &needArgNamesAttr);
+
+/// New Style parsing
+ParseResult parseModuleSignature(OpAsmParser &parser,
+                                 SmallVectorImpl<PortParse> &args,
+                                 TypeAttr &modType);
+
+void printModuleSignatureNew(OpAsmPrinter &p, Region &body,
+                             hw::ModuleType modType,
+                             ArrayRef<Attribute> portAttrs,
+                             ArrayRef<Location> locAttrs);
+void printModuleSignatureNew(OpAsmPrinter &p, HWModuleLike op);
+void getAsmBlockArgumentNamesImpl(mlir::Region &region,
+                                  OpAsmSetValueNameFn setNameFn);
+
+SmallVector<Location> getAllPortLocsImpl(hw::ModuleType modType);
 
 } // namespace module_like_impl
 } // namespace hw

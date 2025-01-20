@@ -16,9 +16,10 @@
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/FunctionInterfaces.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -51,8 +52,19 @@ Value createOrFoldSExt(Location loc, Value value, Type destTy,
 Value createOrFoldSExt(Value value, Type destTy, ImplicitLocOpBuilder &builder);
 
 /// Create a ``Not'' gate on a value.
-Value createOrFoldNot(Location loc, Value value, OpBuilder &builder);
-Value createOrFoldNot(Value value, ImplicitLocOpBuilder &builder);
+Value createOrFoldNot(Location loc, Value value, OpBuilder &builder,
+                      bool twoState = false);
+Value createOrFoldNot(Value value, ImplicitLocOpBuilder &builder,
+                      bool twoState = false);
+
+/// Extract bits from a value.
+void extractBits(OpBuilder &builder, Value val, SmallVectorImpl<Value> &bits);
+
+/// Construct a mux tree for given leaf nodes. `selectors` is the selector for
+/// each level of the tree. Currently the selector is tested from MSB to LSB.
+Value constructMuxTree(OpBuilder &builder, Location loc,
+                       ArrayRef<Value> selectors, ArrayRef<Value> leafNodes,
+                       Value outOfBoundsValue);
 
 } // namespace comb
 } // namespace circt

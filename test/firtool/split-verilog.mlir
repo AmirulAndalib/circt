@@ -10,7 +10,8 @@
 // RUN: FileCheck %s --check-prefix=LIST < %t/filelist.f
 
 sv.verbatim "// I'm everywhere"
-sv.ifdef "VERILATOR" {
+sv.macro.decl @VERILATOR
+sv.ifdef @VERILATOR {
   sv.verbatim "// Hello"
 } else {
   sv.verbatim "// World"
@@ -21,10 +22,10 @@ hw.type_scope @__hw_typedecls {
   hw.typedecl @foo : i1
 }
 
-hw.module @foo(%a: i1) -> (b: i1) {
+hw.module @foo(in %a: i1, out b : i1) {
   hw.output %a : i1
 }
-hw.module @bar(%x: i1) -> (y: i1) {
+hw.module @bar(in %x : i1, out y : i1) {
   hw.output %x : i1
 }
 sv.interface @usb {
@@ -33,15 +34,15 @@ sv.interface @usb {
 }
 hw.module.extern @pll ()
 
-hw.module @inout(%inout: i1) -> (output: i1) {
+hw.module @inout(in %inout: i1, out out : i1) {
   hw.output %inout : i1
 }
 
 // This is made to collide with the first renaming attempt of the `@inout`
 // module above.
-hw.module.extern @inout_0 () -> ()
-hw.module.extern @inout_1 () -> ()
-hw.module.extern @inout_2 () -> ()
+hw.module.extern @inout_0 ()
+hw.module.extern @inout_1 ()
+hw.module.extern @inout_2 ()
 
 sv.verbatim "// Foo" {output_file = #hw.output_file<"custom1.sv">}
 sv.verbatim "// Bar" {output_file = #hw.output_file<"custom2.sv", excludeFromFileList>}
@@ -49,7 +50,6 @@ sv.verbatim "// Bar" {output_file = #hw.output_file<"custom2.sv", excludeFromFil
 // LIST:      {{^}}foo.sv{{$}}
 // LIST-NEXT: {{^}}bar.sv{{$}}
 // LIST-NEXT: {{^}}usb.sv{{$}}
-// LIST-NEXT: {{^}}extern_modules.sv{{$}}
 // LIST-NEXT: {{^}}inout_3.sv{{$}}
 // LIST-NEXT: {{^}}custom1.sv{{$}}
 // LIST-NOT:  custom2.sv
@@ -110,10 +110,10 @@ sv.verbatim "// Bar" {output_file = #hw.output_file<"custom2.sv", excludeFromFil
 // VERILOG:       endmodule
 // VERILOG-LABEL: interface usb;
 // VERILOG:       endinterface
-// VERILOG:       // external module pll
-// VERILOG:       // external module inout_0
-// VERILOG:       // external module inout_1
-// VERILOG:       // external module inout_2
+// VERILOG-NOT:   module pll
+// VERILOG-NOT:   module inout_0
+// VERILOG-NOT:   module inout_1
+// VERILOG-NOT:   module inout_2
 // VERILOG-LABEL: FILE "custom1.sv"
 // VERILOG:       // Foo
 // VERILOG-LABEL: FILE "custom2.sv"

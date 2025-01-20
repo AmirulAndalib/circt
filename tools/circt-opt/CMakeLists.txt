@@ -1,65 +1,29 @@
+get_property(dialect_libs GLOBAL PROPERTY CIRCT_DIALECT_LIBS)
+get_property(conversion_libs GLOBAL PROPERTY CIRCT_CONVERSION_LIBS)
+
 set(LLVM_LINK_COMPONENTS
   Support
 )
 
-add_llvm_tool(circt-opt
+add_circt_tool(circt-opt
   circt-opt.cpp
+
+  DEPENDS
+  SUPPORT_PLUGINS
 )
+
 llvm_update_compile_flags(circt-opt)
+
 target_link_libraries(circt-opt
   PRIVATE
-  CIRCTAffineToPipeline
+  ${dialect_libs}
+  ${conversion_libs}
+
   CIRCTAnalysisTestPasses
-  CIRCTArc
-  CIRCTCalyx
-  CIRCTCalyxToHW
-  CIRCTCalyxToFSM
-  CIRCTCalyxTransforms
-  CIRCTESI
+  CIRCTBMCTransforms
   CIRCTExportChiselInterface
   CIRCTExportVerilog
-  CIRCTFIRRTL
-  CIRCTFIRRTLToHW
-  CIRCTFIRRTLTransforms
-  CIRCTFSM
-  CIRCTFSMTransforms
-  CIRCTFSMToSV
-  CIRCTHandshake
-  CIRCTHandshakeToFIRRTL
-  CIRCTHandshakeToHW
-  CIRCTHandshakeTransforms
-  CIRCTLLHD
-  CIRCTLLHDToLLVM
-  CIRCTHWToLLVM
-  CIRCTCombToLLVM
-  CIRCTLLHDTransforms
-  CIRCTMoore
-  CIRCTMooreToCore
-  CIRCTMSFT
-  CIRCTMSFTTransforms
-  CIRCTHW
-  CIRCTHWArith
-  CIRCTHWArithToHW
-  CIRCTInteropDialect
-  CIRCTHWToLLHD
-  CIRCTHWToSystemC
-  CIRCTHWTransforms
-  CIRCTSCFToCalyx
-  CIRCTScheduling
-  CIRCTSeq
-  CIRCTSeqTransforms
-  CIRCTSSP
-  CIRCTSSPTransforms
-  CIRCTStandardToHandshake
-  CIRCTPipelineOps
-  CIRCTPipelineToHW
-  CIRCTPipelineTransforms
-  CIRCTPipelineToCalyx
-  CIRCTSV
-  CIRCTSVTransforms
-  CIRCTHWArith
-  CIRCTSystemC
-  CIRCTSystemCTransforms
+  CIRCTLECTransforms
   CIRCTTransforms
 
   MLIRIR
@@ -72,4 +36,9 @@ target_link_libraries(circt-opt
   MLIRTransforms
   MLIRSCFDialect
   MLIREmitCDialect
+  MLIRFuncInlinerExtension
+  MLIRVectorDialect
+  MLIRIndexDialect
 )
+
+export_executable_symbols_for_plugins(circt-opt)

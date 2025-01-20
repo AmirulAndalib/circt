@@ -10,6 +10,7 @@
 ##===----------------------------------------------------------------------===//
 
 add_circt_dialect_library(CIRCTSeq
+  SeqAttributes.cpp
   SeqDialect.cpp
   SeqOpInterfaces.cpp
   SeqOps.cpp
@@ -20,20 +21,18 @@ add_circt_dialect_library(CIRCTSeq
 
   DEPENDS
   CIRCTHW
-  CIRCTSV
   MLIRSeqIncGen
-  
+  MLIRSeqEnumsIncGen
+  MLIRSeqAttributesIncGen
+
   LINK_COMPONENTS
   Support
 
   LINK_LIBS PUBLIC
   CIRCTHW
-  CIRCTSV
-  MLIRPass
   MLIRIR
+  MLIRPass
   MLIRTransforms
-   )
-
-add_dependencies(circt-headers MLIRSeqIncGen)
+)
 
 add_subdirectory(Transforms)

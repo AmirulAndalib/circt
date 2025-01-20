@@ -21,10 +21,19 @@
 namespace circt {
 namespace hw {
 
+#define GEN_PASS_DECL
+#include "circt/Dialect/HW/Passes.h.inc"
+
 std::unique_ptr<mlir::Pass> createPrintInstanceGraphPass();
 std::unique_ptr<mlir::Pass> createHWSpecializePass();
 std::unique_ptr<mlir::Pass> createPrintHWModuleGraphPass();
-std::unique_ptr<mlir::Pass> createFlattenIOPass();
+std::unique_ptr<mlir::Pass> createFlattenIOPass(bool recursiveFlag = true,
+                                                bool flattenExternFlag = false,
+                                                char joinChar = '.');
+std::unique_ptr<mlir::Pass> createVerifyInnerRefNamespacePass();
+std::unique_ptr<mlir::Pass> createFlattenModulesPass();
+std::unique_ptr<mlir::Pass> createFooWiresPass();
+std::unique_ptr<mlir::Pass> createHWAggregateToCombPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

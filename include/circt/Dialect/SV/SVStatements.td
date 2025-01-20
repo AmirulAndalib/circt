@@ -11,14 +11,10 @@
 //===----------------------------------------------------------------------===//
 
 include "mlir/IR/EnumAttr.td"
-
-/// Ensure symbol is one of the hw module.* types
-def isModuleSymbol : AttrConstraint<
-  CPred<
-    "hw::isAnyModule(::mlir::SymbolTable::lookupNearestSymbolFrom("
-      "&$_op, $_self.cast<::mlir::FlatSymbolRefAttr>().getValue()))"
-  >, "is module like">;
-
+include "mlir/IR/OpAsmInterface.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "circt/Dialect/Emit/EmitOpInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // Control flow like-operations
@@ -46,8 +42,13 @@ def OrderedOutputOp : SVOp<"ordered", [SingleBlock, NoTerminator, NoRegionArgume
   ];
 }
 
-def IfDefOp : SVOp<"ifdef", [SingleBlock, NoTerminator, NoRegionArguments,
-                             NonProceduralOp]> {
+def IfDefOp : SVOp<"ifdef", [
+    SingleBlock,
+    NoTerminator,
+    NoRegionArguments,
+    NonProceduralOp,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
   let summary = "'ifdef MACRO' block";
 
   let description = [{
@@ -72,6 +73,9 @@ def IfDefOp : SVOp<"ifdef", [SingleBlock, NoTerminator, NoRegionArguments,
     OpBuilder<(ins "StringAttr":$cond,
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>,
+    OpBuilder<(ins "FlatSymbolRefAttr":$cond,
+                      CArg<"std::function<void()>", "{}">:$thenCtor,
+                      CArg<"std::function<void()>", "{}">:$elseCtor)>,
     OpBuilder<(ins "MacroIdentAttr":$cond,
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>
@@ -93,9 +97,14 @@ def IfDefOp : SVOp<"ifdef", [SingleBlock, NoTerminator, NoRegionArguments,
   }];
 }
 
-def IfDefProceduralOp
-  : SVOp<"ifdef.procedural", [SingleBlock, NoTerminator, NoRegionArguments,
-                              ProceduralRegion, ProceduralOp]> {
+def IfDefProceduralOp : SVOp<"ifdef.procedural", [
+      SingleBlock,
+      NoTerminator,
+      NoRegionArguments,
+      ProceduralRegion,
+      ProceduralOp,
+      DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
   let summary = "'ifdef MACRO' block for procedural regions";
 
   let description = [{
@@ -118,6 +127,9 @@ def IfDefProceduralOp
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>,
     OpBuilder<(ins "StringAttr":$cond,
+                      CArg<"std::function<void()>", "{}">:$thenCtor,
+                      CArg<"std::function<void()>", "{}">:$elseCtor)>,
+    OpBuilder<(ins "FlatSymbolRefAttr":$cond,
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>,
     OpBuilder<(ins "MacroIdentAttr":$cond,
@@ -256,8 +268,9 @@ def SyncReset: I32EnumAttrCase<"SyncReset", 1, "syncreset">;
 def AsyncReset: I32EnumAttrCase<"AsyncReset", 2, "asyncreset">;
 
 def ResetTypeAttr : I32EnumAttr<"ResetType", "reset type",
-                                   [NoReset, SyncReset, AsyncReset]>;
-
+                                   [NoReset, SyncReset, AsyncReset]> {
+  let cppNamespace = "::circt::sv";
+}
 
 def AlwaysFFOp : SVOp<"alwaysff", [SingleBlock, NoTerminator, NoRegionArguments,
                                    RecursiveMemoryEffects, RecursivelySpeculatable,
@@ -532,6 +545,29 @@ def VerbatimOp : SVOp<"verbatim"> {
   ];
 }
 
+def MacroRefOp : SVOp<"macro.ref", [
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Statement to refer to a SystemVerilog macro";
+  let description = [{
+    This operation represent a statement by referencing a named macro.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$macroName, Variadic<AnyType>:$inputs);
+  let results = (outs);
+
+  let assemblyFormat = "$macroName (`(` $inputs^ `)` `:` type($inputs))? attr-dict";
+
+  let builders = [
+    OpBuilder<(ins "StringRef":$ident),
+               "build(odsBuilder, odsState, "
+                "FlatSymbolRefAttr::get($_builder.getContext(), ident), {});">
+  ];
+
+  let extraClassDeclaration = [{
+    MacroDeclOp getReferencedMacro(const hw::HWSymbolCache *cache);
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Bind Statements
 //===----------------------------------------------------------------------===//
@@ -747,4 +783,327 @@ def ReadMemOp : SVOp<"readmem", [ProceduralOp]> {
   let results = (outs);
   let assemblyFormat =
     "$dest `,` $filename `,` $base attr-dict `:` qualified(type($dest))";
+}
+
+def ForOp : SVOp<"for", [SingleBlock, NoTerminator, ProceduralOp,
+                         ProceduralRegion, OpAsmOpInterface,
+                         AllTypesMatch<["lowerBound", "upperBound", "step"]>]> {
+  let summary = "System verilog for loop";
+
+  let description = [{
+    The `sv.for` operation in System Verilog defines a for statement that requires
+    three SSA operands: `lowerBounds`, `upperBound`, and `step`. It functions
+    similarly to `scf.for`, where the loop iterates the induction variable from
+    `lowerBound` to `upperBound` with a step size of `step`, i.e:
+
+    ```
+     for (logic ... indVar = lowerBound; indVar < upperBound; indVar += step) begin
+     end
+    ```
+
+    It's important to note that since we are using a bit precise type instead of a Verilog
+    `integer` type, users must be cautious about potential overflow. For example, if
+    you wish to iterate over all 2-bit values, you must use a 3-bit value as the
+    induction variable type.
+  }];
+
+  let regions = (region SizedRegion<1>:$body);
+  let arguments = (ins HWIntegerType:$lowerBound,
+                       HWIntegerType:$upperBound,
+                       HWIntegerType:$step,
+                       DefaultValuedAttr<StrAttr, "{}">:$inductionVarName);
+  let results = (outs);
+  let builders = [
+      OpBuilder<(ins "Value":$lowerBound, "Value":$upperBound,
+                     "Value":$step, "StringRef":$inductionVarName,
+                     "llvm::function_ref<void(BlockArgument)>": $thenCtor)>,
+      OpBuilder<(ins "int64_t":$lowerBound, "int64_t":$upperBound,
+                     "int64_t":$step, "IntegerType": $type,
+                     "StringRef":$inductionVarName,
+                     "llvm::function_ref<void(BlockArgument)>": $thenCtor)>
+  ];
+  let hasCustomAssemblyFormat = 1;
+  let hasCanonicalizeMethod = 1;
+  let extraClassDeclaration = [{
+    Block* getBodyBlock() { return &getBody().front(); }
+    Value getInductionVar() { return getBodyBlock()->getArgument(0); }
+    void getAsmBlockArgumentNames(mlir::Region &region,
+                                  mlir::OpAsmSetValueNameFn setNameFn);
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Macros
+//===----------------------------------------------------------------------===//
+
+
+def MacroDeclOp : SVOp<"macro.decl", [Symbol]> {
+  let summary = "System verilog macro declaration";
+
+  let description = [{
+    The `sv.macro.def` declares a macro in System Verilog.  This is a
+    declaration; the body of the macro, which produces a verilog macro
+    definition is created with a `macro.def` operation.
+
+    Lacking args will be a macro without "()".  An empty args will be an empty "()".
+
+    The verilog name is the spelling of the macro when emitting verilog.
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       OptionalAttr<StrArrayAttr>:$args,
+                       OptionalAttr<StrAttr>:$verilogName);
+  let results = (outs);
+
+  let builders = [
+    OpBuilder<(ins "StringRef":$name), [{
+      return build($_builder, $_state,
+                   ::mlir::StringAttr::get($_builder.getContext(), name),
+                   ::mlir::ArrayAttr{}, ::mlir::StringAttr{});
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $sym_name (`[` $verilogName^ `]`)? (`(` $args^ `)`)?  attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    // Return the Verilog "text macro identifier".  This will be either the
+    // Verilog name, if one was provided or the symbol name.
+    StringRef getMacroIdentifier();
+  }];
+}
+
+
+def MacroDefOp : SVOp<"macro.def",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "System verilog macro definition";
+
+  let description = [{
+    The `sv.macro.def` defines a macro in System Verilog which optionally takes
+    a body.
+
+    This is modeled similarly to verbatim in that the contents of the macro are
+    opaque (plain string).  Given the general power of macros, this op does not
+    try to capture a return type.
+
+    This operation produces a definition for the macro declaration referenced by
+    `sym_name`.  Argument lists are picked up from that operation.
+
+    sv.macro.def allows operand substitutions with {{0}} syntax.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$macroName,
+                       StrAttr:$format_string,
+                       DefaultValuedAttr<NameRefArrayAttr,"{}">:$symbols);
+  let results = (outs);
+
+  let builders = [
+    OpBuilder<(ins "StringRef":$macroName, "StringRef":$format_string),
+                "build($_builder, $_state, macroName, format_string,"
+                "odsBuilder.getArrayAttr({}));">
+  ];
+
+  let assemblyFormat = [{
+    $macroName $format_string (`(` $symbols^ `)`)? attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    MacroDeclOp getReferencedMacro(const hw::HWSymbolCache *cache);
+  }];
+}
+
+
+//===----------------------------------------------------------------------===//
+// Function/Call
+//===----------------------------------------------------------------------===//
+
+def FuncDPIImportOp: SVOp<"func.dpi.import",
+  [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "DPI import statement";
+  let description = [{
+     `sv.func.dpi.import` represents DPI function import statement defined in
+     IEEE 1800-2017 section 35.4.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$callee,
+                       OptionalAttr<StrAttr>: $linkage_name);
+  let results = (outs);
+
+  let assemblyFormat = "(`linkage` $linkage_name^)? $callee attr-dict";
+}
+
+def FuncOp : SVOp<"func",
+     [IsolatedFromAbove, Symbol, OpAsmOpInterface, ProceduralRegion,
+      DeclareOpInterfaceMethods<HWModuleLike>,
+      DeclareOpInterfaceMethods<PortList>,
+      FunctionOpInterface, HasParent<"mlir::ModuleOp">,
+      HWEmittableModuleLike]> {
+  let summary = "A SystemVerilog function";
+  let description = [{
+    `sv.func` represents SystemVerilog function in IEEE 1800-2017 section 13.4
+     "Functions". Similar to HW module, it's allowed to mix the order of input
+    and output arguments. `sv.func` can be used for both function
+    declaration and definition, i.e. a function without a body
+    region is a declaration.
+
+    In SV there are two representations for function results,
+    "output argument" and "return value". Currently an output argument
+    is considered as as a return value if it's is the last argument
+    and has a special attribute `sv.func.explicitly_returned`.
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<ModuleType>:$module_type,
+    OptionalAttr<DictArrayAttr>:$per_argument_attrs,
+    OptionalAttr<LocationArrayAttr>:$input_locs, // Null for actual definition.
+    OptionalAttr<LocationArrayAttr>:$result_locs,
+    OptionalAttr<StrAttr>:$verilogName
+  );
+
+  let results = (outs);
+  let regions = (region AnyRegion:$body);
+
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDeclaration = [{
+    static mlir::StringRef getExplicitlyReturnedAttrName() {
+      return "sv.func.explicitly_returned";
+    }
+
+    mlir::FunctionType getFunctionType() {
+      return getModuleType().getFuncType();
+    }
+
+    void setFunctionTypeAttr(mlir::TypeAttr mlirType) {
+      setModuleType(cast<hw::ModuleType>(mlirType.getValue()));
+    }
+
+    /// Returns the argument types of this function.
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+
+    /// Returns the result types of this function.
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
+
+    Type getExplicitlyReturnedType();
+
+    size_t getNumOutputs() {
+      return getResultTypes().size();
+    }
+
+    size_t getNumInputs() {
+      return getArgumentTypes().size();
+    }
+
+    ::mlir::Region *getCallableRegion() { return isExternal() ? nullptr : &getBody(); }
+    bool isDeclaration() { return isExternal(); }
+
+    /// OpAsmInterface
+    void getAsmBlockArgumentNames(mlir::Region &region,
+                                          mlir::OpAsmSetValueNameFn setNameFn);
+    SmallVector<hw::PortInfo> getPortList(bool excludeExplicitReturn);
+  }];
+  let extraClassDefinition = [{
+    hw::ModuleType $cppClass::getHWModuleType() {
+      return getModuleType();
+    }
+    void $cppClass::setHWModuleType(hw::ModuleType type) {
+      return setModuleType(type);
+    }
+    void $cppClass::setAllPortNames(llvm::ArrayRef<mlir::Attribute>) {
+    }
+
+    size_t $cppClass::getNumPorts() {
+      auto modty = getHWModuleType();
+      return modty.getNumPorts();
+    }
+
+    size_t $cppClass::getNumInputPorts() {
+      auto modty = getHWModuleType();
+      return modty.getNumInputs();
+    }
+
+    size_t $cppClass::getNumOutputPorts() {
+      auto modty = getHWModuleType();
+      return modty.getNumOutputs();
+    }
+
+    size_t $cppClass::getPortIdForInputId(size_t idx) {
+      auto modty = getHWModuleType();
+      return modty.getPortIdForInputId(idx);
+    }
+
+    size_t $cppClass::getPortIdForOutputId(size_t idx) {
+      auto modty = getHWModuleType();
+      return modty.getPortIdForOutputId(idx);
+    }
+  }];
+}
+
+class SVFuncCallBase<string mnemonic, list<Trait> traits = []>: SVOp<mnemonic,
+  traits # [CallOpInterface, DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+
+  let arguments = (ins FlatSymbolRefAttr:$callee, Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat =
+      "$callee `(` $inputs `)` attr-dict `:` functional-type($inputs, results)";
+
+  let extraClassDeclaration = [{
+    Value getExplicitlyReturnedValue(sv::FuncOp op);
+
+    operand_range getArgOperands() {
+      return getInputs();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getInputsMutable();
+    }
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+
+    /// Set the callee for this operation.
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+  }];
+}
+
+def FuncCallProceduralOp : SVFuncCallBase<"func.call.procedural", [ProceduralOp]> {
+  let summary = "Function call in a procedural region";
+}
+
+def FuncCallOp : SVFuncCallBase<"func.call", [NonProceduralOp]> {
+  let summary = "Function call in a non-procedural region";
+  let description = [{
+    This op represents a function call in a non-procedural region.
+    A function call in a non-procedural region must have a return
+    value and no output argument.
+  }];
+}
+
+def ReturnOp : SVOp<"return",
+                   [Pure, ReturnLike, Terminator, HasParent<"FuncOp">]> {
+  let summary = "Function return operation";
+
+  let arguments = (ins Variadic<AnyType>:$operands);
+
+  let hasCustomAssemblyFormat = 1;
+  let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SV output control.
+//===----------------------------------------------------------------------===//
+
+def ReserveNamesOp : SVOp<"reserve_names", [
+  HasParent<"mlir::ModuleOp">
+]> {
+  let summary = "Disallow a set of names to be used during emission";
+
+  let arguments = (ins StrArrayAttr:$reservedNames);
+  let assemblyFormat = [{
+    $reservedNames attr-dict
+  }];
 }

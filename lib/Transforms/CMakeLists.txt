@@ -1,18 +1,31 @@
 add_circt_library(CIRCTTransforms
   FlattenMemRefs.cpp
   StripDebugInfoWithPred.cpp
+  MapArithToComb.cpp
+  MaximizeSSA.cpp
+  InsertMergeBlocks.cpp
+  PrintOpCount.cpp
+  MemoryBanking.cpp
+  IndexSwitchToIf.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms
 
   LINK_LIBS PUBLIC
-  CIRCTControlFlowLoopAnalysis
+  CIRCTComb
+  CIRCTHW
+  CIRCTOpCountAnalysis
+  MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRFuncDialect
   MLIRIR
   MLIRMemRefDialect
-  MLIRFuncDialect
   MLIRSupport
   MLIRTransforms
+  MLIRAffineDialect
+  MLIRSCFDialect
 
   DEPENDS
   CIRCTTransformsPassIncGen
+  MLIRArithDialect
 )

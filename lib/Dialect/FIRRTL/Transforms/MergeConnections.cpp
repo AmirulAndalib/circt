@@ -21,14 +21,23 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "circt/Support/Debug.h"
+#include "mlir/IR/Iterators.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-merge-connections"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_MERGECONNECTIONS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -59,11 +68,11 @@ struct MergeConnection {
   bool changed = false;
 
   // Return true if the given connect op is merged.
-  bool peelConnect(StrictConnectOp connect);
+  bool peelConnect(MatchingConnectOp connect);
 
   // A map from a destination FieldRef to a pair of (i) the number of
   // connections seen so far and (ii) the vector to store subconnections.
-  DenseMap<FieldRef, std::pair<unsigned, SmallVector<StrictConnectOp>>>
+  DenseMap<FieldRef, std::pair<unsigned, SmallVector<MatchingConnectOp>>>
       connections;
 
   FModuleOp moduleOp;
@@ -74,12 +83,12 @@ struct MergeConnection {
   bool enableAggressiveMerging = false;
 };
 
-bool MergeConnection::peelConnect(StrictConnectOp connect) {
+bool MergeConnection::peelConnect(MatchingConnectOp connect) {
   // Ignore connections between different types because it will produce a
   // partial connect. Also ignore non-passive connections or non-integer
   // connections.
   LLVM_DEBUG(llvm::dbgs() << "Visiting " << connect << "\n");
-  auto destTy = connect.getDest().getType().dyn_cast<FIRRTLBaseType>();
+  auto destTy = type_dyn_cast<FIRRTLBaseType>(connect.getDest().getType());
   if (!destTy || !destTy.isPassive() ||
       !firrtl::getBitWidth(destTy).has_value())
     return false;
@@ -109,9 +118,9 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
   // If it is the first time to visit the parent op, then allocate the vector
   // for subconnections.
   if (count == 0) {
-    if (auto bundle = parent.getType().dyn_cast<BundleType>())
+    if (auto bundle = type_dyn_cast<BundleType>(parent.getType()))
       subConnections.resize(bundle.getNumElements());
-    if (auto vector = parent.getType().dyn_cast<FVectorType>())
+    if (auto vector = type_dyn_cast<FVectorType>(parent.getType()))
       subConnections.resize(vector.getNumElements());
   }
   ++count;
@@ -121,9 +130,14 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
   if (count != subConnections.size())
     return false;
 
-  changed = true;
-
   auto parentType = parent.getType();
+  auto parentBaseTy = type_dyn_cast<FIRRTLBaseType>(parentType);
+
+  // Reject if not passive, we don't support aggregate constants for these.
+  if (!parentBaseTy || !parentBaseTy.isPassive())
+    return false;
+
+  changed = true;
 
   auto getMergedValue = [&](auto aggregateType) {
     SmallVector<Value> operands;
@@ -212,7 +226,7 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
         subConnections[idx].erase();
     }
 
-    return parentType.isa<FVectorType>()
+    return isa<FVectorType>(parentType)
                ? builder->createOrFold<VectorCreateOp>(
                      builder->getFusedLoc(locs), parentType, operands)
                : builder->createOrFold<BundleCreateOp>(
@@ -220,50 +234,93 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
   };
 
   Value merged;
-  if (auto bundle = parentType.dyn_cast_or_null<BundleType>())
+  if (auto bundle = type_dyn_cast<BundleType>(parentType))
     merged = getMergedValue(bundle);
-  if (auto vector = parentType.dyn_cast_or_null<FVectorType>())
+  if (auto vector = type_dyn_cast<FVectorType>(parentType))
     merged = getMergedValue(vector);
   if (!merged)
     return false;
 
-  builder->create<StrictConnectOp>(connect.getLoc(), parent, merged);
+  // Emit strict connect if possible, fallback to normal connect.
+  // Don't use emitConnect(), will split the connect apart.
+  if (!parentBaseTy.hasUninferredWidth())
+    builder->create<MatchingConnectOp>(connect.getLoc(), parent, merged);
+  else
+    builder->create<ConnectOp>(connect.getLoc(), parent, merged);
+
   return true;
 }
 
 bool MergeConnection::run() {
   ImplicitLocOpBuilder theBuilder(moduleOp.getLoc(), moduleOp.getContext());
   builder = &theBuilder;
+
+  // Block worklist that tracks the current position within a block.
+  SmallVector<std::pair<Block::iterator, Block::iterator>> worklist;
+
+  // Walk the IR in order, top-to-bottom, stepping into blocks as they are
+  // found.  This is basically the same as `moduleOp.walk`, however, it allows
+  // for visiting operations that are inserted _after_ the current operation.
+  // Using the existing `walk` does not do this.
   auto *body = moduleOp.getBodyBlock();
-  // Merge connections by forward iterations.
-  for (auto it = body->begin(), e = body->end(); it != e;) {
-    auto connectOp = dyn_cast<StrictConnectOp>(*it);
-    if (!connectOp) {
-      it++;
-      continue;
+  worklist.push_back({body->begin(), body->end()});
+  while (!worklist.empty()) {
+    auto &[it, e] = worklist.back();
+
+    // Merge connections by forward iterations.
+    bool opWithBlocks = false;
+    while (it != e) {
+      // Add blocks to the stack such that they will be pulled off in-order.
+      for (auto &region : llvm::reverse(it->getRegions()))
+        for (auto &block : llvm::reverse(region.getBlocks())) {
+          worklist.push_back({block.begin(), block.end()});
+          opWithBlocks = true;
+        }
+
+      // We found one or more blocks.  Stop and go process these blocks.
+      if (opWithBlocks) {
+        ++it;
+        break;
+      }
+
+      // This operation does not have blocks.  Process it normally.
+      auto connectOp = dyn_cast<MatchingConnectOp>(*it);
+      if (!connectOp) {
+        ++it;
+        continue;
+      }
+      builder->setInsertionPointAfter(connectOp);
+      builder->setLoc(connectOp.getLoc());
+      bool removeOp = peelConnect(connectOp);
+      ++it;
+      if (removeOp)
+        connectOp.erase();
     }
-    builder->setInsertionPointAfter(connectOp);
-    builder->setLoc(connectOp.getLoc());
-    bool removeOp = peelConnect(connectOp);
-    ++it;
-    if (removeOp)
-      connectOp.erase();
+
+    // We found a block and added to the worklist.
+    if (opWithBlocks)
+      continue;
+
+    // We finished processing a block.
+    worklist.pop_back();
   }
 
   // Clean up dead operations introduced by this pass.
-  for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body)))
-    if (isa<SubfieldOp, SubindexOp, InvalidValueOp, ConstantOp, BitCastOp,
-            CatPrimOp>(op))
-      if (op.use_empty()) {
-        changed = true;
-        op.erase();
-      }
+  moduleOp.walk<mlir::WalkOrder::PostOrder, mlir::ReverseIterator>(
+      [&](Operation *op) {
+        if (isa<SubfieldOp, SubindexOp, InvalidValueOp, ConstantOp, BitCastOp,
+                CatPrimOp>(op))
+          if (op->use_empty()) {
+            changed = true;
+            op->erase();
+          }
+      });
 
   return changed;
 }
 
 struct MergeConnectionsPass
-    : public MergeConnectionsBase<MergeConnectionsPass> {
+    : public circt::firrtl::impl::MergeConnectionsBase<MergeConnectionsPass> {
   MergeConnectionsPass(bool enableAggressiveMergingFlag) {
     enableAggressiveMerging = enableAggressiveMergingFlag;
   }
@@ -273,9 +330,9 @@ struct MergeConnectionsPass
 } // namespace
 
 void MergeConnectionsPass::runOnOperation() {
-  LLVM_DEBUG(llvm::dbgs() << "===----- Running MergeConnections "
-                             "--------------------------------------===\n"
-                          << "Module: '" << getOperation().getName() << "'\n";);
+  LLVM_DEBUG(debugPassHeader(this)
+             << "\n"
+             << "Module: '" << getOperation().getName() << "'\n");
 
   MergeConnection mergeConnection(getOperation(), enableAggressiveMerging);
   bool changed = mergeConnection.run();

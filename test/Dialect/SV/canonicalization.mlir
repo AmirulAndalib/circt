@@ -1,4 +1,4 @@
-// RUN: circt-opt -canonicalize='top-down=true region-simplify=true' %s | FileCheck %s
+// RUN: circt-opt -canonicalize='top-down=true region-simplify=aggressive' %s | FileCheck %s
 
 // CHECK-LABEL: func @if_dead_condition(%arg0: i1) {
 // CHECK-NEXT:    [[FD:%.*]] = hw.constant -2147483646 : i32
@@ -56,6 +56,9 @@ func.func @if_dead_condition(%arg0: i1) {
   return
 }
 
+// CHECK-LABEL: sv.macro.decl @SYNTHESIS
+sv.macro.decl @SYNTHESIS
+
 // CHECK-LABEL: func @empy_op(%arg0: i1) {
 // CHECK-NOT:     sv.if
 // CHECK-NOT:     sv.ifdef
@@ -68,11 +71,11 @@ func.func @empy_op(%arg0: i1) {
   sv.initial {
     sv.if %arg0 {}
     sv.if %arg0 {} else {}
-    sv.ifdef.procedural "SYNTHESIS" {}
-    sv.ifdef.procedural "SYNTHESIS" {} else {}
+    sv.ifdef.procedural @SYNTHESIS {}
+    sv.ifdef.procedural @SYNTHESIS {} else {}
   }
-  sv.ifdef "SYNTHESIS" {}
-  sv.ifdef "SYNTHESIS" {} else {}
+  sv.ifdef @SYNTHESIS {}
+  sv.ifdef @SYNTHESIS {} else {}
   sv.always posedge %arg0 {}
   sv.initial {}
   return
@@ -106,7 +109,7 @@ func.func @invert_if(%arg0: i1, %arg1 : i1) {
 // CHECK-NEXT:    [[FD:%.*]] = hw.constant -2147483646 : i32
 // CHECK-NEXT:    sv.initial  {
 // CHECK-NEXT:      sv.if %arg0  {
-// CHECK-NEXT:      } else {  
+// CHECK-NEXT:      } else {
 // CHECK-NEXT:        sv.fwrite [[FD]], "Foo"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    }
@@ -123,8 +126,8 @@ func.func @no_invert_if(%arg0: i1) {
   return
 }
 
-// CHECK-LABEL; @immediate_assert_canonicalization
-hw.module @assert_canonicalization(%clock: i1) {
+// CHECK-LABEL: @assert_canonicalization
+hw.module @assert_canonicalization(in %clock: i1) {
   %true = hw.constant 1 : i1
   %false = hw.constant 0 : i1
   sv.always posedge %clock {
@@ -145,8 +148,8 @@ hw.module @assert_canonicalization(%clock: i1) {
 }
 
 
-// CHECK-LABEL: hw.module @svAttrPreventsCanonicalization(%arg0: i1) {
-hw.module @svAttrPreventsCanonicalization(%arg0: i1) {
+// CHECK-LABEL: hw.module @svAttrPreventsCanonicalization(in %arg0 : i1) {
+hw.module @svAttrPreventsCanonicalization(in %arg0: i1) {
   %0 = sv.wire : !hw.inout<i1>
   // CHECK:      %0 = sv.wire : !hw.inout<i1>
   // CHECK-NEXT: sv.assign %0, %arg0 {sv.attributes = [#sv.attribute<"attr">]} : i1
@@ -154,7 +157,7 @@ hw.module @svAttrPreventsCanonicalization(%arg0: i1) {
 }
 
 // CHECK-LABEL: @case_stmt
-hw.module @case_stmt(%arg: i3) {
+hw.module @case_stmt(in %arg: i3) {
   %fd = hw.constant 0x80000002 : i32
   sv.initial {
     // CHECK: sv.case %arg
@@ -281,7 +284,7 @@ hw.module @case_stmt(%arg: i3) {
   }
 
 // CHECK-LABEL: MergeAssignments
-hw.module @MergeAssignments(%a: !hw.array<4xi1>, %clock: i1) -> (d: !hw.array<4xi1>) {
+hw.module @MergeAssignments(in %a: !hw.array<4xi1>, in %clock: i1, out d: !hw.array<4xi1>) {
   %c-1_i2 = hw.constant -1 : i2
   %c-2_i2 = hw.constant -2 : i2
   %c1_i2 = hw.constant 1 : i2
@@ -314,7 +317,15 @@ hw.module @MergeAssignments(%a: !hw.array<4xi1>, %clock: i1) -> (d: !hw.array<4x
 
 // CHECK-LABEL: @Sampled
 // CHECK-NEXT: hw.output
-hw.module @Sampled(%in: i1) {
+hw.module @Sampled(in %in: i1) {
   %2 = sv.system.sampled %in : i1
+  hw.output
+}
+
+// CHECK-LABEL: @Issue7563
+// CHECK-NEXT: hw.output
+hw.module @Issue7563(in %in: i8) {
+  %r = sv.reg : !hw.inout<i8>
+  sv.assign %r, %in : i8
   hw.output
 }

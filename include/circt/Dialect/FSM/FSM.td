@@ -11,7 +11,7 @@
 
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/OpBase.td"
-include "mlir/IR/FunctionInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
 
 def FSMDialect : Dialect {
   let name = "fsm";
@@ -24,7 +24,10 @@ def FSMDialect : Dialect {
   }];
 
   let useDefaultTypePrinterParser = 1;
-  let useFoldAPI = kEmitFoldAdaptorFolder;
+
+  let dependentDialects = [
+    "circt::seq::SeqDialect"
+  ];
 }
 
 // Base class for the types in this dialect.

@@ -23,12 +23,15 @@ def SeqDialect : Dialect {
 
   let hasConstantMaterializer = 1;
   let useDefaultTypePrinterParser = 1;
-  let useFoldAPI = kEmitFoldAdaptorFolder;
+  let useDefaultAttributePrinterParser = 1;
+
   let cppNamespace = "::circt::seq";
 
   let extraClassDeclaration = [{
-    /// Register all Seq types.
+    /// Register all types.
     void registerTypes();
+    /// Register all attributes.
+    void registerAttributes();
   }];
 }
 

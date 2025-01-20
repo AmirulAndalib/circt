@@ -55,7 +55,7 @@ firrtl.circuit "NLARenaming" attributes {
   // CHECK:      firrtl.module private @Foo
   // CHECK:      firrtl.module private @DUT
   // CHECK-SAME:   {circt.nonlocal = @[[nla_DUTLeafModule_clone]], class = "nla_DUTLeafModule"}
-  // CHECK-NEXT    firrtl.instance Foo sym @[[inst_sym]]
+  // CHECK-NEXT:    firrtl.instance Foo sym @[[inst_sym]]
   firrtl.module private @DUT(
     in %in: !firrtl.uint<1> sym @in [{circt.nonlocal = @nla_DUTLeafPort, class = "nla_DUTLeafPort"}]
   ) attributes {
@@ -117,7 +117,7 @@ firrtl.circuit "NLARenamingNewNLAs" attributes {
 
   // CHECK:      firrtl.module private @DUT
   // CHECK-SAME:   in %in{{.+}} [{circt.nonlocal = @[[nla_DUTLeafPort_clone]], class = "nla_DUTLeafPort"}]
-  // CHECK-NEXT    firrtl.instance Foo sym @[[inst_sym]]
+  // CHECK-NEXT:    firrtl.instance Foo sym @[[inst_sym]]
   firrtl.module private @DUT(
     in %in: !firrtl.uint<1> [{circt.nonlocal = @nla_DUTLeafPort, class = "nla_DUTLeafPort"}]
   ) attributes {
@@ -133,5 +133,51 @@ firrtl.circuit "NLARenamingNewNLAs" attributes {
   }
   firrtl.module @NLARenamingNewNLAs() {
     %dut_in = firrtl.instance dut sym @dut @DUT(in in: !firrtl.uint<1>)
+  }
+}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "Refs"
+firrtl.circuit "Refs" attributes {
+    annotations = [{class = "sifive.enterprise.firrtl.InjectDUTHierarchyAnnotation", name = "Foo"}]
+  } {
+
+  firrtl.module private @DUT(
+    in %in: !firrtl.uint<1>, out %out: !firrtl.ref<uint<1>>
+  ) attributes {
+    annotations = [
+      {class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}
+    ]}
+  {
+    %ref = firrtl.ref.send %in : !firrtl.uint<1>
+    firrtl.ref.define %out, %ref : !firrtl.ref<uint<1>>
+  }
+  firrtl.module @Refs() {
+    %dut_in, %dut_tap = firrtl.instance dut sym @dut @DUT(in in: !firrtl.uint<1>, out out: !firrtl.ref<uint<1>>)
+  }
+}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "Properties"
+firrtl.circuit "Properties" attributes {
+    annotations = [{class = "sifive.enterprise.firrtl.InjectDUTHierarchyAnnotation", name = "Foo"}]
+  } {
+
+  firrtl.module private @DUT(
+    in %in: !firrtl.integer, out %out: !firrtl.integer
+  ) attributes {
+    annotations = [
+      {class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}
+    ]}
+  {
+    // CHECK: [[IN:%.+]], [[OUT:%.+]] = firrtl.instance Foo
+    // CHECK: firrtl.propassign [[IN]], %in
+    // CHECK: firrtl.propassign %out, [[OUT]]
+    firrtl.propassign %out, %in : !firrtl.integer
+  }
+  firrtl.module @Properties() {
+    %dut_in, %dut_out = firrtl.instance dut sym @dut @DUT(in in: !firrtl.integer, out out: !firrtl.integer)
   }
 }

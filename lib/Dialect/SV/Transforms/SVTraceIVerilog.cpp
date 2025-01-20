@@ -11,13 +11,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+
+namespace circt {
+namespace sv {
+#define GEN_PASS_DEF_SVTRACEIVERILOG
+#include "circt/Dialect/SV/SVPasses.h.inc"
+} // namespace sv
+} // namespace circt
 
 using namespace circt;
 using namespace sv;
@@ -30,7 +38,7 @@ using namespace hw;
 namespace {
 
 struct SVTraceIVerilogPass
-    : public sv::SVTraceIVerilogBase<SVTraceIVerilogPass> {
+    : public circt::sv::impl::SVTraceIVerilogBase<SVTraceIVerilogPass> {
   void runOnOperation() override;
 };
 
@@ -40,7 +48,7 @@ void SVTraceIVerilogPass::runOnOperation() {
   mlir::ModuleOp mod = getOperation();
 
   if (topOnly) {
-    auto graph = InstanceGraph(mod);
+    auto &graph = getAnalysis<InstanceGraph>();
     auto topLevelNodes = graph.getInferredTopLevelNodes();
     if (failed(topLevelNodes) || topLevelNodes->size() != 1) {
       mod.emitError("Expected exactly one top level node");

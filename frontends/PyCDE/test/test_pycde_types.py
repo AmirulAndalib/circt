@@ -1,7 +1,7 @@
 # RUN: %PYTHON% %s | FileCheck %s
 
 from pycde import dim, types, Input, Output, generator, System, Module
-from pycde.types import bit, Bits, StructType, TypeAlias, UInt
+from pycde.types import bit, Bits, List, StructType, TypeAlias, UInt
 from pycde.testing import unittestmodule
 from pycde.signals import Struct, UIntSignal
 
@@ -15,7 +15,7 @@ array1 = dim(types.ui6)
 # CHECK: UInt<6>
 print(array1)
 
-array2 = dim(6, 10, 12)
+array2 = Bits(6) * 10 * 12
 # CHECK: Bits<6>[10][12]
 print(array2)
 
@@ -30,15 +30,24 @@ print(struct)
 
 dim_alias = dim(1, 8, name="myname5")
 
+# CHECK: List<Bits<5>>
+i5list = List(Bits(5))
+print(i5list)
+
+
+class Dummy(Module):
+  pass
+
+
 # CHECK: hw.type_scope @pycde
 # CHECK: hw.typedecl @myname1 : i8
 # CHECK: hw.typedecl @myname5 : !hw.array<8xi1>
 # CHECK-NOT: hw.typedecl @myname1
 # CHECK-NOT: hw.typedecl @myname5
-m = System([]).mod
+m = System(Dummy)
 TypeAlias.declare_aliases(m)
 TypeAlias.declare_aliases(m)
-print(m)
+m.print()
 
 assert bit == Bits(1)
 
@@ -54,7 +63,7 @@ class ExStruct(Struct):
 print(ExStruct)
 
 
-# CHECK-LABEL:  msft.module @TestStruct {} (%inp1: !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>) -> (out1: ui33, out2: !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>)
+# CHECK-LABEL:  hw.module @TestStruct(in %inp1 : !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>, out out1 : ui33, out out2 : !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>)
 # CHECK-NEXT:     %b = hw.struct_extract %inp1["b"] {sv.namehint = "inp1__b"} : !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>
 # CHECK-NEXT:     [[r0:%.+]] = hwarith.constant 1 : ui1
 # CHECK-NEXT:     [[r1:%.+]] = hwarith.add %b, [[r0]] : (ui32, ui1) -> ui33
@@ -64,7 +73,7 @@ print(ExStruct)
 # CHECK-NEXT:     [[r3:%.+]] = hwarith.add %b_0, [[r2]] : (ui32, ui1) -> ui33
 # CHECK-NEXT:     [[r4:%.+]] = hwarith.cast [[r3]] : (ui33) -> ui32
 # CHECK-NEXT:     [[r5:%.+]] = hw.struct_create (%a, [[r4]]) : !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>
-# CHECK-NEXT:     msft.output [[r1]], [[r5]] : ui33, !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>
+# CHECK-NEXT:     hw.output [[r1]], [[r5]] : ui33, !hw.typealias<@pycde::@ExStruct, !hw.struct<a: i4, b: ui32>>
 @unittestmodule()
 class TestStruct(Module):
   inp1 = Input(ExStruct)

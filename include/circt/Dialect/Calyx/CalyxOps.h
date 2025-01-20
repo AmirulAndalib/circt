@@ -16,15 +16,22 @@
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/FunctionInterfaces.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/RegionKindInterface.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace circt {
 namespace calyx {
+
+// the goPort, donePort, resetPort and clkPort identify the attributes of the
+// go, done, reset and clk port of the circuit.
+static constexpr std::string_view goPort = "go";
+static constexpr std::string_view donePort = "done";
+static constexpr std::string_view resetPort = "reset";
+static constexpr std::string_view clkPort = "clk";
 
 /// A helper function to verify each control-like operation
 /// has a valid parent and, if applicable, body.
@@ -53,11 +60,15 @@ public:
       return success();
 
     // If the operation has the static attribute, verify it is zero.
-    APInt staticValue = staticAttribute.cast<IntegerAttr>().getValue();
+    APInt staticValue = cast<IntegerAttr>(staticAttribute).getValue();
     assert(staticValue == 0 && "If combinational, it should take 0 cycles.");
 
     return success();
   }
+};
+
+enum class FloatingPointStandard {
+  IEEE754,
 };
 
 /// The direction of a Component or Cell port. this is similar to the
@@ -119,6 +130,9 @@ LogicalResult verifyCell(Operation *op);
 
 /// A helper function to verify each operation with the Group Interface trait.
 LogicalResult verifyGroupInterface(Operation *op);
+
+/// A helper function to verify each operation with the If trait.
+LogicalResult verifyIf(Operation *op);
 
 /// Returns port information for the block argument provided.
 PortInfo getPortInfo(BlockArgument arg);

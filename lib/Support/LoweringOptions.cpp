@@ -63,6 +63,8 @@ void LoweringOptions::parse(StringRef text, ErrorHandlerT errorHandler) {
       allowExprInEventControl = true;
     } else if (option == "disallowPackedArrays") {
       disallowPackedArrays = true;
+    } else if (option == "disallowPackedStructAssignments") {
+      disallowPackedStructAssignments = true;
     } else if (option == "disallowLocalVariables") {
       disallowLocalVariables = true;
     } else if (option == "verifLabels") {
@@ -95,8 +97,8 @@ void LoweringOptions::parse(StringRef text, ErrorHandlerT errorHandler) {
       disallowExpressionInliningInPorts = true;
     } else if (option == "disallowMuxInlining") {
       disallowMuxInlining = true;
-    } else if (option == "disallowArrayIndexInlining") {
-      disallowArrayIndexInlining = true;
+    } else if (option == "mitigateVivadoArrayIndexConstPropBug") {
+      mitigateVivadoArrayIndexConstPropBug = true;
     } else if (option.consume_front("wireSpillingHeuristic=")) {
       if (auto heuristic = parseWireSpillingHeuristic(option)) {
         wireSpillingHeuristicSet |= *heuristic;
@@ -109,6 +111,18 @@ void LoweringOptions::parse(StringRef text, ErrorHandlerT errorHandler) {
             "expected integer for number of namehint heurstic term limit");
         wireSpillingNamehintTermLimit = DEFAULT_NAMEHINT_TERM_LIMIT;
       }
+    } else if (option == "emitWireInPorts") {
+      emitWireInPorts = true;
+    } else if (option == "emitBindComments") {
+      emitBindComments = true;
+    } else if (option == "omitVersionComment") {
+      omitVersionComment = true;
+    } else if (option == "caseInsensitiveKeywords") {
+      caseInsensitiveKeywords = true;
+    } else if (option == "emitVerilogLocations") {
+      emitVerilogLocations = true;
+    } else if (option == "fixUpEmptyModules") {
+      fixUpEmptyModules = true;
     } else {
       errorHandler(llvm::Twine("unknown style option \'") + option + "\'");
       // We continue parsing options after a failure.
@@ -125,6 +139,8 @@ std::string LoweringOptions::toString() const {
     options += "exprInEventControl,";
   if (disallowPackedArrays)
     options += "disallowPackedArrays,";
+  if (disallowPackedStructAssignments)
+    options += "disallowPackedStructAssignments,";
   if (disallowLocalVariables)
     options += "disallowLocalVariables,";
   if (enforceVerifLabels)
@@ -148,14 +164,26 @@ std::string LoweringOptions::toString() const {
     options += "disallowExpressionInliningInPorts,";
   if (disallowMuxInlining)
     options += "disallowMuxInlining,";
-  if (disallowArrayIndexInlining)
-    options += "disallowArrayIndexInlining,";
+  if (mitigateVivadoArrayIndexConstPropBug)
+    options += "mitigateVivadoArrayIndexConstPropBug,";
 
   if (emittedLineLength != DEFAULT_LINE_LENGTH)
     options += "emittedLineLength=" + std::to_string(emittedLineLength) + ',';
   if (maximumNumberOfTermsPerExpression != DEFAULT_TERM_LIMIT)
     options += "maximumNumberOfTermsPerExpression=" +
                std::to_string(maximumNumberOfTermsPerExpression) + ',';
+  if (emitWireInPorts)
+    options += "emitWireInPorts,";
+  if (emitBindComments)
+    options += "emitBindComments,";
+  if (omitVersionComment)
+    options += "omitVersionComment,";
+  if (caseInsensitiveKeywords)
+    options += "caseInsensitiveKeywords,";
+  if (emitVerilogLocations)
+    options += "emitVerilogLocations,";
+  if (fixUpEmptyModules)
+    options += "fixUpEmptyModules,";
 
   // Remove a trailing comma if present.
   if (!options.empty()) {

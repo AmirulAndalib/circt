@@ -1,7 +1,8 @@
 set(HANDSHAKE_SRCS
+  HandshakeDialect.cpp
   HandshakeExecutableOps.cpp
   HandshakeOps.cpp
-  HandshakeDialect.cpp
+  HandshakeUtils.cpp
   )
 
 add_circt_dialect_library(CIRCTHandshake
@@ -12,10 +13,13 @@ add_circt_dialect_library(CIRCTHandshake
   ${PROJECT_BINARY_DIR}/include
 
   LINK_LIBS PUBLIC
+  CIRCTSeq
+  CIRCTESI
   MLIRFuncDialect
   MLIRIR
 
   DEPENDS
+  MLIRArithDialect
   MLIRHandshakeInterfacesIncGen
   MLIRHandshakeCanonicalizationIncGen
   MLIRHandshakeAttributesIncGen

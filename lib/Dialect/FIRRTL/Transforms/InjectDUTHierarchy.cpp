@@ -11,23 +11,35 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
-
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/HW/InnerSymbolNamespace.h"
+#include "circt/Support/Debug.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-inject-dut-hier"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_INJECTDUTHIERARCHY
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
 
 namespace {
-struct InjectDUTHierarchy : public InjectDUTHierarchyBase<InjectDUTHierarchy> {
+struct InjectDUTHierarchy
+    : public circt::firrtl::impl::InjectDUTHierarchyBase<InjectDUTHierarchy> {
   void runOnOperation() override;
 };
 } // namespace
@@ -49,11 +61,11 @@ static void addHierarchy(hw::HierPathOp path, FModuleOp dut,
   newNamepath.reserve(namepath.size() + 1);
   while (path.modPart(nlaIdx) != dut.getNameAttr())
     newNamepath.push_back(namepath[nlaIdx++]);
-  newNamepath.push_back(hw::InnerRefAttr::get(dut.moduleNameAttr(),
+  newNamepath.push_back(hw::InnerRefAttr::get(dut.getModuleNameAttr(),
                                               getInnerSymName(wrapperInst)));
 
   // Add the extra level of hierarchy.
-  if (auto dutRef = namepath[nlaIdx].dyn_cast<hw::InnerRefAttr>())
+  if (auto dutRef = dyn_cast<hw::InnerRefAttr>(namepath[nlaIdx]))
     newNamepath.push_back(hw::InnerRefAttr::get(
         wrapperInst.getModuleNameAttr().getAttr(), dutRef.getName()));
   else
@@ -67,14 +79,9 @@ static void addHierarchy(hw::HierPathOp path, FModuleOp dut,
 }
 
 void InjectDUTHierarchy::runOnOperation() {
-  LLVM_DEBUG(llvm::dbgs() << "===- Running InjectDUTHierarchyPass "
-                             "-----------------------------------------===\n");
+  LLVM_DEBUG(debugPassHeader(this) << "\n";);
 
   CircuitOp circuit = getOperation();
-
-  /// The design-under-test (DUT).  This is kept up-to-date by the pass as the
-  /// DUT changes due to internal logic.
-  FModuleOp dut;
 
   /// The wrapper module that is created inside the DUT to house all its logic.
   FModuleOp wrapper;
@@ -121,41 +128,19 @@ void InjectDUTHierarchy::runOnOperation() {
   if (!wrapperName)
     return markAllAnalysesPreserved();
 
-  // TODO: Combine this logic with GrandCentral and other places that need to
-  // find the DUT.  Consider changing the MarkDUTAnnotation scattering to put
-  // this information on the Circuit so that we don't have to dig through all
-  // the modules to find the DUT.
-  for (auto mod : circuit.getOps<FModuleOp>()) {
-    if (!AnnotationSet(mod).hasAnnotation(dutAnnoClass))
-      continue;
-    if (dut) {
-      auto diag = emitError(mod.getLoc())
-                  << "is marked with a '" << dutAnnoClass << "', but '"
-                  << dut.moduleName()
-                  << "' also had such an annotation (this should "
-                     "be impossible!)";
-      diag.attachNote(dut.getLoc()) << "the first DUT was found here";
-      error = true;
-      break;
-    }
-    dut = mod;
-  }
-
-  if (error)
-    return signalPassFailure();
-
-  // If a hierarchy annotation was provided, ensure that a DUT annotation also
-  // exists.  The pass could silently ignore this case and do nothing, but it is
-  // better to provide an error.
-  if (wrapperName && !dut) {
+  // A DUT must exist in order to continue.  The pass could silently ignore this
+  // case and do nothing, but it is better to provide an error.
+  InstanceInfo &instanceInfo = getAnalysis<InstanceInfo>();
+  if (!instanceInfo.getDut()) {
     emitError(circuit->getLoc())
         << "contained a '" << injectDUTHierarchyAnnoClass << "', but no '"
         << dutAnnoClass << "' was provided";
-    error = true;
+    return signalPassFailure();
   }
 
-  if (error)
-    return signalPassFailure();
+  /// The design-under-test (DUT).  This is kept up-to-date by the pass as the
+  /// DUT changes due to internal logic.
+  FModuleOp dut = cast<FModuleOp>(instanceInfo.getDut());
 
   // Create a module that will become the new DUT.  The original DUT is renamed
   // to become the wrapper.  This is done to save copying into the wrapper.
@@ -169,7 +154,8 @@ void InjectDUTHierarchy::runOnOperation() {
   {
     b.setInsertionPointAfter(dut);
     auto newDUT = b.create<FModuleOp>(dut.getLoc(), dut.getNameAttr(),
-                                      dut.getPorts(), dut.getAnnotations());
+                                      dut.getConventionAttr(), dut.getPorts(),
+                                      dut.getAnnotations());
 
     SymbolTable::setSymbolVisibility(newDUT, dut.getVisibility());
     dut.setName(b.getStringAttr(circuitNS.newName(wrapperName.getValue())));
@@ -187,17 +173,19 @@ void InjectDUTHierarchy::runOnOperation() {
 
   // Instantiate the wrapper inside the DUT and wire it up.
   b.setInsertionPointToStart(dut.getBodyBlock());
-  ModuleNamespace dutNS(dut);
-  auto wrapperInst = b.create<InstanceOp>(
-      b.getUnknownLoc(), wrapper, wrapper.moduleName(),
-      NameKindEnum::DroppableName, ArrayRef<Attribute>{}, ArrayRef<Attribute>{},
-      false, b.getStringAttr(dutNS.newName(wrapper.moduleName())));
+  hw::InnerSymbolNamespace dutNS(dut);
+  auto wrapperInst =
+      b.create<InstanceOp>(b.getUnknownLoc(), wrapper, wrapper.getModuleName(),
+                           NameKindEnum::DroppableName, ArrayRef<Attribute>{},
+                           ArrayRef<Attribute>{}, false,
+                           hw::InnerSymAttr::get(b.getStringAttr(
+                               dutNS.newName(wrapper.getModuleName()))));
   for (const auto &pair : llvm::enumerate(wrapperInst.getResults())) {
     Value lhs = dut.getArgument(pair.index());
     Value rhs = pair.value();
     if (dut.getPortDirection(pair.index()) == Direction::In)
       std::swap(lhs, rhs);
-    b.create<ConnectOp>(b.getUnknownLoc(), lhs, rhs);
+    emitConnect(b, b.getUnknownLoc(), lhs, rhs);
   }
 
   // Compute a set of paths that are used _inside_ the wrapper.
@@ -250,7 +238,7 @@ void InjectDUTHierarchy::runOnOperation() {
       assert(namepath.size() > 1 && "namepath size must be greater than one");
       SmallVector<Attribute> newNamepath{hw::InnerRefAttr::get(
           wrapper.getNameAttr(),
-          namepath.front().cast<hw::InnerRefAttr>().getName())};
+          cast<hw::InnerRefAttr>(namepath.front()).getName())};
       auto tail = namepath.drop_front();
       newNamepath.append(tail.begin(), tail.end());
       nla->setAttr("namepath", b.getArrayAttr(newNamepath));

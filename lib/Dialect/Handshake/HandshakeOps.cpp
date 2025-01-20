@@ -11,13 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Handshake/HandshakeOps.h"
+#include "circt/Dialect/ESI/ESITypes.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/FunctionImplementation.h"
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpDefinition.h"
@@ -25,6 +25,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallBitVector.h"
@@ -78,10 +79,36 @@ parseSostOperation(OpAsmParser &parser,
   return success();
 }
 
+/// Verifies whether an indexing value is wide enough to index into a provided
+/// number of operands.
+static LogicalResult verifyIndexWideEnough(Operation *op, Value indexVal,
+                                           uint64_t numOperands) {
+  auto indexType = indexVal.getType();
+  unsigned indexWidth;
+
+  // Determine the bitwidth of the indexing value
+  if (auto integerType = dyn_cast<IntegerType>(indexType))
+    indexWidth = integerType.getWidth();
+  else if (indexType.isIndex())
+    indexWidth = IndexType::kInternalStorageBitWidth;
+  else
+    return op->emitError("unsupported type for indexing value: ") << indexType;
+
+  // Check whether the bitwidth can support the provided number of operands
+  if (indexWidth < 64) {
+    uint64_t maxNumOperands = (uint64_t)1 << indexWidth;
+    if (numOperands > maxNumOperands)
+      return op->emitError("bitwidth of indexing value is ")
+             << indexWidth << ", which can index into " << maxNumOperands
+             << " operands, but found " << numOperands << " operands";
+  }
+  return success();
+}
+
 static bool isControlCheckTypeAndOperand(Type dataType, Value operand) {
   // The operation is a control operation if its operand data type is a
   // NoneType.
-  if (dataType.isa<NoneType>())
+  if (isa<NoneType>(dataType))
     return true;
 
   // Otherwise, the operation is a control operation if the operation's
@@ -169,7 +196,7 @@ struct EliminateUnusedForkResultsPattern : mlir::OpRewritePattern<ForkOp> {
                                 PatternRewriter &rewriter) const override {
     std::set<unsigned> unusedIndexes;
 
-    for (auto &res : llvm::enumerate(op.getResults()))
+    for (auto res : llvm::enumerate(op.getResults()))
       if (res.value().getUses().empty())
         unusedIndexes.insert(res.index());
 
@@ -181,12 +208,10 @@ struct EliminateUnusedForkResultsPattern : mlir::OpRewritePattern<ForkOp> {
     auto operand = op.getOperand();
     auto newFork = rewriter.create<ForkOp>(
         op.getLoc(), operand, op.getNumResults() - unusedIndexes.size());
-    rewriter.updateRootInPlace(op, [&] {
-      unsigned i = 0;
-      for (auto &oldRes : llvm::enumerate(op.getResults()))
-        if (unusedIndexes.count(oldRes.index()) == 0)
-          oldRes.value().replaceAllUsesWith(newFork.getResults()[i++]);
-    });
+    unsigned i = 0;
+    for (auto oldRes : llvm::enumerate(op.getResults()))
+      if (unusedIndexes.count(oldRes.index()) == 0)
+        rewriter.replaceAllUsesWith(oldRes.value(), newFork.getResults()[i++]);
     rewriter.eraseOp(op);
     return success();
   }
@@ -206,21 +231,19 @@ struct EliminateForkToForkPattern : mlir::OpRewritePattern<ForkOp> {
     /// on if op is the single user of the value), but we'll let
     /// EliminateUnusedForkResultsPattern apply in that case.
     unsigned totalNumOuts = op.getSize() + parentForkOp.getSize();
-    rewriter.updateRootInPlace(parentForkOp, [&] {
-      /// Create a new parent fork op which produces all of the fork outputs and
-      /// replace all of the uses of the old results.
-      auto newParentForkOp = rewriter.create<ForkOp>(
-          parentForkOp.getLoc(), parentForkOp.getOperand(), totalNumOuts);
+    /// Create a new parent fork op which produces all of the fork outputs and
+    /// replace all of the uses of the old results.
+    auto newParentForkOp = rewriter.create<ForkOp>(
+        parentForkOp.getLoc(), parentForkOp.getOperand(), totalNumOuts);
 
-      for (auto it :
-           llvm::zip(parentForkOp->getResults(), newParentForkOp.getResults()))
-        std::get<0>(it).replaceAllUsesWith(std::get<1>(it));
+    for (auto it :
+         llvm::zip(parentForkOp->getResults(), newParentForkOp.getResults()))
+      rewriter.replaceAllUsesWith(std::get<0>(it), std::get<1>(it));
 
-      /// Replace the results of the matches fork op with the corresponding
-      /// results of the new parent fork op.
-      rewriter.replaceOp(op,
-                         newParentForkOp.getResults().take_back(op.getSize()));
-    });
+    /// Replace the results of the matches fork op with the corresponding
+    /// results of the new parent fork op.
+    rewriter.replaceOp(op,
+                       newParentForkOp.getResults().take_back(op.getSize()));
     rewriter.eraseOp(parentForkOp);
     return success();
   }
@@ -338,7 +361,7 @@ struct EliminateCBranchIntoMuxPattern : OpRewritePattern<MuxOp> {
     if (!secondParentCBranch || firstParentCBranch != secondParentCBranch)
       return failure();
 
-    rewriter.updateRootInPlace(firstParentCBranch, [&] {
+    rewriter.modifyOpInPlace(firstParentCBranch, [&] {
       // Replace uses of the mux's output with cbranch's data input
       rewriter.replaceOp(op, firstParentCBranch.getDataOperand());
     });
@@ -358,6 +381,7 @@ void MuxOp::getCanonicalizationPatterns(RewritePatternSet &results,
 LogicalResult
 MuxOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
                         ValueRange operands, DictionaryAttr attributes,
+                        mlir::OpaqueProperties properties,
                         mlir::RegionRange regions,
                         SmallVectorImpl<mlir::Type> &inferredReturnTypes) {
   // MuxOp must have at least one data operand (in addition to the select
@@ -369,7 +393,7 @@ MuxOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   return success();
 }
 
-bool MuxOp::isControl() { return getResult().getType().isa<NoneType>(); }
+bool MuxOp::isControl() { return isa<NoneType>(getResult().getType()); }
 
 std::string handshake::MuxOp::getOperandName(unsigned int idx) {
   return idx == 0 ? "select" : defaultOperandName(idx - 1);
@@ -413,25 +437,8 @@ void MuxOp::print(OpAsmPrinter &p) {
 }
 
 LogicalResult MuxOp::verify() {
-  unsigned numDataOperands = static_cast<int>(getDataOperands().size());
-  auto selectType = getSelectOperand().getType();
-
-  unsigned selectBits;
-  if (auto integerType = selectType.dyn_cast<IntegerType>())
-    selectBits = integerType.getWidth();
-  else if (selectType.isIndex())
-    selectBits = IndexType::kInternalStorageBitWidth;
-  else
-    return emitError("unsupported type for select operand: ") << selectType;
-
-  double maxDataOperands = std::pow(2, selectBits);
-  if (numDataOperands > maxDataOperands)
-    return emitError("select bitwidth was ")
-           << selectBits << ", which can mux "
-           << static_cast<int64_t>(maxDataOperands) << " operands, but found "
-           << numDataOperands << " operands";
-
-  return success();
+  return verifyIndexWideEnough(*this, getSelectOperand(),
+                               getDataOperands().size());
 }
 
 std::string handshake::ControlMergeOp::getResultName(unsigned int idx) {
@@ -439,32 +446,21 @@ std::string handshake::ControlMergeOp::getResultName(unsigned int idx) {
   return idx == 0 ? "dataOut" : "index";
 }
 
-LogicalResult ControlMergeOp::inferReturnTypes(
-    MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, mlir::RegionRange regions,
-    SmallVectorImpl<mlir::Type> &inferredReturnTypes) {
-  // ControlMerge must have at least one data operand
-  if (operands.empty())
-    return failure();
-  // Result type is type of any data operand and index type
-  inferredReturnTypes.push_back(operands[0].getType());
-  inferredReturnTypes.push_back(IndexType::get(context));
-  return success();
-}
-
 ParseResult ControlMergeOp::parse(OpAsmParser &parser, OperationState &result) {
   SmallVector<OpAsmParser::UnresolvedOperand, 4> allOperands;
-  Type type;
-  ArrayRef<Type> operandTypes(type);
-  SmallVector<Type, 1> resultTypes, dataOperandsTypes;
+  Type resultType, indexType;
+  SmallVector<Type> resultTypes, dataOperandsTypes;
   llvm::SMLoc allOperandLoc = parser.getCurrentLocation();
   int size;
-  if (parseSostOperation(parser, allOperands, result, size, type, false))
+  if (parseSostOperation(parser, allOperands, result, size, resultType, false))
+    return failure();
+  // Parse type of index result
+  if (parser.parseComma() || parser.parseType(indexType))
     return failure();
 
-  dataOperandsTypes.assign(size, type);
-  resultTypes.push_back(type);
-  resultTypes.push_back(IndexType::get(parser.getContext()));
+  dataOperandsTypes.assign(size, resultType);
+  resultTypes.push_back(resultType);
+  resultTypes.push_back(indexType);
   result.addTypes(resultTypes);
   if (parser.resolveOperands(allOperands, dataOperandsTypes, allOperandLoc,
                              result.operands))
@@ -472,7 +468,20 @@ ParseResult ControlMergeOp::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
-void ControlMergeOp::print(OpAsmPrinter &p) { sostPrint(p, false); }
+void ControlMergeOp::print(OpAsmPrinter &p) {
+  sostPrint(p, false);
+  // Print type of index result
+  p << ", " << getIndex().getType();
+}
+
+LogicalResult ControlMergeOp::verify() {
+  auto operands = getOperands();
+  if (operands.empty())
+    return emitOpError("operation must have at least one operand");
+  if (operands[0].getType() != getResult().getType())
+    return emitOpError("type of first result should match type of operands");
+  return verifyIndexWideEnough(*this, getIndex(), getNumOperands());
+}
 
 LogicalResult FuncOp::verify() {
   // If this function is external there is nothing to do.
@@ -508,7 +517,7 @@ LogicalResult FuncOp::verify() {
                            << ".";
 
     if (llvm::any_of(portNames,
-                     [&](Attribute attr) { return !attr.isa<StringAttr>(); }))
+                     [&](Attribute attr) { return !isa<StringAttr>(attr); }))
       return emitOpError() << "expected all entries in attribute '" << attrName
                            << "' to be strings.";
 
@@ -521,7 +530,7 @@ LogicalResult FuncOp::verify() {
 
   // Verify that all memrefs have a corresponding extmemory operation
   for (auto arg : entryBlock.getArguments()) {
-    if (!arg.getType().isa<MemRefType>())
+    if (!isa<MemRefType>(arg.getType()))
       continue;
     if (arg.getUsers().empty() ||
         !isa<ExternalMemoryOp>(*arg.getUsers().begin()))
@@ -608,9 +617,8 @@ void handshake::FuncOp::resolveArgAndResNames() {
                           StringRef attrName) {
     for (auto fallbackName : llvm::enumerate(fallbackNames)) {
       if (actualNames.size() <= fallbackName.index())
-        addStringToStringArrayAttr(
-            builder, this->getOperation(), attrName,
-            fallbackName.value().template cast<StringAttr>());
+        addStringToStringArrayAttr(builder, this->getOperation(), attrName,
+                                   cast<StringAttr>(fallbackName.value()));
     }
   };
   resolveNames(fallbackArgNames, argNames, "argNames");
@@ -726,7 +734,7 @@ LogicalResult EliminateSimpleControlMergesPattern::matchAndRewrite(
 
   for (auto &use : llvm::make_early_inc_range(dataResult.getUses())) {
     auto *user = use.getOwner();
-    rewriter.updateRootInPlace(
+    rewriter.modifyOpInPlace(
         user, [&]() { user->setOperand(use.getOperandNumber(), merge); });
   }
 
@@ -821,54 +829,6 @@ bool ConditionalBranchOp::isControl() {
                                       getDataOperand());
 }
 
-ParseResult SelectOp::parse(OpAsmParser &parser, OperationState &result) {
-  SmallVector<OpAsmParser::UnresolvedOperand, 4> allOperands;
-  Type dataType;
-  SmallVector<Type> operandTypes;
-  llvm::SMLoc allOperandLoc = parser.getCurrentLocation();
-  if (parser.parseOperandList(allOperands) ||
-      parser.parseOptionalAttrDict(result.attributes) ||
-      parser.parseColonType(dataType))
-    return failure();
-
-  if (allOperands.size() != 3)
-    return parser.emitError(parser.getCurrentLocation(),
-                            "Expected exactly 3 operands");
-
-  result.addTypes({dataType});
-  operandTypes.push_back(IntegerType::get(parser.getContext(), 1));
-  operandTypes.push_back(dataType);
-  operandTypes.push_back(dataType);
-  if (parser.resolveOperands(allOperands, operandTypes, allOperandLoc,
-                             result.operands))
-    return failure();
-  return success();
-}
-
-void SelectOp::print(OpAsmPrinter &p) {
-  Type type = getTrueOperand().getType();
-  p << " " << getOperands();
-  p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << type;
-}
-
-std::string handshake::SelectOp::getOperandName(unsigned int idx) {
-  switch (idx) {
-  case 0:
-    return "sel";
-  case 1:
-    return "true";
-  case 2:
-    return "false";
-  default:
-    llvm_unreachable("Expected exactly 3 operands");
-  }
-}
-
-bool SelectOp::isControl() {
-  return getTrueOperand().getType().isa<NoneType>();
-}
-
 ParseResult SinkOp::parse(OpAsmParser &parser, OperationState &result) {
   SmallVector<OpAsmParser::UnresolvedOperand, 4> allOperands;
   Type type;
@@ -907,7 +867,7 @@ void SourceOp::print(OpAsmPrinter &p) {
 
 LogicalResult ConstantOp::verify() {
   // Verify that the type of the provided value is equal to the result type.
-  auto typedValue = getValue().dyn_cast<mlir::TypedAttr>();
+  auto typedValue = dyn_cast<mlir::TypedAttr>(getValue());
   if (!typedValue)
     return emitOpError("constant value must be a typed attribute; value is ")
            << getValue();
@@ -1081,13 +1041,13 @@ LogicalResult MemoryOp::verify() {
   }
   for (unsigned i = 0; i < opStCount; i++) {
     Type syncType = outputType[opLdCount + i];
-    if (!syncType.isa<NoneType>())
+    if (!isa<NoneType>(syncType))
       return emitOpError("data type for sync port for store port ")
              << i << ":" << syncType << " is not 'none'";
   }
   for (unsigned i = 0; i < opLdCount; i++) {
     Type syncType = outputType[opLdCount + opStCount + i];
-    if (!syncType.isa<NoneType>())
+    if (!isa<NoneType>(syncType))
       return emitOpError("data type for sync port for load port ")
              << i << ":" << syncType << " is not 'none'";
   }
@@ -1114,7 +1074,7 @@ void ExternalMemoryOp::build(OpBuilder &builder, OperationState &result,
   llvm::append_range(ops, inputs);
   result.addOperands(ops);
 
-  auto memrefType = memref.getType().cast<MemRefType>();
+  auto memrefType = cast<MemRefType>(memref.getType());
 
   // Data outputs (get their type from memref)
   result.types.append(ldCount, memrefType.getElementType());
@@ -1144,7 +1104,7 @@ void MemoryOp::build(OpBuilder &builder, OperationState &result,
                      bool lsq, int id, Value memref) {
   result.addOperands(operands);
 
-  auto memrefType = memref.getType().cast<MemRefType>();
+  auto memrefType = cast<MemRefType>(memref.getType());
 
   // Data outputs (get their type from memref)
   result.types.append(outputs, memrefType.getElementType());
@@ -1202,9 +1162,9 @@ bool handshake::MemoryOp::allocateMemory(
   mlir::Type elementType = type.getElementType();
   int width = elementType.getIntOrFloatBitWidth();
   for (int i = 0; i < allocationSize; i++) {
-    if (elementType.isa<mlir::IntegerType>()) {
+    if (isa<mlir::IntegerType>(elementType)) {
       store[ptr][i] = APInt(width, 0);
-    } else if (elementType.isa<mlir::FloatType>()) {
+    } else if (isa<mlir::FloatType>(elementType)) {
       store[ptr][i] = APFloat(0.0);
     } else {
       llvm_unreachable("Unknown result type!\n");
@@ -1243,7 +1203,7 @@ void handshake::LoadOp::build(OpBuilder &builder, OperationState &result,
   result.addOperands(indices);
 
   // Data type
-  auto memrefType = memref.getType().cast<MemRefType>();
+  auto memrefType = cast<MemRefType>(memref.getType());
 
   // Data output (from load to successor ops)
   result.types.push_back(memrefType.getElementType());
@@ -1374,6 +1334,56 @@ void JoinOp::print(OpAsmPrinter &p) {
   p << " " << getData();
   p.printOptionalAttrDict((*this)->getAttrs(), {"control"});
   p << " : " << getData().getTypes();
+}
+
+LogicalResult
+ESIInstanceOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  // Check that the module attribute was specified.
+  auto fnAttr = this->getModuleAttr();
+  assert(fnAttr && "requires a 'module' symbol reference attribute");
+
+  FuncOp fn = symbolTable.lookupNearestSymbolFrom<FuncOp>(*this, fnAttr);
+  if (!fn)
+    return emitOpError() << "'" << fnAttr.getValue()
+                         << "' does not reference a valid handshake function";
+
+  // Verify that the operand and result types match the callee.
+  auto fnType = fn.getFunctionType();
+  if (fnType.getNumInputs() != getNumOperands() - NumFixedOperands)
+    return emitOpError(
+        "incorrect number of operands for the referenced handshake function");
+
+  for (unsigned i = 0, e = fnType.getNumInputs(); i != e; ++i) {
+    Type operandType = getOperand(i + NumFixedOperands).getType();
+    auto channelType = dyn_cast<esi::ChannelType>(operandType);
+    if (!channelType)
+      return emitOpError("operand type mismatch: expected channel type, but "
+                         "provided ")
+             << operandType << " for operand number " << i;
+    if (channelType.getInner() != fnType.getInput(i))
+      return emitOpError("operand type mismatch: expected operand type ")
+             << fnType.getInput(i) << ", but provided "
+             << getOperand(i).getType() << " for operand number " << i;
+  }
+
+  if (fnType.getNumResults() != getNumResults())
+    return emitOpError(
+        "incorrect number of results for the referenced handshake function");
+
+  for (unsigned i = 0, e = fnType.getNumResults(); i != e; ++i) {
+    Type resultType = getResult(i).getType();
+    auto channelType = dyn_cast<esi::ChannelType>(resultType);
+    if (!channelType)
+      return emitOpError("result type mismatch: expected channel type, but "
+                         "provided ")
+             << resultType << " for result number " << i;
+    if (channelType.getInner() != fnType.getResult(i))
+      return emitOpError("result type mismatch: expected result type ")
+             << fnType.getResult(i) << ", but provided "
+             << getResult(i).getType() << " for result number " << i;
+  }
+
+  return success();
 }
 
 /// Based on mlir::func::CallOp::verifySymbolUses

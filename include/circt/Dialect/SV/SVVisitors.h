@@ -31,7 +31,7 @@ public:
             ReadInOutOp, ArrayIndexInOutOp, VerbatimExprOp, VerbatimExprSEOp,
             IndexedPartSelectInOutOp, IndexedPartSelectOp, StructFieldInOutOp,
             ConstantXOp, ConstantZOp, ConstantStrOp, MacroRefExprOp,
-            MacroRefExprSEOp,
+            MacroRefExprSEOp, UnpackedArrayCreateOp, UnpackedOpenArrayCastOp,
             // Declarations.
             RegOp, WireOp, LogicOp, LocalParamOp, XMROp, XMRRefOp,
             // Control flow.
@@ -39,14 +39,17 @@ public:
             AlwaysCombOp, AlwaysFFOp, InitialOp, CaseOp,
             // Other Statements.
             AssignOp, BPAssignOp, PAssignOp, ForceOp, ReleaseOp, AliasOp,
-            FWriteOp, SystemFunctionOp, VerbatimOp,
+            FWriteOp, SystemFunctionOp, VerbatimOp, MacroRefOp, FuncCallOp,
+            FuncCallProceduralOp, ReturnOp,
             // Type declarations.
             InterfaceOp, InterfaceSignalOp, InterfaceModportOp,
             InterfaceInstanceOp, GetModportOp, AssignInterfaceSignalOp,
-            ReadInterfaceSignalOp,
+            ReadInterfaceSignalOp, MacroDeclOp, MacroDefOp, FuncOp,
+            FuncDPIImportOp,
             // Verification statements.
             AssertOp, AssumeOp, CoverOp, AssertConcurrentOp, AssumeConcurrentOp,
-            CoverConcurrentOp,
+            CoverConcurrentOp, AssertPropertyOp, AssumePropertyOp,
+            CoverPropertyOp,
             // Bind Statements
             BindOp,
             // Simulator control tasks
@@ -57,6 +60,8 @@ public:
             ReadMemOp,
             // Generate statements
             GenerateOp, GenerateCaseOp,
+            // For statements
+            ForOp,
             // Sampled value functiions
             SampledOp>([&](auto expr) -> ResultType {
           return thisCast->visitSV(expr, args...);
@@ -104,6 +109,8 @@ public:
   HANDLE(ConstantStrOp, Unhandled);
   HANDLE(MacroRefExprOp, Unhandled);
   HANDLE(MacroRefExprSEOp, Unhandled);
+  HANDLE(UnpackedArrayCreateOp, Unhandled);
+  HANDLE(UnpackedOpenArrayCastOp, Unhandled);
 
   // Control flow.
   HANDLE(OrderedOutputOp, Unhandled);
@@ -125,7 +132,11 @@ public:
   HANDLE(AliasOp, Unhandled);
   HANDLE(FWriteOp, Unhandled);
   HANDLE(SystemFunctionOp, Unhandled);
+  HANDLE(FuncCallProceduralOp, Unhandled);
+  HANDLE(FuncCallOp, Unhandled);
+  HANDLE(ReturnOp, Unhandled);
   HANDLE(VerbatimOp, Unhandled);
+  HANDLE(MacroRefOp, Unhandled);
 
   // Type declarations.
   HANDLE(InterfaceOp, Unhandled);
@@ -135,6 +146,10 @@ public:
   HANDLE(GetModportOp, Unhandled);
   HANDLE(AssignInterfaceSignalOp, Unhandled);
   HANDLE(ReadInterfaceSignalOp, Unhandled);
+  HANDLE(MacroDefOp, Unhandled);
+  HANDLE(MacroDeclOp, Unhandled);
+  HANDLE(FuncDPIImportOp, Unhandled);
+  HANDLE(FuncOp, Unhandled);
 
   // Verification statements.
   HANDLE(AssertOp, Unhandled);
@@ -143,6 +158,9 @@ public:
   HANDLE(AssertConcurrentOp, Unhandled);
   HANDLE(AssumeConcurrentOp, Unhandled);
   HANDLE(CoverConcurrentOp, Unhandled);
+  HANDLE(AssertPropertyOp, Unhandled);
+  HANDLE(AssumePropertyOp, Unhandled);
+  HANDLE(CoverPropertyOp, Unhandled);
 
   // Bind statements.
   HANDLE(BindOp, Unhandled);
@@ -164,6 +182,9 @@ public:
   // Generate statements
   HANDLE(GenerateOp, Unhandled);
   HANDLE(GenerateCaseOp, Unhandled);
+
+  // For loop.
+  HANDLE(ForOp, Unhandled);
 
   // Sampled Value Functions
   HANDLE(SampledOp, Unhandled);

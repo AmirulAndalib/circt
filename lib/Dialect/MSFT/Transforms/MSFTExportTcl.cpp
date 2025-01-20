@@ -24,6 +24,13 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+namespace circt {
+namespace msft {
+#define GEN_PASS_DEF_EXPORTTCL
+#include "circt/Dialect/MSFT/MSFTPasses.h.inc"
+} // namespace msft
+} // namespace circt
+
 using namespace circt;
 using namespace msft;
 
@@ -47,7 +54,7 @@ struct RemovePhysOpLowering : public OpConversionPattern<PhysOpTy> {
 } // anonymous namespace
 
 namespace {
-struct ExportTclPass : public ExportTclBase<ExportTclPass> {
+struct ExportTclPass : public circt::msft::impl::ExportTclBase<ExportTclPass> {
   void runOnOperation() override;
 };
 } // anonymous namespace
@@ -59,7 +66,7 @@ void ExportTclPass::runOnOperation() {
 
   // Traverse MSFT location attributes and export the required Tcl into
   // templated `sv::VerbatimOp`s with symbolic references to the instance paths.
-  for (std::string moduleName : tops) {
+  for (const std::string &moduleName : tops) {
     Operation *hwmod =
         emitter.getDefinition(FlatSymbolRefAttr::get(ctxt, moduleName));
     if (!hwmod) {
@@ -86,14 +93,6 @@ void ExportTclPass::runOnOperation() {
   patterns.insert<RemovePhysOpLowering<InstanceHierarchyOp>>(ctxt);
   patterns.insert<RemovePhysOpLowering<DynamicInstanceVerbatimAttrOp>>(ctxt);
   patterns.insert<RemoveOpLowering<DeclPhysicalRegionOp>>(ctxt);
-  if (failed(applyPartialConversion(top, target, std::move(patterns))))
-    signalPassFailure();
-
-  target.addDynamicallyLegalOp<hw::GlobalRefOp>([&](hw::GlobalRefOp ref) {
-    return !emitter.getRefsUsed().contains(ref);
-  });
-  patterns.clear();
-  patterns.insert<RemoveOpLowering<hw::GlobalRefOp>>(ctxt);
   if (failed(applyPartialConversion(top, target, std::move(patterns))))
     signalPassFailure();
 }

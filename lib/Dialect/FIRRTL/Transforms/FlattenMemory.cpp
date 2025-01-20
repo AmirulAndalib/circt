@@ -10,36 +10,40 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
-#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 #include <numeric>
 
 #define DEBUG_TYPE "lower-memory"
 
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_FLATTENMEMORY
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
+
 using namespace circt;
 using namespace firrtl;
 
 namespace {
-struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
+struct FlattenMemoryPass
+    : public circt::firrtl::impl::FlattenMemoryBase<FlattenMemoryPass> {
   /// This pass flattens the aggregate data of memory into a UInt, and inserts
   /// appropriate bitcasts to access the data.
   void runOnOperation() override {
     LLVM_DEBUG(llvm::dbgs() << "\n Running lower memory on module:"
                             << getOperation().getName());
-    ModuleNamespace modNamespace(getOperation());
     SmallVector<Operation *> opsToErase;
     auto hasSubAnno = [&](MemOp op) -> bool {
       for (size_t portIdx = 0, e = op.getNumResults(); portIdx < e; ++portIdx)
         for (auto attr : op.getPortAnnotation(portIdx))
-          if (attr.cast<DictionaryAttr>().get("circt.fieldID"))
+          if (cast<DictionaryAttr>(attr).get("circt.fieldID"))
             return true;
 
       return false;
@@ -59,7 +63,7 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
       // implies a memtap and we cannot transform the datatype for a memory that
       // is tapped.
       for (auto res : memOp.getResults())
-        if (res.getType().cast<FIRRTLType>().isa<RefType>())
+        if (isa<RefType>(res.getType()))
           return;
       // If subannotations present on aggregate fields, we cannot flatten the
       // memory. It must be split into one memory per aggregate field.
@@ -113,24 +117,27 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
           memOp.getDepth(), memOp.getRuw(), builder.getArrayAttr(portNames),
           memOp.getNameAttr(), memOp.getNameKind(), memOp.getAnnotations(),
           memOp.getPortAnnotations(), memOp.getInnerSymAttr(),
-          memOp.getGroupIDAttr(), memOp.getInitAttr());
+          memOp.getInitAttr(), memOp.getPrefixAttr());
       // Hook up the new memory to the wires the old memory was replaced with.
       for (size_t index = 0, rend = memOp.getNumResults(); index < rend;
            ++index) {
         auto result = memOp.getResult(index);
-        auto wire = builder.create<WireOp>(
-            result.getType(),
-            (memOp.getName() + "_" + memOp.getPortName(index).getValue())
-                .str());
-        result.replaceAllUsesWith(wire.getResult());
+        auto wire = builder
+                        .create<WireOp>(result.getType(),
+                                        (memOp.getName() + "_" +
+                                         memOp.getPortName(index).getValue())
+                                            .str())
+                        .getResult();
+        result.replaceAllUsesWith(wire);
         result = wire;
         auto newResult = flatMem.getResult(index);
-        auto rType = result.getType().cast<BundleType>();
+        auto rType = type_cast<BundleType>(result.getType());
         for (size_t fieldIndex = 0, fend = rType.getNumElements();
              fieldIndex != fend; ++fieldIndex) {
           auto name = rType.getElement(fieldIndex).name.getValue();
           auto oldField = builder.create<SubfieldOp>(result, fieldIndex);
-          Value newField = builder.create<SubfieldOp>(newResult, fieldIndex);
+          FIRRTLBaseValue newField =
+              builder.create<SubfieldOp>(newResult, fieldIndex);
           // data and mask depend on the memory type which was split.  They can
           // also go both directions, depending on the port direction.
           if (!(name == "data" || name == "mask" || name == "wdata" ||
@@ -141,14 +148,14 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
           Value realOldField = oldField;
           if (rType.getElement(fieldIndex).isFlip) {
             // Cast the memory read data from flat type to aggregate.
-            newField = builder.createOrFold<BitCastOp>(
-                oldField.getType().cast<FIRRTLType>(), newField);
+            auto castField =
+                builder.createOrFold<BitCastOp>(oldField.getType(), newField);
             // Write the aggregate read data.
-            emitConnect(builder, realOldField, newField);
+            emitConnect(builder, realOldField, castField);
           } else {
             // Cast the input aggregate write data to flat type.
             // Cast the input aggregate write data to flat type.
-            auto newFieldType = newField.getType().cast<FIRRTLBaseType>();
+            auto newFieldType = newField.getType();
             auto oldFieldBitWidth = getBitWidth(oldField.getType());
             // Following condition is true, if a data field is 0 bits. Then
             // newFieldType is of smaller bits than old.
@@ -176,10 +183,9 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
             }
             // Now set the mask or write data.
             // Ensure that the types match.
-            emitConnect(
-                builder, newField,
-                builder.createOrFold<BitCastOp>(
-                    newField.getType().cast<FIRRTLType>(), realOldField));
+            emitConnect(builder, newField,
+                        builder.createOrFold<BitCastOp>(newField.getType(),
+                                                        realOldField));
           }
         }
       }
@@ -195,7 +201,7 @@ private:
   // Recursively populate the results with each ground type field.
   static bool flattenType(FIRRTLType type, SmallVectorImpl<IntType> &results) {
     std::function<bool(FIRRTLType)> flatten = [&](FIRRTLType type) -> bool {
-      return TypeSwitch<FIRRTLType, bool>(type)
+      return FIRRTLTypeSwitch<FIRRTLType, bool>(type)
           .Case<BundleType>([&](auto bundle) {
             for (auto &elt : bundle)
               if (!flatten(elt.type))
@@ -221,9 +227,9 @@ private:
   }
 
   Value getSubWhatever(ImplicitLocOpBuilder *builder, Value val, size_t index) {
-    if (BundleType bundle = val.getType().dyn_cast<BundleType>())
+    if (BundleType bundle = type_dyn_cast<BundleType>(val.getType()))
       return builder->create<SubfieldOp>(val, index);
-    if (FVectorType fvector = val.getType().dyn_cast<FVectorType>())
+    if (FVectorType fvector = type_dyn_cast<FVectorType>(val.getType()))
       return builder->create<SubindexOp>(val, index);
 
     llvm_unreachable("Unknown aggregate type");

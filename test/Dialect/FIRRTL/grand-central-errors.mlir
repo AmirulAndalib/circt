@@ -39,7 +39,7 @@ firrtl.circuit "NonGroundType" attributes {
        name = "View"}]} {
     %_vector = firrtl.verbatim.expr "???" : () -> !firrtl.vector<uint<2>, 1>
     %ref_vector = firrtl.ref.send %_vector : !firrtl.vector<uint<2>, 1>
-    %vector = firrtl.ref.resolve %ref_vector : !firrtl.ref<vector<uint<2>, 1>>
+    %vector = firrtl.ref.resolve %ref_vector : !firrtl.probe<vector<uint<2>, 1>>
     // expected-error @+1 {{'firrtl.node' op cannot be added to interface with id '0' because it is not a ground type}}
     %a = firrtl.node %vector {
       annotations = [
@@ -343,6 +343,35 @@ firrtl.circuit "NotInstantiated" attributes {
   firrtl.module private @DUT() {
   }
   firrtl.module @NotInstantiated() {
+    firrtl.instance dut @DUT()
+  }
+}
+
+// -----
+
+firrtl.circuit "CompanionWithOutputs"
+  attributes {annotations = [
+    {class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+     defName = "Foo",
+     elements = [
+       {class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+        defName = "Bar",
+        elements = [],
+        name = "bar"}],
+     id = 0 : i64,
+     name = "MyView"}]}  {
+  // expected-error @below {{'firrtl.module' op companion instance cannot have output ports}}
+  firrtl.module private @MyView_companion(
+    out %out : !firrtl.uint<32>
+  )
+    attributes {annotations = [{
+      class = "sifive.enterprise.grandcentral.ViewAnnotation.companion",
+      id = 0 : i64,
+      name = "MyView"}]} {}
+  firrtl.module private @DUT() {
+    firrtl.instance MyView_companion  @MyView_companion(out out: !firrtl.uint<32>)
+  }
+  firrtl.module @CompanionWithOutputs() {
     firrtl.instance dut @DUT()
   }
 }

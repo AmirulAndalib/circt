@@ -14,6 +14,7 @@
 
 #include "mlir/Pass/Pass.h"
 #include <memory>
+#include <utility>
 
 namespace circt {
 namespace esi {
@@ -24,7 +25,7 @@ class ServiceGeneratorDispatcher {
 public:
   // All generators must support this function pointer signature.
   using ServiceGeneratorFunc = std::function<LogicalResult(
-      ServiceImplementReqOp, ServiceDeclOpInterface)>;
+      ServiceImplementReqOp, ServiceDeclOpInterface, ServiceImplRecordOp)>;
 
   // Since passes don't have access to a context at creation time (and
   // Attributes are tied to the context), we need to delay lookup table creation
@@ -33,10 +34,9 @@ public:
   ServiceGeneratorDispatcher(
       DenseMap<StringRef, ServiceGeneratorFunc> genLookupTable,
       bool failIfNotFound)
-      : genLookupTable(genLookupTable), failIfNotFound(failIfNotFound) {}
-  ServiceGeneratorDispatcher(const ServiceGeneratorDispatcher &that)
-      : genLookupTable(that.genLookupTable),
-        failIfNotFound(that.failIfNotFound) {}
+      : genLookupTable(std::move(genLookupTable)),
+        failIfNotFound(failIfNotFound) {}
+  ServiceGeneratorDispatcher(const ServiceGeneratorDispatcher &that) = default;
 
   /// Get the global dispatcher.
   static ServiceGeneratorDispatcher &globalDispatcher();
@@ -46,7 +46,7 @@ public:
   LogicalResult generate(ServiceImplementReqOp, ServiceDeclOpInterface);
 
   /// Add a generator to this registry.
-  void registerGenerator(StringRef name, ServiceGeneratorFunc func);
+  void registerGenerator(StringRef implType, ServiceGeneratorFunc gen);
 
 private:
   DenseMap<StringRef, ServiceGeneratorFunc> genLookupTable;

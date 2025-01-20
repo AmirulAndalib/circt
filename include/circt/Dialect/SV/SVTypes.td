@@ -20,13 +20,6 @@ include "circt/Dialect/SV/SVDialect.td"
 // includable for other dialects, without polluting their output with SV types.
 class SVType<string name> : TypeDef<SVDialect, name> { }
 
-def StringType : SVType<"String"> {
-  let summary = "SystemVerilog string type";
-  let description = "Defines the string type in verilog";
-
-  let mnemonic = "string";
-}
-
 //===----------------------------------------------------------------------===//
 // InOut type and related helpers.
 //===----------------------------------------------------------------------===//
@@ -57,5 +50,32 @@ class InOutTypeConstraint<string value, string inoutValue>
 class InOutElementConstraint<string value, string inoutValue>
   : TypesMatchWith<"type should be element of inout type",
                    inoutValue, value, "sv::getInOutElementType($_self)">;
+
+def UnpackedOpenArrayTypeImpl : SVType<"UnpackedOpenArray"> {
+  let summary = "SystemVerilog unpacked 'open' array";
+  let description = [{
+    This type represents unpacked 'open' array. Open array is a special type that can be
+    used as formal arguments of DPI import statements.
+
+    See SystemVerilog Spec 35.5.6.1.
+  }];
+
+  let mnemonic = "open_uarray";
+  let parameters = (ins "::mlir::Type":$elementType);
+
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "Type":$elementType), [{
+      auto *ctx = elementType.getContext();
+      return $_get(ctx, elementType);
+    }]>
+  ];
+
+  let assemblyFormat = "`<` $elementType `>`";
+}
+
+def UnpackedOpenArrayType : DialectType<SVDialect,
+    CPred<"::circt::hw::type_isa<circt::sv::UnpackedOpenArrayType>($_self)">,
+          "an Unpacked Open ArrayType",
+          "::circt::hw::TypeAliasOr<circt::sv::UnpackedOpenArrayType>">;
 
 #endif // CIRCT_DIALECT_SV_SVTYPES

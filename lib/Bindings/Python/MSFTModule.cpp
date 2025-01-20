@@ -6,11 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "DialectModules.h"
+#include "CIRCTModules.h"
 
 #include "circt-c/Dialect/MSFT.h"
-#include "circt/Dialect/MSFT/MSFTAttributes.h"
-#include "circt/Support/LLVM.h"
+#include "circt/Dialect/MSFT/MSFTDialect.h"
 
 #include "mlir/Bindings/Python/PybindAdaptors.h"
 #include "mlir/CAPI/IR.h"
@@ -22,8 +21,8 @@
 #include <pybind11/stl.h>
 namespace py = pybind11;
 
-using namespace circt;
-using namespace circt::msft;
+// using namespace circt;
+// using namespace circt::msft;
 using namespace mlir::python::adaptors;
 
 static py::handle getPhysLocationAttr(MlirAttribute attr) {
@@ -118,18 +117,18 @@ private:
 class PyLocationVecIterator {
 public:
   /// Get item at the specified position, translating a nullptr to None.
-  static py::handle getItem(MlirAttribute locVec, intptr_t pos) {
+  static std::optional<MlirAttribute> getItem(MlirAttribute locVec,
+                                              intptr_t pos) {
     MlirAttribute loc = circtMSFTLocationVectorAttrGetElement(locVec, pos);
     if (loc.ptr == nullptr)
-      return py::none();
-    return py::detail::type_caster<MlirAttribute>().cast(
-        loc, py::return_value_policy::automatic, py::handle());
+      return std::nullopt;
+    return loc;
   }
 
   PyLocationVecIterator(MlirAttribute attr) : attr(attr) {}
   PyLocationVecIterator &dunderIter() { return *this; }
 
-  py::handle dunderNext() {
+  std::optional<MlirAttribute> dunderNext() {
     if (nextIndex >= circtMSFTLocationVectorAttrGetNumElements(attr)) {
       throw py::stop_iteration();
     }
@@ -147,6 +146,7 @@ private:
   MlirAttribute attr;
   intptr_t nextIndex = 0;
 };
+
 /// Populate the msft python module.
 void circt::python::populateDialectMSFTSubmodule(py::module &m) {
   mlirMSFTRegisterPasses();
@@ -278,23 +278,4 @@ void circt::python::populateDialectMSFTSubmodule(py::module &m) {
       .def(py::init<CirctMSFTDirection, CirctMSFTDirection>(),
            py::arg("columns") = CirctMSFTDirection::NONE,
            py::arg("rows") = CirctMSFTDirection::NONE);
-
-  mlir_attribute_subclass(m, "AppIDAttr", circtMSFTAttributeIsAnAppIDAttr)
-      .def_classmethod(
-          "get",
-          [](py::object cls, std::string name, uint64_t index,
-             MlirContext ctxt) {
-            return cls(circtMSFTAppIDAttrGet(ctxt, wrap(name), index));
-          },
-          "Create an AppID attribute", py::arg("cls"), py::arg("name"),
-          py::arg("index"), py::arg("context") = py::none())
-      .def_property_readonly("name",
-                             [](MlirAttribute self) {
-                               StringRef name =
-                                   unwrap(circtMSFTAppIDAttrGetName(self));
-                               return std::string(name.data(), name.size());
-                             })
-      .def_property_readonly("index", [](MlirAttribute self) {
-        return circtMSFTAppIDAttrGetIndex(self);
-      });
 }

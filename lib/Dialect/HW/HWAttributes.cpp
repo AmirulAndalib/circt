@@ -49,7 +49,7 @@ Attribute HWDialect::parseAttribute(DialectAsmParser &p, Type type) const {
     return attr;
 
   // Parse "#hw.param.expr.add" as ParamExprAttr.
-  if (attrName.startswith(ParamExprAttr::getMnemonic())) {
+  if (attrName.starts_with(ParamExprAttr::getMnemonic())) {
     auto string = attrName.drop_front(ParamExprAttr::getMnemonic().size());
     if (string.front() == '.')
       return parseParamExprWithOpcode(string.drop_front(), p, type);
@@ -89,7 +89,7 @@ static std::string canonicalizeFilename(const Twine &directory,
   // separator and return it.
   // e.g. `directory` + `` -> `directory/`.
   auto separator = llvm::sys::path::get_separator();
-  if (nativeFilename.empty() && !nativeDirectory.endswith(separator)) {
+  if (nativeFilename.empty() && !nativeDirectory.ends_with(separator)) {
     nativeDirectory += separator;
     return std::string(nativeDirectory);
   }
@@ -127,7 +127,17 @@ OutputFileAttr OutputFileAttr::getAsDirectory(MLIRContext *context,
 }
 
 bool OutputFileAttr::isDirectory() {
-  return getFilename().getValue().endswith(llvm::sys::path::get_separator());
+  return getFilename().getValue().ends_with(llvm::sys::path::get_separator());
+}
+
+StringRef OutputFileAttr::getDirectory() {
+  auto dir = getFilename().getValue();
+  for (unsigned i = 0, e = dir.size(); i < e; ++i) {
+    if (dir.ends_with(llvm::sys::path::get_separator()))
+      break;
+    dir = dir.drop_back();
+  }
+  return dir;
 }
 
 /// Option         ::= 'excludeFromFileList' | 'includeReplicatedOp'
@@ -171,16 +181,6 @@ void OutputFileAttr::print(AsmPrinter &p) const {
 }
 
 //===----------------------------------------------------------------------===//
-// FileListAttr
-//===----------------------------------------------------------------------===//
-
-FileListAttr FileListAttr::getFromFilename(MLIRContext *context,
-                                           const Twine &filename) {
-  auto canonicalized = canonicalizeFilename("", filename);
-  return FileListAttr::get(StringAttr::get(context, canonicalized));
-}
-
-//===----------------------------------------------------------------------===//
 // EnumFieldAttr
 //===----------------------------------------------------------------------===//
 
@@ -206,7 +206,7 @@ EnumFieldAttr EnumFieldAttr::get(Location loc, StringAttr value,
     emitError(loc) << "expected enum type";
 
   // Check whether the provided value is a member of the enum type.
-  EnumType enumType = getCanonicalType(type).cast<EnumType>();
+  EnumType enumType = llvm::cast<EnumType>(getCanonicalType(type));
   if (!enumType.contains(value.getValue())) {
     emitError(loc) << "enum value '" << value.getValue()
                    << "' is not a member of enum type " << enumType;
@@ -230,34 +230,48 @@ Attribute InnerRefAttr::parse(AsmParser &p, Type type) {
   return InnerRefAttr::get(attr.getRootReference(), attr.getLeafReference());
 }
 
+static void printSymbolName(AsmPrinter &p, StringAttr sym) {
+  if (sym)
+    p.printSymbolName(sym.getValue());
+  else
+    p.printSymbolName({});
+}
+
 void InnerRefAttr::print(AsmPrinter &p) const {
   p << "<";
-  p.printSymbolName(getModule().getValue());
+  printSymbolName(p, getModule());
   p << "::";
-  p.printSymbolName(getName().getValue());
+  printSymbolName(p, getName());
   p << ">";
 }
 
 //===----------------------------------------------------------------------===//
-// InnerSymAttr
+// InnerSymAttr and InnerSymPropertiesAttr
 //===----------------------------------------------------------------------===//
 
 Attribute InnerSymPropertiesAttr::parse(AsmParser &parser, Type type) {
   StringAttr name;
   NamedAttrList dummyList;
   int64_t fieldId = 0;
-  StringRef visibility;
   if (parser.parseLess() || parser.parseSymbolName(name, "name", dummyList) ||
       parser.parseComma() || parser.parseInteger(fieldId) ||
-      parser.parseComma() ||
-      parser.parseOptionalKeyword(&visibility,
-                                  {"public", "private", "nested"}) ||
-      parser.parseGreater())
+      parser.parseComma())
     return Attribute();
-  StringAttr visibilityAttr = parser.getBuilder().getStringAttr(visibility);
 
-  return InnerSymPropertiesAttr::get(parser.getContext(), name, fieldId,
-                                     visibilityAttr);
+  StringRef visibility;
+  auto loc = parser.getCurrentLocation();
+  if (parser.parseOptionalKeyword(&visibility,
+                                  {"public", "private", "nested"})) {
+    parser.emitError(loc, "expected 'public', 'private', or 'nested'");
+    return Attribute();
+  }
+  auto visibilityAttr = parser.getBuilder().getStringAttr(visibility);
+
+  if (parser.parseGreater())
+    return Attribute();
+
+  return parser.getChecked<InnerSymPropertiesAttr>(parser.getContext(), name,
+                                                   fieldId, visibilityAttr);
 }
 
 void InnerSymPropertiesAttr::print(AsmPrinter &odsPrinter) const {
@@ -265,7 +279,16 @@ void InnerSymPropertiesAttr::print(AsmPrinter &odsPrinter) const {
              << getSymVisibility().getValue() << ">";
 }
 
-StringAttr InnerSymAttr::getSymIfExists(unsigned fieldId) const {
+LogicalResult InnerSymPropertiesAttr::verify(
+    ::llvm::function_ref<::mlir::InFlightDiagnostic()> emitError,
+    ::mlir::StringAttr name, uint64_t fieldID,
+    ::mlir::StringAttr symVisibility) {
+  if (!name || name.getValue().empty())
+    return emitError() << "inner symbol cannot have empty name";
+  return success();
+}
+
+StringAttr InnerSymAttr::getSymIfExists(uint64_t fieldId) const {
   const auto *it =
       llvm::find_if(getImpl()->props, [&](const InnerSymPropertiesAttr &p) {
         return p.getFieldID() == fieldId;
@@ -273,6 +296,16 @@ StringAttr InnerSymAttr::getSymIfExists(unsigned fieldId) const {
   if (it != getProps().end())
     return it->getName();
   return {};
+}
+
+InnerSymAttr InnerSymAttr::erase(uint64_t fieldID) const {
+  SmallVector<InnerSymPropertiesAttr> syms(getProps());
+  const auto *it = llvm::find_if(syms, [fieldID](InnerSymPropertiesAttr p) {
+    return p.getFieldID() == fieldID;
+  });
+  assert(it != syms.end());
+  syms.erase(it);
+  return InnerSymAttr::get(getContext(), syms);
 }
 
 LogicalResult InnerSymAttr::walkSymbols(
@@ -287,19 +320,24 @@ Attribute InnerSymAttr::parse(AsmParser &parser, Type type) {
   StringAttr sym;
   NamedAttrList dummyList;
   SmallVector<InnerSymPropertiesAttr, 4> names;
-  if (!parser.parseOptionalSymbolName(sym, "dummy", dummyList))
-    names.push_back(InnerSymPropertiesAttr::get(sym));
-  else if (parser.parseCommaSeparatedList(
-               OpAsmParser::Delimiter::Square, [&]() -> ParseResult {
-                 InnerSymPropertiesAttr prop;
-                 if (parser.parseCustomAttributeWithFallback(
-                         prop, mlir::Type{}, "dummy", dummyList))
-                   return failure();
+  if (!parser.parseOptionalSymbolName(sym, "dummy", dummyList)) {
+    auto prop = parser.getChecked<InnerSymPropertiesAttr>(
+        parser.getContext(), sym, 0,
+        StringAttr::get(parser.getContext(), "public"));
+    if (!prop)
+      return {};
+    names.push_back(prop);
+  } else if (parser.parseCommaSeparatedList(
+                 OpAsmParser::Delimiter::Square, [&]() -> ParseResult {
+                   InnerSymPropertiesAttr prop;
+                   if (parser.parseCustomAttributeWithFallback(
+                           prop, mlir::Type{}, "dummy", dummyList))
+                     return failure();
 
-                 names.push_back(prop);
+                   names.push_back(prop);
 
-                 return success();
-               }))
+                   return success();
+                 }))
     return Attribute();
 
   std::sort(names.begin(), names.end(),
@@ -313,8 +351,7 @@ Attribute InnerSymAttr::parse(AsmParser &parser, Type type) {
 void InnerSymAttr::print(AsmPrinter &odsPrinter) const {
 
   auto props = getProps();
-  if (props.size() == 1 &&
-      props[0].getSymVisibility().getValue().equals("public") &&
+  if (props.size() == 1 && props[0].getSymVisibility().getValue() == "public" &&
       props[0].getFieldID() == 0) {
     odsPrinter << "@" << props[0].getName().getValue();
     return;
@@ -355,7 +392,8 @@ Attribute ParamDeclAttr::parse(AsmParser &p, Type trailing) {
     return Attribute();
 
   if (value)
-    return ParamDeclAttr::get(name, value);
+    return ParamDeclAttr::get(p.getContext(),
+                              p.getBuilder().getStringAttr(name), type, value);
   return ParamDeclAttr::get(name, type);
 }
 
@@ -412,8 +450,8 @@ static TypedAttr foldBinaryOp(
     ArrayRef<TypedAttr> operands,
     llvm::function_ref<APInt(const APInt &, const APInt &)> calculate) {
   assert(operands.size() == 2 && "binary operator always has two operands");
-  if (auto lhs = operands[0].dyn_cast<IntegerAttr>())
-    if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto lhs = dyn_cast<IntegerAttr>(operands[0]))
+    if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
       return IntegerAttr::get(lhs.getType(),
                               calculate(lhs.getValue(), rhs.getValue()));
   return {};
@@ -425,7 +463,7 @@ static TypedAttr
 foldUnaryOp(ArrayRef<TypedAttr> operands,
             llvm::function_ref<APInt(const APInt &)> calculate) {
   assert(operands.size() == 1 && "unary operator always has one operand");
-  if (auto intAttr = operands[0].dyn_cast<IntegerAttr>())
+  if (auto intAttr = dyn_cast<IntegerAttr>(operands[0]))
     return IntegerAttr::get(intAttr.getType(), calculate(intAttr.getValue()));
   return {};
 }
@@ -433,7 +471,7 @@ foldUnaryOp(ArrayRef<TypedAttr> operands,
 /// If the specified attribute is a ParamExprAttr with the specified opcode,
 /// return it.  Otherwise return null.
 static ParamExprAttr dyn_castPE(PEO opcode, Attribute value) {
-  if (auto expr = value.dyn_cast<ParamExprAttr>())
+  if (auto expr = dyn_cast<ParamExprAttr>(value))
     if (expr.getOpcode() == opcode)
       return expr;
   return {};
@@ -452,38 +490,38 @@ static bool paramExprOperandSortPredicate(Attribute lhs, Attribute rhs) {
     return false;
 
   // All expressions are "less than" a constant, since they appear on the right.
-  if (rhs.isa<IntegerAttr>()) {
+  if (isa<IntegerAttr>(rhs)) {
     // We don't bother to order constants w.r.t. each other since they will be
     // folded - they can all compare equal.
-    return !lhs.isa<IntegerAttr>();
+    return !isa<IntegerAttr>(lhs);
   }
-  if (lhs.isa<IntegerAttr>())
+  if (isa<IntegerAttr>(lhs))
     return false;
 
   // Next up are named parameters.
-  if (auto rhsParam = rhs.dyn_cast<ParamDeclRefAttr>()) {
+  if (auto rhsParam = dyn_cast<ParamDeclRefAttr>(rhs)) {
     // Parameters are sorted lexically w.r.t. each other.
-    if (auto lhsParam = lhs.dyn_cast<ParamDeclRefAttr>())
+    if (auto lhsParam = dyn_cast<ParamDeclRefAttr>(lhs))
       return lhsParam.getName().getValue() < rhsParam.getName().getValue();
     // They otherwise appear on the right of other things.
     return true;
   }
-  if (lhs.isa<ParamDeclRefAttr>())
+  if (isa<ParamDeclRefAttr>(lhs))
     return false;
 
   // Next up are verbatim parameters.
-  if (auto rhsParam = rhs.dyn_cast<ParamVerbatimAttr>()) {
+  if (auto rhsParam = dyn_cast<ParamVerbatimAttr>(rhs)) {
     // Verbatims are sorted lexically w.r.t. each other.
-    if (auto lhsParam = lhs.dyn_cast<ParamVerbatimAttr>())
+    if (auto lhsParam = dyn_cast<ParamVerbatimAttr>(lhs))
       return lhsParam.getValue().getValue() < rhsParam.getValue().getValue();
     // They otherwise appear on the right of other things.
     return true;
   }
-  if (lhs.isa<ParamVerbatimAttr>())
+  if (isa<ParamVerbatimAttr>(lhs))
     return false;
 
   // The only thing left are nested expressions.
-  auto lhsExpr = lhs.cast<ParamExprAttr>(), rhsExpr = rhs.cast<ParamExprAttr>();
+  auto lhsExpr = cast<ParamExprAttr>(lhs), rhsExpr = cast<ParamExprAttr>(rhs);
   // Sort by the string form of the opcode, e.g. add, .. mul,... then xor.
   if (lhsExpr.getOpcode() != rhsExpr.getOpcode())
     return stringifyPEO(lhsExpr.getOpcode()) <
@@ -540,16 +578,16 @@ static TypedAttr simplifyAssocOp(
   llvm::stable_sort(operands, paramExprOperandSortPredicate);
 
   // Merge any constants, they will appear at the back of the operand list now.
-  if (operands.back().isa<IntegerAttr>()) {
+  if (isa<IntegerAttr>(operands.back())) {
     while (operands.size() >= 2 &&
-           operands[operands.size() - 2].isa<IntegerAttr>()) {
-      APInt c1 = operands.pop_back_val().cast<IntegerAttr>().getValue();
-      APInt c2 = operands.pop_back_val().cast<IntegerAttr>().getValue();
+           isa<IntegerAttr>(operands[operands.size() - 2])) {
+      APInt c1 = cast<IntegerAttr>(operands.pop_back_val()).getValue();
+      APInt c2 = cast<IntegerAttr>(operands.pop_back_val()).getValue();
       auto resultConstant = IntegerAttr::get(type, calculateFn(c1, c2));
       operands.push_back(resultConstant);
     }
 
-    auto resultCst = operands.back().cast<IntegerAttr>();
+    auto resultCst = cast<IntegerAttr>(operands.back());
 
     // If the resulting constant is the destructive constant (e.g. `x*0`), then
     // return it.
@@ -562,7 +600,7 @@ static TypedAttr simplifyAssocOp(
       operands.pop_back();
   }
 
-  return operands.size() == 1 ? operands[0] : Attribute();
+  return operands.size() == 1 ? operands[0] : TypedAttr();
 }
 
 /// Analyze an operand to an add.  If it is a multiplication by a constant (e.g.
@@ -571,7 +609,7 @@ static TypedAttr simplifyAssocOp(
 /// null as the second (standin for "multiplication by 1").
 static std::pair<TypedAttr, TypedAttr> decomposeAddend(TypedAttr operand) {
   if (auto mul = dyn_castPE(PEO::Mul, operand))
-    if (auto cst = mul.getOperands().back().dyn_cast<IntegerAttr>()) {
+    if (auto cst = dyn_cast<IntegerAttr>(mul.getOperands().back())) {
       auto nonCst = ParamExprAttr::get(PEO::Mul, mul.getOperands().drop_back());
       return {nonCst, cst};
     }
@@ -684,9 +722,9 @@ static TypedAttr simplifyXor(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyShl(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
 
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>()) {
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1])) {
     // Constant fold simple integers.
-    if (auto lhs = operands[0].dyn_cast<IntegerAttr>())
+    if (auto lhs = dyn_cast<IntegerAttr>(operands[0]))
       return IntegerAttr::get(lhs.getType(),
                               lhs.getValue().shl(rhs.getValue()));
 
@@ -703,7 +741,7 @@ static TypedAttr simplifyShl(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyShrU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x >> 0`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isZero())
       return operands[0];
 
@@ -713,7 +751,7 @@ static TypedAttr simplifyShrU(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyShrS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x >> 0`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isZero())
       return operands[0];
 
@@ -723,7 +761,7 @@ static TypedAttr simplifyShrS(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyDivU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x/1`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isOne())
       return operands[0];
 
@@ -733,7 +771,7 @@ static TypedAttr simplifyDivU(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyDivS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x/1`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isOne())
       return operands[0];
 
@@ -743,7 +781,7 @@ static TypedAttr simplifyDivS(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyModU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x%1`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isOne())
       return IntegerAttr::get(rhs.getType(), 0);
 
@@ -753,7 +791,7 @@ static TypedAttr simplifyModU(SmallVector<TypedAttr, 4> &operands) {
 static TypedAttr simplifyModS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x%1`.
-  if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
+  if (auto rhs = dyn_cast<IntegerAttr>(operands[1]))
     if (rhs.getValue().isOne())
       return IntegerAttr::get(rhs.getType(), 0);
 
@@ -785,7 +823,7 @@ static TypedAttr simplifyStrConcat(SmallVector<TypedAttr, 4> &operands) {
   };
 
   for (TypedAttr op : operands) {
-    if (auto strOp = op.dyn_cast<StringAttr>()) {
+    if (auto strOp = dyn_cast<StringAttr>(op)) {
       // Queue up adjacent strings.
       stringsToCombine.push_back(strOp);
     } else {
@@ -908,28 +946,31 @@ void ParamExprAttr::print(AsmPrinter &p) const {
 static FailureOr<Attribute>
 replaceDeclRefInExpr(Location loc,
                      const std::map<std::string, Attribute> &parameters,
-                     Attribute paramAttr) {
-  if (paramAttr.dyn_cast<IntegerAttr>()) {
+                     Attribute paramAttr, bool emitErrors) {
+  if (dyn_cast<IntegerAttr>(paramAttr)) {
     // Nothing to do, constant value.
     return paramAttr;
   }
-  if (auto paramRefAttr = paramAttr.dyn_cast<hw::ParamDeclRefAttr>()) {
+  if (auto paramRefAttr = dyn_cast<hw::ParamDeclRefAttr>(paramAttr)) {
     // Get the value from the provided parameters.
     auto it = parameters.find(paramRefAttr.getName().str());
-    if (it == parameters.end())
-      return emitError(loc)
-             << "Could not find parameter " << paramRefAttr.getName().str()
-             << " in the provided parameters for the expression!";
+    if (it == parameters.end()) {
+      if (emitErrors)
+        return emitError(loc)
+               << "Could not find parameter " << paramRefAttr.getName().str()
+               << " in the provided parameters for the expression!";
+      return failure();
+    }
     return it->second;
   }
-  if (auto paramExprAttr = paramAttr.dyn_cast<hw::ParamExprAttr>()) {
+  if (auto paramExprAttr = dyn_cast<hw::ParamExprAttr>(paramAttr)) {
     // Recurse into all operands of the expression.
     llvm::SmallVector<TypedAttr, 4> replacedOperands;
     for (auto operand : paramExprAttr.getOperands()) {
-      auto res = replaceDeclRefInExpr(loc, parameters, operand);
+      auto res = replaceDeclRefInExpr(loc, parameters, operand, emitErrors);
       if (failed(res))
         return {failure()};
-      replacedOperands.push_back(*res);
+      replacedOperands.push_back(cast<TypedAttr>(*res));
     }
     return {
         hw::ParamExprAttr::get(paramExprAttr.getOpcode(), replacedOperands)};
@@ -938,27 +979,29 @@ replaceDeclRefInExpr(Location loc,
   return {};
 }
 
-FailureOr<Attribute> hw::evaluateParametricAttr(Location loc,
+FailureOr<TypedAttr> hw::evaluateParametricAttr(Location loc,
                                                 ArrayAttr parameters,
-                                                Attribute paramAttr) {
+                                                Attribute paramAttr,
+                                                bool emitErrors) {
   // Create a map of the provided parameters for faster lookup.
   std::map<std::string, Attribute> parameterMap;
   for (auto param : parameters) {
-    auto paramDecl = param.cast<ParamDeclAttr>();
+    auto paramDecl = cast<ParamDeclAttr>(param);
     parameterMap[paramDecl.getName().str()] = paramDecl.getValue();
   }
 
   // First, replace any ParamDeclRefAttr in the expression with its
   // corresponding value in 'parameters'.
-  auto paramAttrRes = replaceDeclRefInExpr(loc, parameterMap, paramAttr);
+  auto paramAttrRes =
+      replaceDeclRefInExpr(loc, parameterMap, paramAttr, emitErrors);
   if (failed(paramAttrRes))
     return {failure()};
   paramAttr = *paramAttrRes;
 
   // Then, evaluate the parametric attribute.
-  if (paramAttr.isa<IntegerAttr>() || paramAttr.isa<hw::ParamDeclRefAttr>())
-    return paramAttr;
-  if (auto paramExprAttr = paramAttr.dyn_cast<hw::ParamExprAttr>()) {
+  if (isa<IntegerAttr, hw::ParamDeclRefAttr>(paramAttr))
+    return cast<TypedAttr>(paramAttr);
+  if (auto paramExprAttr = dyn_cast<hw::ParamExprAttr>(paramAttr)) {
     // Since any ParamDeclRefAttr was replaced within the expression,
     // we re-evaluate the expression through the existing ParamExprAttr
     // canonicalizer.
@@ -967,47 +1010,55 @@ FailureOr<Attribute> hw::evaluateParametricAttr(Location loc,
   }
 
   llvm_unreachable("Unhandled parametric attribute");
-  return Attribute();
+  return TypedAttr();
+}
+
+template <typename TArray>
+FailureOr<Type> evaluateParametricArrayType(Location loc, ArrayAttr parameters,
+                                            TArray arrayType, bool emitErrors) {
+  auto size = evaluateParametricAttr(loc, parameters, arrayType.getSizeAttr(),
+                                     emitErrors);
+  if (failed(size))
+    return failure();
+  auto elementType = evaluateParametricType(
+      loc, parameters, arrayType.getElementType(), emitErrors);
+  if (failed(elementType))
+    return failure();
+
+  // If the size was evaluated to a constant, use a 64-bit integer
+  // attribute version of it
+  if (auto intAttr = dyn_cast<IntegerAttr>(*size))
+    return TArray::get(
+        arrayType.getContext(), *elementType,
+        IntegerAttr::get(IntegerType::get(arrayType.getContext(), 64),
+                         intAttr.getValue().getSExtValue()));
+
+  // Otherwise parameter references are still involved
+  return TArray::get(arrayType.getContext(), *elementType, *size);
 }
 
 FailureOr<Type> hw::evaluateParametricType(Location loc, ArrayAttr parameters,
-                                           Type type) {
+                                           Type type, bool emitErrors) {
   return llvm::TypeSwitch<Type, FailureOr<Type>>(type)
       .Case<hw::IntType>([&](hw::IntType t) -> FailureOr<Type> {
         auto evaluatedWidth =
-            evaluateParametricAttr(loc, parameters, t.getWidth());
+            evaluateParametricAttr(loc, parameters, t.getWidth(), emitErrors);
         if (failed(evaluatedWidth))
           return {failure()};
 
         // If the width was evaluated to a constant, return an `IntegerType`
-        if (auto intAttr = evaluatedWidth->dyn_cast<IntegerAttr>())
+        if (auto intAttr = dyn_cast<IntegerAttr>(*evaluatedWidth))
           return {IntegerType::get(type.getContext(),
                                    intAttr.getValue().getSExtValue())};
 
         // Otherwise parameter references are still involved
-        return hw::IntType::get(*evaluatedWidth);
+        return hw::IntType::get(cast<TypedAttr>(*evaluatedWidth));
       })
-      .Case<hw::ArrayType>([&](hw::ArrayType arrayType) -> FailureOr<Type> {
-        auto size =
-            evaluateParametricAttr(loc, parameters, arrayType.getSizeAttr());
-        if (failed(size))
-          return failure();
-        auto elementType =
-            evaluateParametricType(loc, parameters, arrayType.getElementType());
-        if (failed(elementType))
-          return failure();
-
-        // If the size was evaluated to a constant, use a 64-bit integer
-        // attribute version of it
-        if (auto intAttr = size->dyn_cast<IntegerAttr>())
-          return hw::ArrayType::get(
-              arrayType.getContext(), *elementType,
-              IntegerAttr::get(IntegerType::get(type.getContext(), 64),
-                               intAttr.getValue().getSExtValue()));
-
-        // Otherwise parameter references are still involved
-        return hw::ArrayType::get(arrayType.getContext(), *elementType, *size);
-      })
+      .Case<hw::ArrayType, hw::UnpackedArrayType>(
+          [&](auto arrayType) -> FailureOr<Type> {
+            return evaluateParametricArrayType(loc, parameters, arrayType,
+                                               emitErrors);
+          })
       .Default([&](auto) { return type; });
 }
 
@@ -1026,7 +1077,7 @@ bool hw::isParametricType(mlir::Type t) {
   return llvm::TypeSwitch<Type, bool>(t)
       .Case<hw::IntType>(
           [&](hw::IntType t) { return isParamAttrWithParamRef(t.getWidth()); })
-      .Case<hw::ArrayType>([&](hw::ArrayType arrayType) {
+      .Case<hw::ArrayType, hw::UnpackedArrayType>([&](auto arrayType) {
         return isParametricType(arrayType.getElementType()) ||
                isParamAttrWithParamRef(arrayType.getSizeAttr());
       })

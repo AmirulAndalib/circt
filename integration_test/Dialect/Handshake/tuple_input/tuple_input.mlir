@@ -1,15 +1,20 @@
 // REQUIRES: iverilog,cocotb
 
-// This test is executed with all different buffering strategies
+// Test the original HandshakeToHW flow.
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// RUN: hlstool %s --dynamic-hw --input-level core --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables,disallowPackedStructAssignments > %t.sv && \
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder="%S,%S/.." %t.sv 2>&1 | FileCheck %s
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=allFIFO --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// RUN: hlstool %s --dynamic-hw --input-level core --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables,disallowPackedStructAssignments > %t.sv && \
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder="%S,%S/.." %t.sv 2>&1 | FileCheck %s
 
-// RUN: hlstool %s --dynamic-firrtl --ir-input-level 1 --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables > %t.sv && \
-// RUN: %PYTHON% %S/../cocotb_driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder=%S %t.sv 2>&1 | FileCheck %s
+// Test the DC lowering flow.
+
+// RUN: hlstool %s --dynamic-hw --dc --input-level core --buffering-strategy=cycles --verilog --lowering-options=disallowLocalVariables,disallowPackedStructAssignments > %t.sv && \
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder="%S,%S/.." %t.sv %esi_prims 2>&1 | FileCheck %s
+
+// RUN: hlstool %s --dynamic-hw --dc --input-level core --buffering-strategy=all --verilog --lowering-options=disallowLocalVariables,disallowPackedStructAssignments > %t.sv && \
+// RUN: circt-cocotb-driver.py --objdir=%T --topLevel=top --pythonModule=tuple_input --pythonFolder="%S,%S/.." %t.sv %esi_prims 2>&1 | FileCheck %s
 
 // CHECK: ** TEST
 // CHECK: ** TESTS=[[N:.*]] PASS=[[N]] FAIL=0 SKIP=0
@@ -21,4 +26,3 @@ module {
     return %sum, %arg1 : i32, none
   }
 }
-

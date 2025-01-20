@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 include "mlir/Interfaces/InferTypeOpInterface.td"
+include "circt/Dialect/HW/HWTypes.td"
 include "circt/Dialect/SV/SVTypes.td"
 
 def HWValueOrInOutType : AnyTypeOf<[HWValueType, InOutType]>;
@@ -99,7 +100,8 @@ def VerbatimExprSEOp : SVOp<"verbatim.expr.se", [HasCustomSSAName]> {
   ];
 }
 
-def MacroRefExprOp : SVOp<"macro.ref", [Pure, HasCustomSSAName]> {
+def MacroRefExprOp : SVOp<"macro.ref.expr", [Pure, HasCustomSSAName,
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "Expression to refer to a SystemVerilog macro";
   let description = [{
     This operation produces a value by referencing a named macro.
@@ -109,20 +111,24 @@ def MacroRefExprOp : SVOp<"macro.ref", [Pure, HasCustomSSAName]> {
     and emitted inline by the Verilog emitter.
     }];
 
-  let arguments = (ins MacroIdentAttr:$ident);
+  let arguments = (ins FlatSymbolRefAttr:$macroName, Variadic<AnyType>:$inputs);
   let results = (outs HWValueOrInOutType:$result);
 
-  let assemblyFormat = "`<` $ident `>` attr-dict `:` type($result)";
+  let assemblyFormat = "$macroName `(` $inputs `)` attr-dict `:` functional-type($inputs, $result)";
 
   let builders = [
     OpBuilder<(ins "Type":$resultType, "StringRef":$ident),
                "build(odsBuilder, odsState, resultType, "
-                 "::circt::sv::MacroIdentAttr::get("
-                   "$_builder.getContext(), ident));">
+                "FlatSymbolRefAttr::get($_builder.getContext(), ident), {});">
   ];
+
+  let extraClassDeclaration = [{
+    MacroDeclOp getReferencedMacro(const hw::HWSymbolCache *cache);
+  }];
 }
 
-def MacroRefExprSEOp : SVOp<"macro.ref.se", [HasCustomSSAName]> {
+def MacroRefExprSEOp : SVOp<"macro.ref.expr.se", [HasCustomSSAName,
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "Expression to refer to a SystemVerilog macro";
   let description = [{
     This operation produces a value by referencing a named macro.
@@ -132,17 +138,20 @@ def MacroRefExprSEOp : SVOp<"macro.ref.se", [HasCustomSSAName]> {
     duplicated, but can be emitted inline by the Verilog emitter.
     }];
 
-  let arguments = (ins MacroIdentAttr:$ident);
+  let arguments = (ins FlatSymbolRefAttr:$macroName, Variadic<AnyType>:$inputs);
   let results = (outs HWValueOrInOutType:$result);
 
-  let assemblyFormat = "`<` $ident `>` attr-dict `:` type($result)";
+  let assemblyFormat = "$macroName `(` $inputs `)` attr-dict `:` functional-type($inputs, $result)";
 
   let builders = [
     OpBuilder<(ins "Type":$resultType, "StringRef":$ident),
                "build(odsBuilder, odsState, resultType, "
-                 "::circt::sv::MacroIdentAttr::get("
-                   "$_builder.getContext(), ident));">
+                "FlatSymbolRefAttr::get($_builder.getContext(), ident), {});">
   ];
+
+  let extraClassDeclaration = [{
+    MacroDeclOp getReferencedMacro(const hw::HWSymbolCache *cache);
+  }];
 }
 
 def ConstantXOp : SVOp<"constantX", [Pure, HasCustomSSAName]> {
@@ -188,7 +197,7 @@ def ConstantStrOp : SVOp<"constantStr", [Pure]> {
     }];
 
   let arguments = (ins StrAttr:$str);
-  let results = (outs StringType:$result);
+  let results = (outs HWStringType:$result);
   let assemblyFormat = " $str attr-dict";
 }
 
@@ -204,7 +213,7 @@ def LocalParamOp : SVOp<"localparam",
   let results = (outs HWValueType:$result);
 
   let assemblyFormat = [{
-    `:` qualified(type($result)) `` custom<ImplicitSSAName>(attr-dict)
+    `` custom<ImplicitSSAName>($name) attr-dict `:` qualified(type($result))
   }];
 
   let hasVerifier = 1;
@@ -232,6 +241,7 @@ def IndexedPartSelectOp
                                           std::optional<Location> loc,
                                           ValueRange operands,
                                           DictionaryAttr attrs,
+                                          mlir::OpaqueProperties properties,
                                           mlir::RegionRange regions,
                                           SmallVectorImpl<Type> &results);
   }];
@@ -254,4 +264,27 @@ def SampledOp : SVOp<"system.sampled", [Pure, SameOperandsAndResultType]> {
   let arguments = (ins AnyType:$expression);
   let results = (outs AnyType:$sampledValue);
   let assemblyFormat = "$expression attr-dict `:` qualified(type($expression))";
+}
+
+def UnpackedArrayCreateOp : SVOp<"unpacked_array_create", [Pure, SameTypeOperands]> {
+  let summary = "Create an unpacked array";
+  let description = [{
+    Creates an unpacked array from a variable set of values. One or more values must be
+    listed.
+
+    See the HW-SV rationale document for details on operand ordering.
+  }];
+
+  let arguments = (ins Variadic<HWNonInOutType>:$inputs);
+  let results = (outs UnpackedArrayType:$result);
+
+  let assemblyFormat = "$inputs attr-dict `:` functional-type($inputs, $result)";
+}
+
+def UnpackedOpenArrayCastOp : SVOp<"unpacked_open_array_cast"> {
+  let summary = "Cast an unpacked array into an unpacked open array";
+  let arguments = (ins UnpackedArrayType:$input);
+  let results = (outs UnpackedOpenArrayType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` functional-type($input, $result)";
 }

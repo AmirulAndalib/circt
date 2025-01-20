@@ -11,13 +11,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HandshakeToHW.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/ESI/ESIOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/HW/HWSymCache.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
+#include "circt/Dialect/Handshake/HandshakeUtils.h"
 #include "circt/Dialect/Handshake/Visitor.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
@@ -25,11 +26,17 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
 #include <optional>
+
+namespace circt {
+#define GEN_PASS_DEF_HANDSHAKETOHW
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -59,23 +66,25 @@ public:
   ESITypeConverter() {
     addConversion([](Type type) -> Type { return esiWrapper(type); });
 
-    addTargetMaterialization(
-        [&](mlir::OpBuilder &builder, mlir::Type resultType,
-            mlir::ValueRange inputs,
-            mlir::Location loc) -> std::optional<mlir::Value> {
-          if (inputs.size() != 1)
-            return std::nullopt;
-          return inputs[0];
-        });
+    addTargetMaterialization([&](mlir::OpBuilder &builder,
+                                 mlir::Type resultType, mlir::ValueRange inputs,
+                                 mlir::Location loc) -> mlir::Value {
+      if (inputs.size() != 1)
+        return Value();
+      return builder
+          .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+          ->getResult(0);
+    });
 
-    addSourceMaterialization(
-        [&](mlir::OpBuilder &builder, mlir::Type resultType,
-            mlir::ValueRange inputs,
-            mlir::Location loc) -> std::optional<mlir::Value> {
-          if (inputs.size() != 1)
-            return std::nullopt;
-          return inputs[0];
-        });
+    addSourceMaterialization([&](mlir::OpBuilder &builder,
+                                 mlir::Type resultType, mlir::ValueRange inputs,
+                                 mlir::Location loc) -> mlir::Value {
+      if (inputs.size() != 1)
+        return Value();
+      return builder
+          .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+          ->getResult(0);
+    });
   }
 };
 
@@ -102,7 +111,7 @@ static std::string getCallName(Operation *op) {
 /// assume that opType itself is the data-carrying type.
 static Type getOperandDataType(Value op) {
   auto opType = op.getType();
-  if (auto channelType = opType.dyn_cast<esi::ChannelType>())
+  if (auto channelType = dyn_cast<esi::ChannelType>(opType))
     return channelType.getInner();
   return opType;
 }
@@ -111,7 +120,7 @@ static Type getOperandDataType(Value op) {
 static SmallVector<Type> filterNoneTypes(ArrayRef<Type> input) {
   SmallVector<Type> filterRes;
   llvm::copy_if(input, std::back_inserter(filterRes),
-                [](Type type) { return !type.isa<NoneType>(); });
+                [](Type type) { return !isa<NoneType>(type); });
   return filterRes;
 }
 
@@ -145,17 +154,17 @@ static std::string getTypeName(Location loc, Type type) {
   std::string typeName;
   // Builtin types
   if (type.isIntOrIndex()) {
-    if (auto indexType = type.dyn_cast<IndexType>())
+    if (auto indexType = dyn_cast<IndexType>(type))
       typeName += "_ui" + std::to_string(indexType.kInternalStorageBitWidth);
     else if (type.isSignedInteger())
       typeName += "_si" + std::to_string(type.getIntOrFloatBitWidth());
     else
       typeName += "_ui" + std::to_string(type.getIntOrFloatBitWidth());
-  } else if (auto tupleType = type.dyn_cast<TupleType>()) {
+  } else if (auto tupleType = dyn_cast<TupleType>(type)) {
     typeName += "_tuple";
     for (auto elementType : tupleType.getTypes())
       typeName += getTypeName(loc, elementType);
-  } else if (auto structType = type.dyn_cast<hw::StructType>()) {
+  } else if (auto structType = dyn_cast<hw::StructType>(type)) {
     typeName += "_struct";
     for (auto element : structType.getElements())
       typeName += "_" + element.name.str() + getTypeName(loc, element.type);
@@ -174,7 +183,7 @@ static std::string getSubModuleName(Operation *oldOp) {
 
   // Add value of the constant operation.
   if (auto constOp = dyn_cast<handshake::ConstantOp>(oldOp)) {
-    if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue())) {
       auto intType = intAttr.getType();
 
       if (intType.isSignedInteger())
@@ -218,9 +227,9 @@ static std::string getSubModuleName(Operation *oldOp) {
     if (auto initValues = bufferOp.getInitValues()) {
       subModuleName += "_init";
       for (const Attribute e : *initValues) {
-        assert(e.isa<IntegerAttr>());
+        assert(isa<IntegerAttr>(e));
         subModuleName +=
-            "_" + std::to_string(e.dyn_cast<IntegerAttr>().getInt());
+            "_" + std::to_string(dyn_cast<IntegerAttr>(e).getInt());
       }
     }
   }
@@ -248,24 +257,28 @@ static std::string getSubModuleName(Operation *oldOp) {
 /// Check whether a submodule with the same name has been created elsewhere in
 /// the top level module. Return the matched module operation if true, otherwise
 /// return nullptr.
-static Operation *checkSubModuleOp(mlir::ModuleOp parentModule,
-                                   StringRef modName) {
+static HWModuleLike checkSubModuleOp(mlir::ModuleOp parentModule,
+                                     StringRef modName) {
   if (auto mod = parentModule.lookupSymbol<HWModuleOp>(modName))
     return mod;
   if (auto mod = parentModule.lookupSymbol<HWModuleExternOp>(modName))
     return mod;
-  return nullptr;
+  return {};
 }
 
-static Operation *checkSubModuleOp(mlir::ModuleOp parentModule,
-                                   Operation *oldOp) {
-  auto *moduleOp = checkSubModuleOp(parentModule, getSubModuleName(oldOp));
+static HWModuleLike checkSubModuleOp(mlir::ModuleOp parentModule,
+                                     Operation *oldOp) {
+  HWModuleLike targetModule;
+  if (auto instanceOp = dyn_cast<handshake::InstanceOp>(oldOp))
+    targetModule = checkSubModuleOp(parentModule, instanceOp.getModule());
+  else
+    targetModule = checkSubModuleOp(parentModule, getSubModuleName(oldOp));
 
   if (isa<handshake::InstanceOp>(oldOp))
-    assert(moduleOp &&
+    assert(targetModule &&
            "handshake.instance target modules should always have been lowered "
            "before the modules that reference them!");
-  return moduleOp;
+  return targetModule;
 }
 
 /// Returns a vector of PortInfo's which defines the HW interface of the
@@ -277,7 +290,7 @@ static ModulePortInfo getPortInfoForOp(Operation *op) {
 static llvm::SmallVector<hw::detail::FieldInfo>
 portToFieldInfo(llvm::ArrayRef<hw::PortInfo> portInfo) {
   llvm::SmallVector<hw::detail::FieldInfo> fieldInfo;
-  for (auto &port : portInfo)
+  for (auto port : portInfo)
     fieldInfo.push_back({port.name, port.type});
 
   return fieldInfo;
@@ -286,14 +299,13 @@ portToFieldInfo(llvm::ArrayRef<hw::PortInfo> portInfo) {
 // Convert any handshake.extmemory operations and the top-level I/O
 // associated with these.
 static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
-  auto ports = mod.getPorts();
   auto *ctx = mod.getContext();
 
   // Gather memref ports to be converted.
   llvm::DenseMap<unsigned, Value> memrefPorts;
-  for (auto [i, arg] : llvm::enumerate(mod.getArguments())) {
-    auto channel = arg.getType().dyn_cast<esi::ChannelType>();
-    if (channel && channel.getInner().isa<MemRefType>())
+  for (auto [i, arg] : llvm::enumerate(mod.getBodyBlock()->getArguments())) {
+    auto channel = dyn_cast<esi::ChannelType>(arg.getType());
+    if (channel && isa<MemRefType>(channel.getInner()))
       memrefPorts[i] = arg;
   }
 
@@ -304,47 +316,51 @@ static LogicalResult convertExtMemoryOps(HWModuleOp mod) {
 
   auto getMemoryIOInfo = [&](Location loc, Twine portName, unsigned argIdx,
                              ArrayRef<hw::PortInfo> info,
-                             hw::PortDirection direction) {
+                             hw::ModulePort::Direction direction) {
     auto type = hw::StructType::get(ctx, portToFieldInfo(info));
     auto portInfo =
-        hw::PortInfo{b.getStringAttr(portName), direction, type, argIdx};
+        hw::PortInfo{{b.getStringAttr(portName), type, direction}, argIdx};
     return portInfo;
   };
 
   for (auto [i, arg] : memrefPorts) {
     // Insert ports into the module
-    auto memName = mod.getArgNames()[i].cast<StringAttr>();
+    auto memName = mod.getArgName(i);
 
     // Get the attached extmemory external module.
     auto extmemInstance = cast<hw::InstanceOp>(*arg.getUsers().begin());
     auto extmemMod =
-        cast<hw::HWModuleExternOp>(extmemInstance.getReferencedModule());
-    auto portInfo = extmemMod.getPorts();
+        cast<hw::HWModuleExternOp>(SymbolTable::lookupNearestSymbolFrom(
+            extmemInstance, extmemInstance.getModuleNameAttr()));
+
+    ModulePortInfo portInfo(extmemMod.getPortList());
 
     // The extmemory external module's interface is a direct wrapping of the
     // original handshake.extmemory operation in- and output types. Remove the
     // first input argument (the !esi.channel<memref> op) since that is what
     // we're replacing with a materialized interface.
-    portInfo.inputs.erase(portInfo.inputs.begin());
+    portInfo.eraseInput(0);
 
     // Add memory input - this is the output of the extmemory op.
+    SmallVector<PortInfo> outputs(portInfo.getOutputs());
     auto inPortInfo =
-        getMemoryIOInfo(arg.getLoc(), memName.strref() + "_in", i,
-                        portInfo.outputs, hw::PortDirection::INPUT);
+        getMemoryIOInfo(arg.getLoc(), memName.strref() + "_in", i, outputs,
+                        hw::ModulePort::Direction::Input);
     mod.insertPorts({{i, inPortInfo}}, {});
-    auto newInPort = mod.getArgument(i);
+    auto newInPort = mod.getArgumentForInput(i);
     // Replace the extmemory submodule outputs with the newly created inputs.
     b.setInsertionPointToStart(mod.getBodyBlock());
     auto newInPortExploded = b.create<hw::StructExplodeOp>(
-        arg.getLoc(), extmemMod.getResultTypes(), newInPort);
+        arg.getLoc(), extmemMod.getOutputTypes(), newInPort);
     extmemInstance.replaceAllUsesWith(newInPortExploded.getResults());
 
     // Add memory output - this is the inputs of the extmemory op (without the
     // first argument);
-    unsigned outArgI = mod.getNumResults();
+    unsigned outArgI = mod.getNumOutputPorts();
+    SmallVector<PortInfo> inputs(portInfo.getInputs());
     auto outPortInfo =
         getMemoryIOInfo(arg.getLoc(), memName.strref() + "_out", outArgI,
-                        portInfo.inputs, hw::PortDirection::OUTPUT);
+                        inputs, hw::ModulePort::Direction::Output);
 
     auto memOutputArgs = extmemInstance.getOperands().drop_front();
     b.setInsertionPoint(mod.getBodyBlock()->getTerminator());
@@ -468,7 +484,8 @@ struct RTLBuilder {
 
   Value constant(unsigned width, int64_t value,
                  std::optional<StringRef> name = {}) {
-    return constant(APInt(width, value));
+    return constant(
+        APInt(width, value, /*isSigned=*/false, /*implicitTrunc=*/true));
   }
   std::pair<Value, Value> wrap(Value data, Value valid,
                                std::optional<StringRef> name = {}) {
@@ -493,8 +510,8 @@ struct RTLBuilder {
            "No global reset provided to this RTLBuilder - a reset "
            "signal must be provided to the reg(...) function.");
 
-    return b.create<seq::CompRegOp>(loc, in.getType(), in, resolvedClk, name,
-                                    resolvedRst, rstValue, StringAttr());
+    return b.create<seq::CompRegOp>(loc, in, resolvedClk, resolvedRst, rstValue,
+                                    name);
   }
 
   Value cmp(Value lhs, Value rhs, comb::ICmpPredicate predicate,
@@ -566,7 +583,7 @@ struct RTLBuilder {
 
   // Unpacks a hw.struct into a list of values.
   ValueRange unpack(Value value) {
-    auto structType = value.getType().cast<hw::StructType>();
+    auto structType = cast<hw::StructType>(value.getType());
     llvm::SmallVector<Type> innerTypes;
     structType.getInnerTypes(innerTypes);
     return b.create<hw::StructExplodeOp>(loc, innerTypes, value).getResults();
@@ -653,7 +670,7 @@ struct RTLBuilder {
     // Todo: clean up when handshake supports i0.
     auto dataType = inputs[0].getType();
     unsigned width =
-        dataType.isa<NoneType>() ? 0 : dataType.getIntOrFloatBitWidth();
+        isa<NoneType>(dataType) ? 0 : dataType.getIntOrFloatBitWidth();
     Value muxValue = constant(width, 0);
 
     // Iteratively chain together muxes from the high bit to the low bit.
@@ -701,8 +718,10 @@ addSequentialIOOperandsIfNeeded(Operation *op,
     // Parent should at this point be a hw.module and have clock and reset
     // ports.
     auto parent = cast<hw::HWModuleOp>(op->getParentOp());
-    operands.push_back(parent.getArgument(parent.getNumArguments() - 2));
-    operands.push_back(parent.getArgument(parent.getNumArguments() - 1));
+    operands.push_back(
+        parent.getArgumentForInput(parent.getNumInputPorts() - 2));
+    operands.push_back(
+        parent.getArgumentForInput(parent.getNumInputPorts() - 1));
   }
 }
 
@@ -728,6 +747,7 @@ public:
     if (!implModule) {
       auto portInfo = ModulePortInfo(getPortInfoForOp(op));
 
+      submoduleBuilder.setInsertionPoint(op->getParentOp());
       implModule = submoduleBuilder.create<hw::HWModuleOp>(
           op.getLoc(), submoduleBuilder.getStringAttr(getSubModuleName(op)),
           portInfo, [&](OpBuilder &b, hw::HWModulePortAccessor &ports) {
@@ -740,7 +760,7 @@ public:
             }
 
             BackedgeBuilder bb(b, op.getLoc());
-            RTLBuilder s(ports.getModulePortInfo(), b, op.getLoc(), clk, rst);
+            RTLBuilder s(ports.getPortList(), b, op.getLoc(), clk, rst);
             this->buildModule(op, bb, s, ports);
           });
     }
@@ -774,7 +794,7 @@ public:
       hs.ready = ready;
       unwrapped.inputs.push_back(hs);
     }
-    for (auto &outputInfo : ports.getModulePortInfo().outputs) {
+    for (auto &outputInfo : ports.getPortList().getOutputs()) {
       esi::ChannelType channelType =
           dyn_cast<esi::ChannelType>(outputInfo.type);
       if (!channelType)
@@ -1022,41 +1042,52 @@ public:
   };
 };
 
-class SelectConversionPattern
-    : public HandshakeConversionPattern<handshake::SelectOp> {
+class InstanceConversionPattern
+    : public HandshakeConversionPattern<handshake::InstanceOp> {
 public:
   using HandshakeConversionPattern<
-      handshake::SelectOp>::HandshakeConversionPattern;
-  void buildModule(handshake::SelectOp op, BackedgeBuilder &bb, RTLBuilder &s,
+      handshake::InstanceOp>::HandshakeConversionPattern;
+  void buildModule(handshake::InstanceOp op, BackedgeBuilder &bb, RTLBuilder &s,
                    hw::HWModulePortAccessor &ports) const override {
-    auto unwrappedIO = unwrapIO(s, bb, ports);
+    assert(false &&
+           "If we indeed perform conversion in post-order, this "
+           "should never be called. The base HandshakeConversionPattern logic "
+           "will instantiate the external module.");
+  }
+};
 
-    // Extract select signal from the unwrapped IO.
-    auto select = unwrappedIO.inputs[0];
-    auto trueIn = unwrappedIO.inputs[1];
-    auto falseIn = unwrappedIO.inputs[2];
-    auto out = unwrappedIO.outputs[0];
+class ESIInstanceConversionPattern
+    : public OpConversionPattern<handshake::ESIInstanceOp> {
+public:
+  ESIInstanceConversionPattern(MLIRContext *context,
+                               const HWSymbolCache &symCache)
+      : OpConversionPattern(context), symCache(symCache) {}
 
-    // Mux the true and false data to the output.
-    auto muxedData = s.mux(select.data, {falseIn.data, trueIn.data});
-    out.data->setValue(muxedData);
+  LogicalResult
+  matchAndRewrite(ESIInstanceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // The operand signature of this op is very similar to the lowered
+    // `handshake.func`s (especially since handshake uses ESI channels
+    // internally). Whereas ESIInstance ops have 'clk' and 'rst' at the
+    // beginning, lowered `handshake.func`s have them at the end. So we've just
+    // got to re-arrange them.
+    SmallVector<Value> operands;
+    for (size_t i = ESIInstanceOp::NumFixedOperands, e = op.getNumOperands();
+         i < e; ++i)
+      operands.push_back(adaptor.getOperands()[i]);
+    operands.push_back(adaptor.getClk());
+    operands.push_back(adaptor.getRst());
+    // Locate the lowered module so the instance builder can get all the
+    // metadata.
+    Operation *targetModule = symCache.getDefinition(op.getModuleAttr());
+    // And replace the op with an instance of the target module.
+    rewriter.replaceOpWithNewOp<hw::InstanceOp>(op, targetModule,
+                                                op.getInstNameAttr(), operands);
+    return success();
+  }
 
-    // 'and' the arg valids and select valid
-    Value allValid = s.bAnd({select.valid, trueIn.valid, falseIn.valid});
-
-    // Connect that to the result valid.
-    out.valid->setValue(allValid);
-
-    // 'and' the result valid with the result ready.
-    auto resValidAndReady = s.bAnd({allValid, out.ready});
-
-    // Connect that to the 'ready' signal of all inputs. This implies that all
-    // inputs + select is transacted when all are valid (and the output is
-    // ready), but only the selected data is forwarded.
-    select.ready->setValue(resValidAndReady);
-    trueIn.ready->setValue(resValidAndReady);
-    falseIn.ready->setValue(resValidAndReady);
-  };
+private:
+  const HWSymbolCache &symCache;
 };
 
 class ReturnConversionPattern
@@ -1650,7 +1681,7 @@ public:
         initValueCs = s.constant(dataType.getIntOrFloatBitWidth(), *initValue);
 
       // This could/should be revised but needs a larger rethinking to avoid
-      // introducing new bugs. Implement similarly to HandshakeToFIRRTL.
+      // introducing new bugs.
       Value dataReg =
           buildDataBufferLogic(validReg, initValueCs, validBE, readyBE);
       buildControlBufferLogic(validReg, readyBE, dataReg);
@@ -1825,10 +1856,10 @@ public:
     } else {
       auto hwModuleOp = rewriter.create<hw::HWModuleOp>(
           op.getLoc(), rewriter.getStringAttr(op.getName()), ports);
-      auto args = hwModuleOp.getArguments().drop_back(2);
-      rewriter.mergeBlockBefore(&op.getBody().front(),
-                                hwModuleOp.getBodyBlock()->getTerminator(),
-                                args);
+      auto args = hwModuleOp.getBodyBlock()->getArguments().drop_back(2);
+      rewriter.inlineBlockBefore(&op.getBody().front(),
+                                 hwModuleOp.getBodyBlock()->getTerminator(),
+                                 args);
       hwModule = hwModuleOp;
     }
 
@@ -1841,7 +1872,7 @@ public:
           SymbolTable::lookupSymbolIn(parentOp, predecl.getValue());
       if (predeclModule) {
         if (failed(SymbolTable::replaceAllSymbolUses(
-                predeclModule, hwModule.moduleNameAttr(), parentOp)))
+                predeclModule, hwModule.getModuleNameAttr(), parentOp)))
           return failure();
         rewriter.eraseOp(predeclModule);
       }
@@ -1898,18 +1929,20 @@ static LogicalResult convertFuncOp(ESITypeConverter &typeConverter,
       UnitRateConversionPattern<arith::AndIOp, comb::AndOp>,
       UnitRateConversionPattern<arith::OrIOp, comb::OrOp>,
       UnitRateConversionPattern<arith::XOrIOp, comb::XorOp>,
-      UnitRateConversionPattern<arith::ShLIOp, comb::OrOp>,
+      UnitRateConversionPattern<arith::ShLIOp, comb::ShlOp>,
       UnitRateConversionPattern<arith::ShRUIOp, comb::ShrUOp>,
       UnitRateConversionPattern<arith::ShRSIOp, comb::ShrSOp>,
+      UnitRateConversionPattern<arith::SelectOp, comb::MuxOp>,
       // HW operations.
       StructCreateConversionPattern,
       // Handshake operations.
       ConditionalBranchConversionPattern, MuxConversionPattern,
-      SelectConversionPattern, PackConversionPattern, UnpackConversionPattern,
+      PackConversionPattern, UnpackConversionPattern,
       ComparisonConversionPattern, BufferConversionPattern,
       SourceConversionPattern, SinkConversionPattern, ConstantConversionPattern,
       MergeConversionPattern, ControlMergeConversionPattern,
       LoadConversionPattern, StoreConversionPattern, MemoryConversionPattern,
+      InstanceConversionPattern,
       // Arith operations.
       ExtendConversionPattern<arith::ExtUIOp, /*signExtend=*/false>,
       ExtendConversionPattern<arith::ExtSIOp, /*signExtend=*/true>,
@@ -1922,7 +1955,8 @@ static LogicalResult convertFuncOp(ESITypeConverter &typeConverter,
 }
 
 namespace {
-class HandshakeToHWPass : public HandshakeToHWBase<HandshakeToHWPass> {
+class HandshakeToHWPass
+    : public circt::impl::HandshakeToHWBase<HandshakeToHWPass> {
 public:
   void runOnOperation() override {
     mlir::ModuleOp mod = getOperation();
@@ -1952,7 +1986,8 @@ public:
     ConversionTarget target(getContext());
     // All top-level logic of a handshake module will be the interconnectivity
     // between instantiated modules.
-    target.addLegalOp<hw::HWModuleOp, hw::OutputOp, hw::InstanceOp>();
+    target.addLegalOp<hw::HWModuleOp, hw::HWModuleExternOp, hw::OutputOp,
+                      hw::InstanceOp>();
     target
         .addIllegalDialect<handshake::HandshakeDialect, arith::ArithDialect>();
 
@@ -1977,6 +2012,18 @@ public:
     for (auto hwModule : mod.getOps<hw::HWModuleOp>())
       if (failed(convertExtMemoryOps(hwModule)))
         return signalPassFailure();
+
+    // Run conversions which need see everything.
+    HWSymbolCache symbolCache;
+    symbolCache.addDefinitions(mod);
+    symbolCache.freeze();
+    RewritePatternSet patterns(mod.getContext());
+    patterns.insert<ESIInstanceConversionPattern>(mod.getContext(),
+                                                  symbolCache);
+    if (failed(applyPartialConversion(mod, target, std::move(patterns)))) {
+      mod->emitOpError() << "error during conversion";
+      signalPassFailure();
+    }
   }
 };
 } // end anonymous namespace

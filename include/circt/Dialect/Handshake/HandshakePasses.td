@@ -117,10 +117,21 @@ def HandshakeLegalizeMemrefs : Pass<"handshake-legalize-memrefs", "mlir::func::F
   let summary = "Memref legalization and lowering pass.";
   let description = [{
     Lowers various memref operations to a state suitable for passing to the
-    StandardToHandshake lowering.
+    CFToHandshake lowering.
   }];
   let constructor = "circt::handshake::createHandshakeLegalizeMemrefsPass()";
   let dependentDialects = ["mlir::scf::SCFDialect"];
+}
+
+def HandshakeSplitMerges : Pass<"handshake-split-merges", "handshake::FuncOp"> {
+  let summary = "Deconstruct >2 input merge operations into 2-input merges";
+  let description = [{
+    This pass deconstructs the (rather complex) semantics of a >2 input merge
+    and control merge operation into a series of 2-input merge operations +
+    supporting logic.
+  }];
+  let constructor = "circt::handshake::createHandshakeSplitMergesPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect"];
 }
 
 #endif // CIRCT_DIALECT_HANDSHAKE_HANDSHAKEPASSES_TD

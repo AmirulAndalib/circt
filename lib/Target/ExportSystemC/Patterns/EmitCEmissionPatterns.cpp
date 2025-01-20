@@ -63,12 +63,12 @@ struct ApplyOpEmitter : OpEmissionPattern<ApplyOp> {
 /// side effects. To make sure that calls with side effects are not reordered
 /// with interferring operations, a pre-pass has to emit VariableOp operations
 /// with the result of the call as initial value.
-class CallOpEmitter : public OpEmissionPattern<CallOp> {
+class CallOpEmitter : public OpEmissionPattern<CallOpaqueOp> {
 public:
   using OpEmissionPattern::OpEmissionPattern;
 
   MatchResult matchInlinable(Value value) override {
-    if (auto callOp = value.getDefiningOp<CallOp>()) {
+    if (auto callOp = value.getDefiningOp<CallOpaqueOp>()) {
       // TODO: template arguments not supported for now.
       if (callOp->getNumResults() == 1 && !callOp.getTemplateArgs())
         return Precedence::FUNCTION_CALL;
@@ -77,17 +77,17 @@ public:
   }
 
   void emitInlined(Value value, EmissionPrinter &p) override {
-    printCallOp(value.getDefiningOp<CallOp>(), p);
+    printCallOp(value.getDefiningOp<CallOpaqueOp>(), p);
   }
 
   bool matchStatement(Operation *op) override {
     // TODO: template arguments not supported for now.
-    if (auto callOp = dyn_cast<CallOp>(op))
+    if (auto callOp = dyn_cast<CallOpaqueOp>(op))
       return callOp->getNumResults() <= 1 && !callOp.getTemplateArgs();
     return false;
   }
 
-  void emitStatement(CallOp callOp, EmissionPrinter &p) override {
+  void emitStatement(CallOpaqueOp callOp, EmissionPrinter &p) override {
     if (callOp->getNumResults() != 0)
       return;
 
@@ -96,7 +96,7 @@ public:
   }
 
 private:
-  void printCallOp(CallOp callOp, EmissionPrinter &p) {
+  void printCallOp(CallOpaqueOp callOp, EmissionPrinter &p) {
     p << callOp.getCallee();
 
     p << "(";
@@ -108,8 +108,8 @@ private:
       });
     } else {
       llvm::interleaveComma(callOp.getArgs().value(), p, [&](Attribute attr) {
-        if (auto idx = attr.dyn_cast<IntegerAttr>()) {
-          if (idx.getType().isa<IndexType>()) {
+        if (auto idx = dyn_cast<IntegerAttr>(attr)) {
+          if (isa<IndexType>(idx.getType())) {
             p.getInlinable(callOp.getOperands()[idx.getInt()])
                 .emitWithParensOnLowerPrecedence(Precedence::COMMA);
             return;
@@ -158,6 +158,36 @@ struct ConstantEmitter : OpEmissionPattern<ConstantOp> {
     p.emitAttr(value.getDefiningOp<ConstantOp>().getValue());
   }
 };
+
+/// Emit an emitc.variable operation.
+struct VariableEmitter : OpEmissionPattern<VariableOp> {
+  using OpEmissionPattern::OpEmissionPattern;
+
+  MatchResult matchInlinable(Value value) override {
+    if (auto varOp = value.getDefiningOp<VariableOp>()) {
+      if (!varOp->getAttrOfType<StringAttr>("name"))
+        return {};
+      return Precedence::VAR;
+    }
+    return {};
+  }
+
+  void emitInlined(Value value, EmissionPrinter &p) override {
+    p << value.getDefiningOp()->getAttrOfType<StringAttr>("name").getValue();
+  }
+
+  void emitStatement(VariableOp op, EmissionPrinter &p) override {
+    p.emitType(op.getResult().getType());
+    p << " " << op->getAttrOfType<StringAttr>("name").getValue();
+
+    if (op.getValue()) {
+      p << " = ";
+      p.emitAttr(op.getValue());
+    }
+
+    p << ";\n";
+  }
+};
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -178,6 +208,13 @@ struct PointerTypeEmitter : TypeEmissionPattern<PointerType> {
   void emitType(PointerType type, EmissionPrinter &p) override {
     p.emitType(type.getPointee());
     p << "*";
+  }
+};
+
+/// Emit an emitc.ptr type.
+struct LValueTypeEmitter : TypeEmissionPattern<LValueType> {
+  void emitType(LValueType type, EmissionPrinter &p) override {
+    p.emitType(type.getValueType());
   }
 };
 } // namespace
@@ -201,12 +238,12 @@ struct OpaqueAttrEmitter : AttrEmissionPattern<OpaqueAttr> {
 void circt::ExportSystemC::populateEmitCOpEmitters(
     OpEmissionPatternSet &patterns, MLIRContext *context) {
   patterns.add<IncludeEmitter, ApplyOpEmitter, CallOpEmitter, CastOpEmitter,
-               ConstantEmitter>(context);
+               ConstantEmitter, VariableEmitter>(context);
 }
 
 void circt::ExportSystemC::populateEmitCTypeEmitters(
     TypeEmissionPatternSet &patterns) {
-  patterns.add<OpaqueTypeEmitter, PointerTypeEmitter>();
+  patterns.add<OpaqueTypeEmitter, PointerTypeEmitter, LValueTypeEmitter>();
 }
 
 void circt::ExportSystemC::populateEmitCAttrEmitters(

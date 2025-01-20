@@ -56,7 +56,7 @@ static void printCHIRRTLOp(OpAsmPrinter &p, Operation *op, DictionaryAttr attr,
   SmallVector<StringRef> elides(extraElides.begin(), extraElides.end());
 
   // Elide the symbol.
-  elides.push_back(hw::InnerName::getInnerNameAttrName());
+  elides.push_back(hw::InnerSymbolTable::getInnerSymbolAttrName());
 
   // Note that we only need to print the "name" attribute if the asmprinter
   // result name disagrees with it.  This can happen in strange cases, e.g.
@@ -118,14 +118,12 @@ void MemoryPortOp::build(OpBuilder &builder, OperationState &result,
         memory, direction, name, builder.getArrayAttr(annotations));
 }
 
-LogicalResult MemoryPortOp::inferReturnTypes(MLIRContext *context,
-                                             std::optional<Location> loc,
-                                             ValueRange operands,
-                                             DictionaryAttr attrs,
-                                             mlir::RegionRange regions,
-                                             SmallVectorImpl<Type> &results) {
+LogicalResult MemoryPortOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> loc, ValueRange operands,
+    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   auto inType = operands[0].getType();
-  auto memType = inType.dyn_cast<CMemoryType>();
+  auto memType = type_dyn_cast<CMemoryType>(inType);
   if (!memType) {
     if (loc)
       mlir::emitError(*loc, "memory port requires memory operand");
@@ -194,10 +192,10 @@ void MemoryDebugPortOp::build(OpBuilder &builder, OperationState &result,
 
 LogicalResult MemoryDebugPortOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
-    DictionaryAttr attrs, mlir::RegionRange regions,
-    SmallVectorImpl<Type> &results) {
+    DictionaryAttr attrs, mlir::OpaqueProperties properties,
+    mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   auto inType = operands[0].getType();
-  auto memType = inType.dyn_cast<CMemoryType>();
+  auto memType = type_dyn_cast<CMemoryType>(inType);
   if (!memType) {
     if (loc)
       mlir::emitError(*loc, "memory port requires memory operand");
@@ -258,11 +256,17 @@ void CombMemOp::build(OpBuilder &builder, OperationState &result,
   build(builder, result,
         CMemoryType::get(builder.getContext(), elementType, numElements), name,
         nameKind, annotations,
-        innerSym ? hw::InnerSymAttr::get(innerSym) : hw::InnerSymAttr(), init);
+        innerSym ? hw::InnerSymAttr::get(innerSym) : hw::InnerSymAttr(), init,
+        {});
 }
 
 void CombMemOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   setNameFn(getResult(), getName());
+}
+
+std::optional<size_t> CombMemOp::getTargetResultIndex() {
+  // Inner symbols on comb memory operations target the op not any result.
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -287,11 +291,17 @@ void SeqMemOp::build(OpBuilder &builder, OperationState &result,
   build(builder, result,
         CMemoryType::get(builder.getContext(), elementType, numElements), ruw,
         name, nameKind, annotations,
-        innerSym ? hw::InnerSymAttr::get(innerSym) : hw::InnerSymAttr(), init);
+        innerSym ? hw::InnerSymAttr::get(innerSym) : hw::InnerSymAttr(), init,
+        {});
 }
 
 void SeqMemOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
   setNameFn(getResult(), getName());
+}
+
+std::optional<size_t> SeqMemOp::getTargetResultIndex() {
+  // Inner symbols on seq memory operations target the op not any result.
+  return std::nullopt;
 }
 
 //===----------------------------------------------------------------------===//
@@ -313,9 +323,6 @@ struct CHIRRTLOpAsmDialectInterface : public OpAsmDialectInterface {
 };
 } // namespace
 
-#define GET_TYPEDEF_CLASSES
-#include "circt/Dialect/FIRRTL/CHIRRTLTypes.cpp.inc"
-
 #define GET_OP_CLASSES
 #include "circt/Dialect/FIRRTL/CHIRRTL.cpp.inc"
 
@@ -327,43 +334,10 @@ void CHIRRTLDialect::initialize() {
       >();
 
   // Register types.
-  addTypes<
-#define GET_TYPEDEF_LIST
-#include "circt/Dialect/FIRRTL/CHIRRTLTypes.cpp.inc"
-      >();
+  registerTypes();
 
   // Register interface implementations.
   addInterfaces<CHIRRTLOpAsmDialectInterface>();
 }
 
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.cpp.inc"
-
-//===----------------------------------------------------------------------===//
-// CMemory Type
-//===----------------------------------------------------------------------===//
-
-void CMemoryType::print(AsmPrinter &printer) const {
-  printer << "<";
-  // Don't print element types with "!firrtl.".
-  firrtl::printNestedType(getElementType(), printer);
-  printer << ", " << getNumElements() << ">";
-}
-
-Type CMemoryType::parse(AsmParser &parser) {
-  FIRRTLBaseType elementType;
-  uint64_t numElements;
-  if (parser.parseLess() || firrtl::parseNestedBaseType(elementType, parser) ||
-      parser.parseComma() || parser.parseInteger(numElements) ||
-      parser.parseGreater())
-    return {};
-  return parser.getChecked<CMemoryType>(elementType, numElements);
-}
-
-LogicalResult CMemoryType::verify(function_ref<InFlightDiagnostic()> emitError,
-                                  FIRRTLBaseType elementType,
-                                  uint64_t numElements) {
-  if (!elementType.isPassive()) {
-    return emitError() << "behavioral memory element type must be passive";
-  }
-  return success();
-}

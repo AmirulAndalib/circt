@@ -30,8 +30,8 @@ def SSPDialect : Dialect {
 
   let cppNamespace = "::circt::ssp";
 
-  let useFoldAPI = kEmitFoldAdaptorFolder;
   let useDefaultAttributePrinterParser = true;
+
   let extraClassDeclaration = [{
     /// Register all SSP attributes.
     void registerAttributes();

@@ -25,6 +25,10 @@ if(POLICY CMP0116)
   cmake_policy(SET CMP0116 OLD)
 endif()
 
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 
@@ -49,14 +53,11 @@ if( CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR )
 # Options and settings
 #-------------------------------------------------------------------------------
 
-  option(LLVM_INCLUDE_TOOLS "Generate build targets for the LLVM tools." ON)
-  option(LLVM_BUILD_TOOLS "Build the LLVM tools. If OFF, just generate build targets." ON)
-
-if (MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c- /GR-")
-else ()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
-endif ()
+  if (MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c- /GR-")
+  else ()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
+  endif ()
 
 #-------------------------------------------------------------------------------
 # MLIR/LLVM Configuration
@@ -84,12 +85,16 @@ endif ()
   # Handle unittests when building out-of-tree against an installed version of
   # LLVM/MLIR (not a build tree). Adapted from `llvm/flang/CMakeLists.txt`.
   set(CIRCT_GTEST_AVAILABLE 0)
-  set(UNITTEST_DIR ${LLVM_THIRD_PARTY_DIR}/unittest)
-  if (NOT EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
-    set(UNITTEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm/third-party/unittest)
-  endif()
-  if (EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
-    if (NOT TARGET llvm_gtest)
+  if (TARGET llvm_gtest)
+    # Installed gtest, via LLVM_INSTALL_GTEST.  Preferred.
+    message(STATUS "LLVM GTest found, enabling unittests")
+    set(CIRCT_GTEST_AVAILABLE 1)
+  else()
+    set(UNITTEST_DIR ${LLVM_THIRD_PARTY_DIR}/unittest)
+    if (NOT EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
+      set(UNITTEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm/third-party/unittest)
+    endif()
+    if (EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
       find_package(Threads)
       add_llvm_library(llvm_gtest
         ${UNITTEST_DIR}/googletest/src/gtest-all.cc
@@ -112,12 +117,12 @@ endif ()
         LINK_COMPONENTS Support # llvm::cl
         BUILDTREE_ONLY
       )
+      set(CIRCT_GTEST_AVAILABLE 1)
+    else()
+      message(WARNING "Skipping unittests since LLVM install does not include \
+        gtest headers and libraries")
+      set(CIRCT_GTEST_AVAILABLE 0)
     endif()
-    set(CIRCT_GTEST_AVAILABLE 1)
-  else()
-    message(WARNING "Skipping unittests since LLVM install does not include \
-      gtest headers and libraries")
-    set(CIRCT_GTEST_AVAILABLE 0)
   endif()
 
 else()
@@ -139,6 +144,12 @@ else()
   set(MLIR_TABLEGEN_EXE $<TARGET_FILE:mlir-tblgen>)
   include_directories(SYSTEM ${MLIR_INCLUDE_DIR})
   include_directories(SYSTEM ${MLIR_TABLEGEN_OUTPUT_DIR})
+
+  # If building as part of a unified build, whether or not MLIR's execution engine
+  # is enabled must be fetched from its subdirectory scope.
+  get_directory_property(MLIR_ENABLE_EXECUTION_ENGINE
+      DIRECTORY ${MLIR_MAIN_SRC_DIR}
+      DEFINITION MLIR_ENABLE_EXECUTION_ENGINE)
 
   set(BACKEND_PACKAGE_STRING "${PACKAGE_STRING}")
 
@@ -169,6 +180,15 @@ set(CIRCT_TOOLS_DIR ${CMAKE_BINARY_DIR}/bin)
 set(CIRCT_UTILS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 set(CIRCT_PYTHON_PACKAGES_DIR ${CIRCT_BINARY_DIR}/python_packages)
 
+
+option(CIRCT_INCLUDE_TOOLS "Generate build targets for the CIRCT tools." ON)
+option(CIRCT_BUILD_TOOLS "Build the CIRCT tools. If OFF, just generate build targets." ON)
+set(CIRCT_TOOLS_INSTALL_DIR "${CMAKE_INSTALL_BINDIR}" CACHE PATH
+    "Path for binary subdirectory (defaults to '${CMAKE_INSTALL_BINDIR}')")
+
+option(CIRCT_INCLUDE_TESTS
+       "Generate build targets for the CIRCT tests." ON)
+
 list(APPEND CMAKE_MODULE_PATH "${MLIR_MAIN_SRC_DIR}/cmake/modules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 include(AddCIRCT)
@@ -178,6 +198,9 @@ include(AddCIRCT)
 add_custom_target(circt-headers)
 set_target_properties(circt-headers PROPERTIES FOLDER "Misc")
 add_custom_target(circt-doc)
+
+# Umbrella target that builds all C API bindings.
+add_custom_target(circt-capi)
 
 # Add MLIR and LLVM headers to the include path
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -390,7 +413,7 @@ else()
 
     string(REGEX MATCH "Icarus Verilog version (([0-9]+)\.([0-9]+)) \.*"
       MATCH ${IVERILOG_VERSION})
-    
+
     if (${CMAKE_MATCH_1} LESS 11.0)
       message(FATAL_ERROR "CIRCT only supports Icarus Verilog version 11.0 and up. \
                            Found version: ${CMAKE_MATCH_1}. You can disable \
@@ -401,32 +424,6 @@ else()
   else()
     set(IVERILOG_PATH "")
     message(STATUS "Did not find iverilog.")
-  endif()
-endif()
-
-#-------------------------------------------------------------------------------
-# capnp Configuration
-#-------------------------------------------------------------------------------
-
-# If capnp hasn't been explicitly disabled, find it.
-option(CAPNP_DISABLE "Disable Cap'nProto (needed for cosimulation).")
-if (CAPNP_DISABLE)
-  message (STATUS "Disabling Cap'nProto.")
-else()
-  if(DEFINED CAPNP_PATH)
-    set(ENV{PKG_CONFIG_PATH}
-      "${CAPNP_PATH}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
-    find_package(CapnProto CONFIG PATHS ${CAPNP_PATH})
-  else()
-    set(ENV{PKG_CONFIG_PATH}
-      "${CMAKE_CURRENT_SOURCE_DIR}/ext/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
-    find_package(CapnProto CONFIG PATHS "${CMAKE_CURRENT_SOURCE_DIR}/ext")
-  endif()
-
-  if(CapnProto_FOUND)
-    message(STATUS "Found Cap'nProto at ${CapnProto_DIR}.")
-    set(CMAKE_INSTALL_RPATH ${capnp_LIBDIR})
-    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
   endif()
 endif()
 
@@ -455,22 +452,58 @@ else()
 endif()
 
 #-------------------------------------------------------------------------------
-# llhd-sim Configuration
+# Z3Lib Configuration (for circt-lec and SMT dialect integration tests)
 #-------------------------------------------------------------------------------
 
-if(NOT WIN32)
-  option(CIRCT_LLHD_SIM_ENABLED "Enables LLHD sim." ON)
+# If z3 hasn't been explicitly disabled, find it.
+option(Z3_DISABLE "Disable the z3 tests.")
+if (Z3_DISABLE)
+  message(STATUS "Disabling tests requiring z3.")
 else()
-  option(CIRCT_LLHD_SIM_ENABLED "Enables LLHD sim." OFF)
+  if(Z3_DIR)
+    # Search and load the package configuration file in the specified directory.
+    find_package(Z3 CONFIG REQUIRED PATHS ${Z3_DIR} NO_DEFAULT_PATH)
+    if(Z3_FOUND)
+      # Report the found library location and version
+      # similarly to LLVM's `FindZ3` CMake module.
+      get_target_property(Z3_LIB_LOCATION z3::libz3 IMPORTED_LOCATION_DEBUG)
+      message(STATUS "Found Z3: ${Z3_LIB_LOCATION} (found version \"${Z3_VERSION_STRING}\")")
+    endif()
+  else()
+    # Attempt initialising Z3 according to LLVM's `FindZ3` CMake module.
+    find_package(Z3)
+  endif()
+
+  if(Z3_FOUND)
+    SET(CIRCT_LEC_Z3_VER 4.8.11)
+    if(Z3_VERSION_STRING VERSION_LESS ${CIRCT_LEC_Z3_VER})
+      message(WARNING "Cannot build circt-lec with outdated Z3 version ${Z3_VERSION_STRING}, requires ${CIRCT_LEC_Z3_VER}.")
+    else()
+      message(STATUS "Z3 identified as a logical backend.")
+    endif()
+  endif()
 endif()
 
-if(CIRCT_LLHD_SIM_ENABLED)
-  message(STATUS "llhd-sim is enabled.")
-else()
-  message(STATUS "llhd-sim is disabled.")
-endif()
+#-------------------------------------------------------------------------------
+# Z3 Configuration (for integration tests to check SMT-LIB export)
+#-------------------------------------------------------------------------------
 
-llvm_canonicalize_cmake_booleans(CIRCT_LLHD_SIM_ENABLED)
+# If z3 hasn't been explicitly disabled, find it.
+option(Z3_DISABLE "Disable the z3 tests.")
+if (Z3_DISABLE)
+  message(STATUS "Disabling tests requiring z3.")
+else()
+  # Search for the `z3` command.
+  find_program(Z3_PATH "z3")
+  if(EXISTS ${Z3_PATH})
+    # Then strip the filename.
+    get_filename_component(Z3_PATH ${Z3_PATH} DIRECTORY)
+    message(STATUS "Found z3 at ${Z3_PATH}.")
+  else()
+    set(Z3_PATH "")
+    message(STATUS "Did NOT find z3.")
+  endif()
+endif()
 
 #-------------------------------------------------------------------------------
 # Python Configuration
@@ -480,8 +513,12 @@ option(CIRCT_BINDINGS_PYTHON_ENABLED "Enables CIRCT Python bindings." OFF)
 
 if(CIRCT_BINDINGS_PYTHON_ENABLED)
   message(STATUS "CIRCT Python bindings are enabled.")
-  include(MLIRDetectPythonEnv)
-  mlir_configure_python_dev_packages()
+  set(MLIR_DISABLE_CONFIGURE_PYTHON_DEV_PACKAGES 0)
+  mlir_detect_pybind11_install()
+  # Prime the search like mlir_configure_python_dev_modules
+  find_package(Python3 3.8 COMPONENTS Interpreter Development)
+  find_package(Python3 3.8 COMPONENTS Interpreter Development.Module)
+  find_package(pybind11 2.10 CONFIG REQUIRED)
 else()
   message(STATUS "CIRCT Python bindings are disabled.")
   # Lookup python either way as some integration tests use python without the
@@ -508,18 +545,106 @@ if(CIRCT_BINDINGS_TCL_ENABLED)
 endif()
 
 #-------------------------------------------------------------------------------
+# slang Verilog Frontend
+#-------------------------------------------------------------------------------
+
+option(CIRCT_SLANG_FRONTEND_ENABLED "Enables the slang Verilog frontend." OFF)
+option(CIRCT_SLANG_BUILD_FROM_SOURCE
+  "Build slang from source instead of finding an installed package" ON)
+
+llvm_canonicalize_cmake_booleans(CIRCT_SLANG_FRONTEND_ENABLED)
+llvm_canonicalize_cmake_booleans(CIRCT_SLANG_BUILD_FROM_SOURCE)
+
+if(CIRCT_SLANG_FRONTEND_ENABLED)
+  message(STATUS "slang Verilog frontend is enabled")
+  if(CIRCT_SLANG_BUILD_FROM_SOURCE)
+    # Build slang as part of CIRCT (see https://sv-lang.com/building.html)
+    message(STATUS "Building slang from source")
+    include(FetchContent)
+    FetchContent_Declare(
+      slang
+      GIT_REPOSITORY https://github.com/MikePopoloski/slang.git
+      GIT_TAG v3.0
+      GIT_SHALLOW ON)
+    set(FETCHCONTENT_TRY_FIND_PACKAGE_MODE "NEVER")
+
+    # Force Slang to be built as a static library to avoid messing around with
+    # RPATHs and installing a slang dylib alongside CIRCT. The static library
+    # will embed Slang into ImportVerilog.
+    set(ORIGINAL_CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+    set(ORIGINAL_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+
+    if (MSVC)
+      set(CMAKE_CXX_FLAGS "/EHsc")
+    else ()
+      set(CMAKE_CXX_FLAGS "")
+    endif ()
+    set(BUILD_SHARED_LIBS OFF)
+    FetchContent_MakeAvailable(slang)
+
+    set(CMAKE_CXX_FLAGS ${ORIGINAL_CMAKE_CXX_FLAGS})
+    set(BUILD_SHARED_LIBS ${ORIGINAL_BUILD_SHARED_LIBS})
+
+    if(BUILD_SHARED_LIBS)
+      set_target_properties(slang_slang PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      set_target_properties(fmt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      set_target_properties(unordered_dense PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    # The following feels *very* hacky, but CMake complains about the
+    # CIRCTImportVerilog target linking against slang_slang (even with PRIVATE
+    # linking) without the latter being in an export set. I think we'd want to
+    # statically link slang into the CIRCTImportVerilog library, but seems to be
+    # harder than it ought to be.
+    set_property(
+      GLOBAL APPEND PROPERTY CIRCT_EXPORTS slang_slang unordered_dense fmt)
+    
+    # Disable the installation of headers coming from third-party libraries. We
+    # won't use those APIs directly. Just make them static libraries for the sake
+    # of running slang normally.
+    set_target_properties(fmt PROPERTIES PUBLIC_HEADER "")
+    set_target_properties(unordered_dense PROPERTIES PUBLIC_HEADER "")
+
+    install(TARGETS slang_slang unordered_dense fmt EXPORT CIRCTTargets)
+  else()
+    find_package(slang 3.0 REQUIRED)
+  endif()
+endif()
+
+#-------------------------------------------------------------------------------
+# Arcilator JIT
+#-------------------------------------------------------------------------------
+
+if(MLIR_ENABLE_EXECUTION_ENGINE)
+  set(ARCILATOR_JIT_ENABLED 1)
+else()
+  set(ARCILATOR_JIT_ENABLED 0)
+endif()
+
+#-------------------------------------------------------------------------------
 # Directory setup
 #-------------------------------------------------------------------------------
 
+if (CIRCT_INCLUDE_TESTS)
+  add_definitions(-DCIRCT_INCLUDE_TESTS)
+endif()
+
 add_subdirectory(include/circt)
 add_subdirectory(lib)
-add_subdirectory(tools)
-if (CIRCT_GTEST_AVAILABLE)
-  add_subdirectory(unittests)
+if(CIRCT_INCLUDE_TOOLS)
+  add_subdirectory(tools)
 endif()
-add_subdirectory(test)
-add_subdirectory(integration_test)
 add_subdirectory(frontends)
+
+if (CIRCT_INCLUDE_TESTS)
+  # Test directories are added after everything else so their cmake files can
+  # use targets and target properties defined by the things they test.
+  if (CIRCT_GTEST_AVAILABLE)
+    add_subdirectory(unittests)
+  endif()
+  add_subdirectory(test)
+  add_subdirectory(integration_test)
+endif()
 
 option(CIRCT_INCLUDE_DOCS "Generate build targets for the CIRCT docs.")
 if (CIRCT_INCLUDE_DOCS)
@@ -555,6 +680,29 @@ if (NOT LLVM_ENABLE_IDE)
   add_llvm_install_targets(install-circt-headers
                            DEPENDS circt-headers
                            COMPONENT circt-headers)
+endif()
+
+
+# Custom target to install all CIRCT libraries
+add_custom_target(circt-libraries)
+set_target_properties(circt-libraries PROPERTIES FOLDER "Misc")
+
+if (NOT LLVM_ENABLE_IDE)
+  add_llvm_install_targets(install-circt-libraries
+                           DEPENDS circt-libraries
+                           COMPONENT circt-libraries)
+endif()
+
+get_property(CIRCT_LIBS GLOBAL PROPERTY CIRCT_ALL_LIBS)
+if(CIRCT_LIBS)
+  list(REMOVE_DUPLICATES CIRCT_LIBS)
+  foreach(lib ${CIRCT_LIBS})
+    add_dependencies(circt-libraries ${lib})
+    if(NOT LLVM_ENABLE_IDE)
+      add_dependencies(install-circt-libraries install-${lib})
+      add_dependencies(install-circt-libraries-stripped install-${lib}-stripped)
+    endif()
+  endforeach()
 endif()
 
 add_subdirectory(cmake/modules)

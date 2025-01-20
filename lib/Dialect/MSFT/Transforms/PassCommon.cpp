@@ -7,24 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetails.h"
+#include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/MSFT/MSFTPasses.h"
 
 using namespace mlir;
 using namespace circt;
 using namespace msft;
-
-bool circt::msft::isAnyModule(Operation *module) {
-  return isa<MSFTModuleOp, MSFTModuleExternOp>(module) ||
-         hw::isAnyModule(module);
-}
-
-hw::ModulePortInfo circt::msft::getModulePortInfo(Operation *op) {
-  if (auto mod = dyn_cast<MSFTModuleOp>(op))
-    return mod.getPorts();
-  if (auto mod = dyn_cast<MSFTModuleExternOp>(op))
-    return mod.getPorts();
-  return hw::getModulePortInfo(op);
-}
 
 SmallVector<unsigned> circt::msft::makeSequentialRange(unsigned size) {
   SmallVector<unsigned> seq;
@@ -36,25 +24,26 @@ SmallVector<unsigned> circt::msft::makeSequentialRange(unsigned size) {
 StringRef circt::msft::getValueName(Value v, const SymbolCache &syms,
                                     std::string &buff) {
   Operation *defOp = v.getDefiningOp();
-  if (auto inst = dyn_cast_or_null<InstanceOp>(defOp)) {
+  if (auto inst = dyn_cast_or_null<hw::InstanceOp>(defOp)) {
     Operation *modOp = syms.getDefinition(inst.getModuleNameAttr());
     if (modOp) { // If modOp isn't in the cache, it's probably a new module;
-      assert(isAnyModule(modOp) && "Instance must point to a module");
-      OpResult instResult = v.cast<OpResult>();
-      hw::ModulePortInfo ports = getModulePortInfo(modOp);
+      assert(isa<hw::HWModuleLike>(modOp) && "Instance must point to a module");
+      OpResult instResult = cast<OpResult>(v);
+      auto mod = cast<hw::HWModuleLike>(modOp);
       buff.clear();
       llvm::raw_string_ostream os(buff);
-      os << inst.getSymName() << ".";
-      StringAttr name = ports.outputs[instResult.getResultNumber()].name;
+      os << inst.getInstanceName() << ".";
+      StringAttr name = mod.getOutputNameAttr(instResult.getResultNumber());
       if (name)
         os << name.getValue();
       return buff;
     }
   }
-  if (auto blockArg = v.dyn_cast<BlockArgument>()) {
-    auto portInfo =
-        getModulePortInfo(blockArg.getOwner()->getParent()->getParentOp());
-    return portInfo.inputs[blockArg.getArgNumber()].getName();
+  if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+    hw::ModulePortInfo portInfo(
+        cast<hw::PortList>(blockArg.getOwner()->getParent()->getParentOp())
+            .getPortList());
+    return portInfo.atInput(blockArg.getArgNumber()).getName();
   }
   if (auto constOp = dyn_cast<hw::ConstantOp>(defOp)) {
     buff.clear();
@@ -63,49 +52,4 @@ StringRef circt::msft::getValueName(Value v, const SymbolCache &syms,
   }
 
   return "";
-}
-
-void PassCommon::getAndSortModules(ModuleOp topMod,
-                                   SmallVectorImpl<hw::HWModuleLike> &mods) {
-  // Add here _before_ we go deeper to prevent infinite recursion.
-  DenseSet<Operation *> modsSeen;
-  mods.clear();
-  moduleInstantiations.clear();
-  topMod.walk([&](hw::HWModuleLike mod) {
-    getAndSortModulesVisitor(mod, mods, modsSeen);
-  });
-}
-
-LogicalResult PassCommon::verifyInstances(mlir::ModuleOp mod) {
-  WalkResult r = mod.walk([&](InstanceOp inst) {
-    Operation *modOp = topLevelSyms.getDefinition(inst.getModuleNameAttr());
-    if (!isAnyModule(modOp))
-      return WalkResult::interrupt();
-
-    hw::ModulePortInfo ports = getModulePortInfo(modOp);
-    return succeeded(inst.verifySignatureMatch(ports))
-               ? WalkResult::advance()
-               : WalkResult::interrupt();
-  });
-  return failure(r.wasInterrupted());
-}
-
-// Run a post-order DFS.
-void PassCommon::getAndSortModulesVisitor(
-    hw::HWModuleLike mod, SmallVectorImpl<hw::HWModuleLike> &mods,
-    DenseSet<Operation *> &modsSeen) {
-  if (modsSeen.contains(mod))
-    return;
-  modsSeen.insert(mod);
-
-  mod.walk([&](hw::HWInstanceLike inst) {
-    Operation *modOp =
-        topLevelSyms.getDefinition(inst.referencedModuleNameAttr());
-    assert(modOp);
-    moduleInstantiations[modOp].push_back(inst);
-    if (auto modLike = dyn_cast<hw::HWModuleLike>(modOp))
-      getAndSortModulesVisitor(modLike, mods, modsSeen);
-  });
-
-  mods.push_back(mod);
 }

@@ -14,7 +14,11 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRPARSER_H
 #define CIRCT_DIALECT_FIRRTL_FIRPARSER_H
 
+#include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Support/LLVM.h"
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace llvm {
 class SourceMgr;
@@ -29,13 +33,29 @@ namespace circt {
 namespace firrtl {
 
 struct FIRParserOptions {
-  /// If this is set to true, the @info locators are ignored, and the locations
-  /// are set to the location in the .fir file.
-  bool ignoreInfoLocators = false;
+  /// Specify how @info locators should be handled.
+  enum class InfoLocHandling {
+    /// If this is set to true, the @info locators are ignored, and the
+    /// locations are set to the location in the .fir file.
+    IgnoreInfo,
+    /// Prefer @info locators, fallback to .fir locations.
+    PreferInfo,
+    /// Attach both @info locators (when present) and .fir locations.
+    FusedInfo
+  };
+
+  InfoLocHandling infoLocatorHandling = InfoLocHandling::PreferInfo;
+
   /// The number of annotation files that were specified on the command line.
-  /// This, along with numOMIRFiles provides structure to the buffers in the
-  /// source manager.
+  /// This, provides structure to the buffers in the source manager.
   unsigned numAnnotationFiles;
+  bool scalarizePublicModules = false;
+  bool scalarizeInternalModules = false;
+  bool scalarizeExtModules = false;
+  std::vector<std::string> enableLayers;
+  std::vector<std::string> disableLayers;
+  std::optional<LayerSpecialization> defaultLayerSpecialization;
+  std::vector<std::string> selectInstanceChoice;
 };
 
 mlir::OwningOpRef<mlir::ModuleOp> importFIRFile(llvm::SourceMgr &sourceMgr,
@@ -63,6 +83,65 @@ maybeStringToLocation(llvm::StringRef spelling, bool skipParsing,
                       MLIRContext *context);
 
 void registerFromFIRFileTranslation();
+
+/// The FIRRTL specification version.
+struct FIRVersion {
+  constexpr FIRVersion(uint16_t major, uint16_t minor, uint16_t patch)
+      : major{major}, minor{minor}, patch{patch} {}
+
+  explicit constexpr operator uint64_t() const {
+    return uint64_t(major) << 32 | uint64_t(minor) << 16 | uint64_t(patch);
+  }
+
+  constexpr bool operator<(FIRVersion rhs) const {
+    return uint64_t(*this) < uint64_t(rhs);
+  }
+
+  constexpr bool operator>(FIRVersion rhs) const {
+    return uint64_t(*this) > uint64_t(rhs);
+  }
+
+  constexpr bool operator<=(FIRVersion rhs) const {
+    return uint64_t(*this) <= uint64_t(rhs);
+  }
+
+  constexpr bool operator>=(FIRVersion rhs) const {
+    return uint64_t(*this) >= uint64_t(rhs);
+  }
+
+  uint16_t major;
+  uint16_t minor;
+  uint16_t patch;
+};
+
+/// The current minimum version of FIRRTL that the parser supports.
+constexpr FIRVersion minimumFIRVersion(2, 0, 0);
+
+/// The next version of FIRRTL that is not yet released.
+///
+/// Features use this version if they have been landed on the main branch of
+/// `chipsalliance/firrtl-spec`, but have not been part of a release yet. Once a
+/// new version of the spec is released, all uses of `nextFIRVersion` in the
+/// parser are replaced with the concrete version `{x, y, z}`, and this
+/// declaration here is bumped to the next probable version number.
+constexpr FIRVersion nextFIRVersion(4, 2, 0);
+
+/// A marker for parser features that are currently missing from the spec.
+///
+/// Features use this version if they have _not_ been added to the documentation
+/// in the `chipsalliance/firrtl-spec` repository. This allows us to distinguish
+/// features that are released in the next version of the spec and features that
+/// are still missing from the spec.
+constexpr FIRVersion missingSpecFIRVersion = nextFIRVersion;
+
+/// The version of FIRRTL that the exporter produces. This is always the next
+/// version, since it contains any new developments.
+constexpr FIRVersion exportFIRVersion = nextFIRVersion;
+
+template <typename T>
+T &operator<<(T &os, FIRVersion version) {
+  return os << version.major << "." << version.minor << "." << version.patch;
+}
 
 } // namespace firrtl
 } // namespace circt

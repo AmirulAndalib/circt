@@ -1,10 +1,8 @@
-//===-- circt-c/SVDialect.h - C API for SV dialect ----------------*- C -*-===//
+//===- SV.h - C interface for the SV dialect ----------------------*- C -*-===//
 //
-// This header declares the C interface for registering and accessing the
-// SV dialect. A dialect should be registered with a context to make it
-// available to users of the context. These users must load the dialect
-// before using any of its attributes, operations or types. Parser and pass
-// manager can load registered dialects automatically.
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,26 +16,20 @@ extern "C" {
 #endif
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(SystemVerilog, sv);
-MLIR_CAPI_EXPORTED void registerSVPasses();
+MLIR_CAPI_EXPORTED void registerSVPasses(void);
 
 //===----------------------------------------------------------------------===//
 // Attribute API.
 //===----------------------------------------------------------------------===//
 
 MLIR_CAPI_EXPORTED bool svAttrIsASVAttributeAttr(MlirAttribute);
-MLIR_CAPI_EXPORTED MlirAttribute svSVAttributeAttrGet(MlirContext cCtxt,
+MLIR_CAPI_EXPORTED MlirAttribute svSVAttributeAttrGet(MlirContext,
                                                       MlirStringRef name,
-                                                      MlirStringRef expression);
+                                                      MlirStringRef expression,
+                                                      bool emitAsComment);
 MLIR_CAPI_EXPORTED MlirStringRef svSVAttributeAttrGetName(MlirAttribute);
 MLIR_CAPI_EXPORTED MlirStringRef svSVAttributeAttrGetExpression(MlirAttribute);
-
-MLIR_CAPI_EXPORTED bool svAttrIsASVAttributesAttr(MlirAttribute);
-MLIR_CAPI_EXPORTED MlirAttribute svSVAttributesAttrGet(MlirContext cCtxt,
-                                                       MlirAttribute attributes,
-                                                       bool emitAsComments);
-MLIR_CAPI_EXPORTED MlirAttribute svSVAttributesAttrGetAttributes(MlirAttribute);
-MLIR_CAPI_EXPORTED
-bool svSVAttributesAttrGetEmitAsComments(MlirAttribute);
+MLIR_CAPI_EXPORTED bool svSVAttributeAttrGetEmitAsComment(MlirAttribute);
 
 #ifdef __cplusplus
 }

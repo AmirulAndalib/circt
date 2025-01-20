@@ -21,6 +21,21 @@ using namespace circt;
 using namespace comb;
 using namespace matchers;
 
+/// In comb, we assume no knowledge of the semantics of cross-block dataflow. As
+/// such, cross-block dataflow is interpreted as a canonicalization barrier.
+/// This is a conservative approach which:
+/// 1. still allows for efficient canonicalization for the common CIRCT usecase
+///    of comb (comb logic nested inside single-block hw.module's)
+/// 2. allows comb operations to be used in non-HW container ops - that may use
+///    MLIR blocks and regions to represent various forms of hierarchical
+///    abstractions, thus allowing comb to compose with other dialects.
+static bool hasOperandsOutsideOfBlock(Operation *op) {
+  Block *thisBlock = op->getBlock();
+  return llvm::any_of(op->getOperands(), [&](Value operand) {
+    return operand.getParentBlock() != thisBlock;
+  });
+}
+
 /// Create a new instance of a generic operation that only has value operands,
 /// and has a single result value whose type matches the first operand.
 ///
@@ -34,7 +49,7 @@ static Value createGenericOp(Location loc, OperationName name,
   return builder.create(state)->getResult(0);
 }
 
-static Attribute getIntAttr(const APInt &value, MLIRContext *context) {
+static TypedAttr getIntAttr(const APInt &value, MLIRContext *context) {
   return IntegerAttr::get(IntegerType::get(context, value.getBitWidth()),
                           value);
 }
@@ -60,8 +75,8 @@ static void replaceOpAndCopyName(PatternRewriter &rewriter, Operation *op,
   if (auto *newOp = newValue.getDefiningOp()) {
     auto name = op->getAttrOfType<StringAttr>("sv.namehint");
     if (name && !newOp->hasAttr("sv.namehint"))
-      rewriter.updateRootInPlace(newOp,
-                                 [&] { newOp->setAttr("sv.namehint", name); });
+      rewriter.modifyOpInPlace(newOp,
+                               [&] { newOp->setAttr("sv.namehint", name); });
   }
   rewriter.replaceOp(op, newValue);
 }
@@ -76,28 +91,17 @@ static OpTy replaceOpWithNewOpAndCopyName(PatternRewriter &rewriter,
   auto newOp =
       rewriter.replaceOpWithNewOp<OpTy>(op, std::forward<Args>(args)...);
   if (name && !newOp->hasAttr("sv.namehint"))
-    rewriter.updateRootInPlace(newOp,
-                               [&] { newOp->setAttr("sv.namehint", name); });
+    rewriter.modifyOpInPlace(newOp,
+                             [&] { newOp->setAttr("sv.namehint", name); });
 
   return newOp;
 }
 
-namespace {
-struct ConstantIntMatcher {
-  APInt &value;
-  ConstantIntMatcher(APInt &value) : value(value) {}
-  bool match(Operation *op) {
-    if (auto cst = dyn_cast<hw::ConstantOp>(op)) {
-      value = cst.getValue();
-      return true;
-    }
-    return false;
-  }
-};
-} // end anonymous namespace
-
-static inline ConstantIntMatcher m_RConstant(APInt &value) {
-  return ConstantIntMatcher(value);
+// Return true if the op has SV attributes. Note that we cannot use a helper
+// function `hasSVAttributes` defined under SV dialect because of a cyclic
+// dependency.
+static bool hasSVAttributes(Operation *op) {
+  return op->hasAttr("sv.attributes");
 }
 
 namespace {
@@ -117,25 +121,66 @@ static inline ComplementMatcher<SubType> m_Complement(const SubType &subExpr) {
   return ComplementMatcher<SubType>(subExpr);
 }
 
+/// Return true if the op will be flattened afterwards. Op will be flattend if
+/// it has a single user which has a same op type.  User must be in same block.
+static bool shouldBeFlattened(Operation *op) {
+  assert((isa<AndOp, OrOp, XorOp, AddOp, MulOp>(op) &&
+          "must be commutative operations"));
+  if (op->hasOneUse()) {
+    auto *user = *op->getUsers().begin();
+    return user->getName() == op->getName() &&
+           op->getAttrOfType<UnitAttr>("twoState") ==
+               user->getAttrOfType<UnitAttr>("twoState") &&
+           op->getBlock() == user->getBlock();
+  }
+  return false;
+}
+
 /// Flattens a single input in `op` if `hasOneUse` is true and it can be defined
 /// as an Op. Returns true if successful, and false otherwise.
 ///
 /// Example: op(1, 2, op(3, 4), 5) -> op(1, 2, 3, 4, 5)  // returns true
 ///
 static bool tryFlatteningOperands(Operation *op, PatternRewriter &rewriter) {
+  // Skip if the operation should be flattened by another operation.
+  if (shouldBeFlattened(op))
+    return false;
+
   auto inputs = op->getOperands();
 
-  for (size_t i = 0, size = inputs.size(); i != size; ++i) {
-    Operation *flattenOp = inputs[i].getDefiningOp();
-    if (!flattenOp || flattenOp->getName() != op->getName())
-      continue;
+  SmallVector<Value, 4> newOperands;
+  SmallVector<Location, 4> newLocations{op->getLoc()};
+  newOperands.reserve(inputs.size());
+  struct Element {
+    decltype(inputs.begin()) current, end;
+  };
 
-    // Check for loops
-    if (flattenOp == op)
+  SmallVector<Element> worklist;
+  worklist.push_back({inputs.begin(), inputs.end()});
+  bool binFlag = op->hasAttrOfType<UnitAttr>("twoState");
+  bool changed = false;
+  while (!worklist.empty()) {
+    auto &element = worklist.back(); // Do not pop. Take ref.
+
+    // Pop when we finished traversing the current operand range.
+    if (element.current == element.end) {
+      worklist.pop_back();
       continue;
+    }
+
+    Value value = *element.current++;
+    auto *flattenOp = value.getDefiningOp();
+    // If not defined by a compatible operation of the same kind and
+    // from the same block, keep this as-is.
+    if (!flattenOp || flattenOp->getName() != op->getName() ||
+        flattenOp == op || binFlag != op->hasAttrOfType<UnitAttr>("twoState") ||
+        flattenOp->getBlock() != op->getBlock()) {
+      newOperands.push_back(value);
+      continue;
+    }
 
     // Don't duplicate logic when it has multiple uses.
-    if (!inputs[i].hasOneUse()) {
+    if (!value.hasOneUse()) {
       // We can fold a multi-use binary operation into this one if this allows a
       // constant to fold though.  For example, fold
       //    (or a, b, c, (or d, cst1), cst2) --> (or a, b, c, d, cst1, cst2)
@@ -145,34 +190,30 @@ static bool tryFlatteningOperands(Operation *op, PatternRewriter &rewriter) {
       // between the two ops if duplicated.
       if (flattenOp->getNumOperands() != 2 || !isa<AndOp, OrOp, XorOp>(op) ||
           !flattenOp->getOperand(1).getDefiningOp<hw::ConstantOp>() ||
-          !inputs.back().getDefiningOp<hw::ConstantOp>())
+          !inputs.back().getDefiningOp<hw::ConstantOp>()) {
+        newOperands.push_back(value);
         continue;
+      }
     }
 
-    // Otherwise, flatten away.
+    changed = true;
+
+    // Otherwise, push operands into worklist.
     auto flattenOpInputs = flattenOp->getOperands();
-
-    SmallVector<Value, 4> newOperands;
-    newOperands.reserve(size + flattenOpInputs.size());
-
-    auto flattenOpIndex = inputs.begin() + i;
-    newOperands.append(inputs.begin(), flattenOpIndex);
-    newOperands.append(flattenOpInputs.begin(), flattenOpInputs.end());
-    newOperands.append(flattenOpIndex + 1, inputs.end());
-
-    Value result =
-        createGenericOp(op->getLoc(), op->getName(), newOperands, rewriter);
-
-    // If the original operation and flatten operand have bin flags, propagte
-    // the flag to new one.
-    if (op->hasAttrOfType<UnitAttr>("twoState") &&
-        flattenOp->hasAttrOfType<UnitAttr>("twoState"))
-      result.getDefiningOp()->setAttr("twoState", rewriter.getUnitAttr());
-
-    replaceOpAndCopyName(rewriter, op, result);
-    return true;
+    worklist.push_back({flattenOpInputs.begin(), flattenOpInputs.end()});
+    newLocations.push_back(flattenOp->getLoc());
   }
-  return false;
+
+  if (!changed)
+    return false;
+
+  Value result = createGenericOp(FusedLoc::get(op->getContext(), newLocations),
+                                 op->getName(), newOperands, rewriter);
+  if (binFlag)
+    result.getDefiningOp()->setAttr("twoState", rewriter.getUnitAttr());
+
+  replaceOpAndCopyName(rewriter, op, result);
+  return true;
 }
 
 // Given a range of uses of an operation, find the lowest and highest bits
@@ -194,7 +235,7 @@ getLowestBitAndHighestBitRequired(Operation *op, bool narrowTrailingBits,
     if (auto extractOp = dyn_cast<ExtractOp>(user)) {
       size_t lowBit = extractOp.getLowBit();
       size_t highBit =
-          extractOp.getType().cast<IntegerType>().getWidth() + lowBit - 1;
+          cast<IntegerType>(extractOp.getType()).getWidth() + lowBit - 1;
       highestBitRequired = std::max(highestBitRequired, highBit);
       lowestBitRequired = std::min(lowestBitRequired, lowBit);
       continue;
@@ -211,8 +252,7 @@ getLowestBitAndHighestBitRequired(Operation *op, bool narrowTrailingBits,
 template <class OpTy>
 static bool narrowOperationWidth(OpTy op, bool narrowTrailingBits,
                                  PatternRewriter &rewriter) {
-  IntegerType opType =
-      op.getResult().getType().template dyn_cast<IntegerType>();
+  IntegerType opType = dyn_cast<IntegerType>(op.getResult().getType());
   if (!opType)
     return false;
 
@@ -231,19 +271,24 @@ static bool narrowOperationWidth(OpTy op, bool narrowTrailingBits,
       args.push_back(rewriter.createOrFold<ExtractOp>(inop.getLoc(), newType,
                                                       inop, range.first));
   }
-  Value newop = rewriter.createOrFold<OpTy>(op.getLoc(), newType, args);
+  auto newop = rewriter.create<OpTy>(op.getLoc(), newType, args);
+  newop->setDialectAttrs(op->getDialectAttrs());
+  if (op.getTwoState())
+    newop.setTwoState(true);
+
+  Value newResult = newop.getResult();
   if (range.first)
-    newop = rewriter.createOrFold<ConcatOp>(
-        op.getLoc(), newop,
+    newResult = rewriter.createOrFold<ConcatOp>(
+        op.getLoc(), newResult,
         rewriter.create<hw::ConstantOp>(op.getLoc(),
                                         APInt::getZero(range.first)));
   if (range.second + 1 < opType.getWidth())
-    newop = rewriter.createOrFold<ConcatOp>(
+    newResult = rewriter.createOrFold<ConcatOp>(
         op.getLoc(),
         rewriter.create<hw::ConstantOp>(
             op.getLoc(), APInt::getZero(opType.getWidth() - range.second - 1)),
-        newop);
-  replaceOpAndCopyName(rewriter, op, newop);
+        newResult);
+  rewriter.replaceOp(op, newResult);
   return true;
 }
 
@@ -252,20 +297,23 @@ static bool narrowOperationWidth(OpTy op, bool narrowTrailingBits,
 //===----------------------------------------------------------------------===//
 
 OpFoldResult ReplicateOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // Replicate one time -> noop.
-  if (getType().cast<IntegerType>().getWidth() ==
+  if (cast<IntegerType>(getType()).getWidth() ==
       getInput().getType().getIntOrFloatBitWidth())
     return getInput();
 
   // Constant fold.
-  if (auto input = adaptor.getInput().dyn_cast_or_null<IntegerAttr>()) {
+  if (auto input = dyn_cast_or_null<IntegerAttr>(adaptor.getInput())) {
     if (input.getValue().getBitWidth() == 1) {
       if (input.getValue().isZero())
         return getIntAttr(
-            APInt::getZero(getType().cast<IntegerType>().getWidth()),
+            APInt::getZero(cast<IntegerType>(getType()).getWidth()),
             getContext());
       return getIntAttr(
-          APInt::getAllOnes(getType().cast<IntegerType>().getWidth()),
+          APInt::getAllOnes(cast<IntegerType>(getType()).getWidth()),
           getContext());
     }
 
@@ -279,10 +327,12 @@ OpFoldResult ReplicateOp::fold(FoldAdaptor adaptor) {
 }
 
 OpFoldResult ParityOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // Constant fold.
-  if (auto input = adaptor.getInput().dyn_cast_or_null<IntegerAttr>())
-    return getIntAttr(APInt(1, input.getValue().countPopulation() & 1),
-                      getContext());
+  if (auto input = dyn_cast_or_null<IntegerAttr>(adaptor.getInput()))
+    return getIntAttr(APInt(1, input.getValue().popcount() & 1), getContext());
 
   return {};
 }
@@ -301,11 +351,15 @@ static Attribute constFoldBinaryOp(ArrayRef<Attribute> operands,
 
   // Fold constants with ParamExprAttr::get which handles simple constants as
   // well as parameter expressions.
-  return hw::ParamExprAttr::get(paramOpcode, operands[0], operands[1]);
+  return hw::ParamExprAttr::get(paramOpcode, cast<TypedAttr>(operands[0]),
+                                cast<TypedAttr>(operands[1]));
 }
 
 OpFoldResult ShlOp::fold(FoldAdaptor adaptor) {
-  if (auto rhs = adaptor.getRhs().dyn_cast_or_null<IntegerAttr>()) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
+  if (auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs())) {
     unsigned shift = rhs.getValue().getZExtValue();
     unsigned width = getType().getIntOrFloatBitWidth();
     if (shift == 0)
@@ -318,12 +372,15 @@ OpFoldResult ShlOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult ShlOp::canonicalize(ShlOp op, PatternRewriter &rewriter) {
-  // ShlOp(x, cst) -> Concat(Extract(x), zeros)
-  APInt value;
-  if (!matchPattern(op.getRhs(), m_RConstant(value)))
+  if (hasOperandsOutsideOfBlock(&*op))
     return failure();
 
-  unsigned width = op.getLhs().getType().cast<IntegerType>().getWidth();
+  // ShlOp(x, cst) -> Concat(Extract(x), zeros)
+  APInt value;
+  if (!matchPattern(op.getRhs(), m_ConstantInt(&value)))
+    return failure();
+
+  unsigned width = cast<IntegerType>(op.getLhs().getType()).getWidth();
   unsigned shift = value.getZExtValue();
 
   // This case is handled by fold.
@@ -342,7 +399,10 @@ LogicalResult ShlOp::canonicalize(ShlOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult ShrUOp::fold(FoldAdaptor adaptor) {
-  if (auto rhs = adaptor.getRhs().dyn_cast_or_null<IntegerAttr>()) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
+  if (auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs())) {
     unsigned shift = rhs.getValue().getZExtValue();
     if (shift == 0)
       return getOperand(0);
@@ -355,12 +415,15 @@ OpFoldResult ShrUOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult ShrUOp::canonicalize(ShrUOp op, PatternRewriter &rewriter) {
-  // ShrUOp(x, cst) -> Concat(zeros, Extract(x))
-  APInt value;
-  if (!matchPattern(op.getRhs(), m_RConstant(value)))
+  if (hasOperandsOutsideOfBlock(&*op))
     return failure();
 
-  unsigned width = op.getLhs().getType().cast<IntegerType>().getWidth();
+  // ShrUOp(x, cst) -> Concat(zeros, Extract(x))
+  APInt value;
+  if (!matchPattern(op.getRhs(), m_ConstantInt(&value)))
+    return failure();
+
+  unsigned width = cast<IntegerType>(op.getLhs().getType()).getWidth();
   unsigned shift = value.getZExtValue();
 
   // This case is handled by fold.
@@ -379,7 +442,10 @@ LogicalResult ShrUOp::canonicalize(ShrUOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult ShrSOp::fold(FoldAdaptor adaptor) {
-  if (auto rhs = adaptor.getRhs().dyn_cast_or_null<IntegerAttr>()) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
+  if (auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs())) {
     if (rhs.getValue().getZExtValue() == 0)
       return getOperand(0);
   }
@@ -387,12 +453,15 @@ OpFoldResult ShrSOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult ShrSOp::canonicalize(ShrSOp op, PatternRewriter &rewriter) {
-  // ShrSOp(x, cst) -> Concat(replicate(extract(x, topbit)),extract(x))
-  APInt value;
-  if (!matchPattern(op.getRhs(), m_RConstant(value)))
+  if (hasOperandsOutsideOfBlock(&*op))
     return failure();
 
-  unsigned width = op.getLhs().getType().cast<IntegerType>().getWidth();
+  // ShrSOp(x, cst) -> Concat(replicate(extract(x, topbit)),extract(x))
+  APInt value;
+  if (!matchPattern(op.getRhs(), m_ConstantInt(&value)))
+    return failure();
+
+  unsigned width = cast<IntegerType>(op.getLhs().getType()).getWidth();
   unsigned shift = value.getZExtValue();
 
   auto topbit =
@@ -416,13 +485,16 @@ LogicalResult ShrSOp::canonicalize(ShrSOp op, PatternRewriter &rewriter) {
 //===----------------------------------------------------------------------===//
 
 OpFoldResult ExtractOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // If we are extracting the entire input, then return it.
   if (getInput().getType() == getType())
     return getInput();
 
   // Constant fold.
-  if (auto input = adaptor.getInput().dyn_cast_or_null<IntegerAttr>()) {
-    unsigned dstWidth = getType().cast<IntegerType>().getWidth();
+  if (auto input = dyn_cast_or_null<IntegerAttr>(adaptor.getInput())) {
+    unsigned dstWidth = cast<IntegerType>(getType()).getWidth();
     return getIntAttr(input.getValue().lshr(getLowBit()).trunc(dstWidth),
                       getContext());
   }
@@ -478,7 +550,7 @@ static LogicalResult extractConcatToConcatExtract(ExtractOp op,
          "lowBit");
 
   SmallVector<Value> reverseConcatArgs;
-  size_t widthRemaining = op.getType().cast<IntegerType>().getWidth();
+  size_t widthRemaining = cast<IntegerType>(op.getType()).getWidth();
   size_t extractLo = lowBit - beginOfFirstRelevantElement;
 
   // Transform individual arguments of innerCat(..., a, b, c,) into
@@ -515,7 +587,7 @@ static LogicalResult extractConcatToConcatExtract(ExtractOp op,
 // Transforms extract(lo, replicate(a, N)) into replicate(a, N-c).
 static bool extractFromReplicate(ExtractOp op, ReplicateOp replicate,
                                  PatternRewriter &rewriter) {
-  auto extractResultWidth = op.getType().cast<IntegerType>().getWidth();
+  auto extractResultWidth = cast<IntegerType>(op.getType()).getWidth();
   auto replicateEltWidth =
       replicate.getOperand().getType().getIntOrFloatBitWidth();
 
@@ -544,6 +616,9 @@ static bool extractFromReplicate(ExtractOp op, ReplicateOp replicate,
 }
 
 LogicalResult ExtractOp::canonicalize(ExtractOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   auto *inputOp = op.getInput().getDefiningOp();
 
   // This turns out to be incredibly expensive.  Disable until performance is
@@ -551,7 +626,7 @@ LogicalResult ExtractOp::canonicalize(ExtractOp op, PatternRewriter &rewriter) {
 #if 0
   // If the extracted bits are all known, then return the result.
   auto knownBits = computeKnownBits(op.getInput())
-                       .extractBits(op.getType().cast<IntegerType>().getWidth(),
+                       .extractBits(cast<IntegerType>(op.getType()).getWidth(),
                                     op.getLowBit());
   if (knownBits.isConstant()) {
     replaceOpWithNewOpAndCopyName<hw::ConstantOp>(rewriter, op,
@@ -583,7 +658,7 @@ LogicalResult ExtractOp::canonicalize(ExtractOp op, PatternRewriter &rewriter) {
       isa<AndOp, OrOp, XorOp>(inputOp)) {
     if (auto cstRHS = inputOp->getOperand(1).getDefiningOp<hw::ConstantOp>()) {
       auto extractedCst = cstRHS.getValue().extractBits(
-          op.getType().cast<IntegerType>().getWidth(), op.getLowBit());
+          cast<IntegerType>(op.getType()).getWidth(), op.getLowBit());
       if (isa<OrOp, XorOp>(inputOp) && extractedCst.isZero()) {
         replaceOpWithNewOpAndCopyName<ExtractOp>(
             rewriter, op, op.getType(), inputOp->getOperand(0), op.getLowBit());
@@ -599,7 +674,7 @@ LogicalResult ExtractOp::canonicalize(ExtractOp op, PatternRewriter &rewriter) {
         // contiguous series of ones.
         unsigned lz = extractedCst.countLeadingZeros();
         unsigned tz = extractedCst.countTrailingZeros();
-        unsigned pop = extractedCst.countPopulation();
+        unsigned pop = extractedCst.popcount();
         if (extractedCst.getBitWidth() - lz - tz == pop) {
           auto resultTy = rewriter.getIntegerType(pop);
           SmallVector<Value> resultElts;
@@ -621,18 +696,21 @@ LogicalResult ExtractOp::canonicalize(ExtractOp op, PatternRewriter &rewriter) {
 
   // `extract(lowBit, shl(1, x))` -> `x == lowBit` when a single bit is
   // extracted.
-  if (op.getType().cast<IntegerType>().getWidth() == 1 && inputOp)
-    if (auto shlOp = dyn_cast<ShlOp>(inputOp))
-      if (auto lhsCst = shlOp.getOperand(0).getDefiningOp<hw::ConstantOp>())
-        if (lhsCst.getValue().isOne()) {
-          auto newCst = rewriter.create<hw::ConstantOp>(
-              shlOp.getLoc(),
-              APInt(lhsCst.getValue().getBitWidth(), op.getLowBit()));
-          replaceOpWithNewOpAndCopyName<ICmpOp>(rewriter, op, ICmpPredicate::eq,
-                                                shlOp->getOperand(1), newCst,
-                                                false);
-          return success();
-        }
+  if (cast<IntegerType>(op.getType()).getWidth() == 1 && inputOp)
+    if (auto shlOp = dyn_cast<ShlOp>(inputOp)) {
+      // Don't canonicalize if the shift is multiply used.
+      if (shlOp->hasOneUse())
+        if (auto lhsCst = shlOp.getLhs().getDefiningOp<hw::ConstantOp>())
+          if (lhsCst.getValue().isOne()) {
+            auto newCst = rewriter.create<hw::ConstantOp>(
+                shlOp.getLoc(),
+                APInt(lhsCst.getValue().getBitWidth(), op.getLowBit()));
+            replaceOpWithNewOpAndCopyName<ICmpOp>(
+                rewriter, op, ICmpPredicate::eq, shlOp->getOperand(1), newCst,
+                false);
+            return success();
+          }
+    }
 
   return failure();
 }
@@ -657,7 +735,7 @@ static Attribute constFoldAssociativeOp(ArrayRef<Attribute> operands,
     SmallVector<mlir::TypedAttr> typedOperands;
     typedOperands.reserve(operands.size());
     for (auto operand : operands) {
-      if (auto typedOperand = operand.dyn_cast<mlir::TypedAttr>())
+      if (auto typedOperand = dyn_cast<mlir::TypedAttr>(operand))
         typedOperands.push_back(typedOperand);
       else
         break;
@@ -753,8 +831,32 @@ static bool canonicalizeLogicalCstWithConcat(Operation *logicalOp,
   return true;
 }
 
+// Determines whether the inputs to a logical element are of opposite
+// comparisons and can lowered into a constant.
+static bool canCombineOppositeBinCmpIntoConstant(OperandRange operands) {
+  llvm::SmallDenseSet<std::tuple<ICmpPredicate, Value, Value>> seenPredicates;
+
+  for (auto op : operands) {
+    if (auto icmpOp = op.getDefiningOp<ICmpOp>();
+        icmpOp && icmpOp.getTwoState()) {
+      auto predicate = icmpOp.getPredicate();
+      auto lhs = icmpOp.getLhs();
+      auto rhs = icmpOp.getRhs();
+      if (seenPredicates.contains(
+              {ICmpOp::getNegatedPredicate(predicate), lhs, rhs}))
+        return true;
+
+      seenPredicates.insert({predicate, lhs, rhs});
+    }
+  }
+  return false;
+}
+
 OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
-  APInt value = APInt::getAllOnes(getType().cast<IntegerType>().getWidth());
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
+  APInt value = APInt::getAllOnes(cast<IntegerType>(getType()).getWidth());
 
   auto inputs = adaptor.getInputs();
 
@@ -762,14 +864,14 @@ OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
   for (auto operand : inputs) {
     if (!operand)
       continue;
-    value &= operand.cast<IntegerAttr>().getValue();
+    value &= cast<IntegerAttr>(operand).getValue();
     if (value.isZero())
       return getIntAttr(value, getContext());
   }
 
   // and(x, -1) -> x.
   if (inputs.size() == 2 && inputs[1] &&
-      inputs[1].cast<IntegerAttr>().getValue().isAllOnes())
+      cast<IntegerAttr>(inputs[1]).getValue().isAllOnes())
     return getInputs()[0];
 
   // and(x, x, x) -> x.  This also handles and(x) -> x.
@@ -784,10 +886,17 @@ OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
       for (Value arg2 : getInputs())
         if (arg2 == subExpr)
           return getIntAttr(
-              APInt::getZero(getType().cast<IntegerType>().getWidth()),
+              APInt::getZero(cast<IntegerType>(getType()).getWidth()),
               getContext());
     }
   }
+
+  // x0 = icmp(pred, x, y)
+  // x1 = icmp(!pred, x, y)
+  // and(x0, x1) -> 0
+  if (canCombineOppositeBinCmpIntoConstant(getInputs()))
+    return getIntAttr(APInt::getZero(cast<IntegerType>(getType()).getWidth()),
+                      getContext());
 
   // Constant fold
   return constFoldAssociativeOp(inputs, hw::PEO::And);
@@ -835,15 +944,48 @@ static Value getCommonOperand(Op op) {
 /// Example: `and(x, y, x, z)` -> `and(x, y, z)`
 template <typename Op>
 static bool canonicalizeIdempotentInputs(Op op, PatternRewriter &rewriter) {
+  // Depth limit to search, in operations.  Chosen arbitrarily, keep small.
+  constexpr unsigned limit = 3;
   auto inputs = op.getInputs();
-  llvm::SmallSetVector<Value, 8> uniqueInputs;
 
-  for (const auto input : inputs)
-    uniqueInputs.insert(input);
+  llvm::SmallSetVector<Value, 8> uniqueInputs(inputs.begin(), inputs.end());
+  llvm::SmallDenseSet<Op, 8> checked;
+  checked.insert(op);
+
+  struct OpWithDepth {
+    Op op;
+    unsigned depth;
+  };
+  llvm::SmallVector<OpWithDepth, 8> worklist;
+
+  auto enqueue = [&worklist, &checked, &op](Value input, unsigned depth) {
+    // Add to worklist if within depth limit, is defined in the same block by
+    // the same kind of operation, has same two-state-ness, and not enqueued
+    // previously.
+    if (depth < limit && input.getParentBlock() == op->getBlock()) {
+      auto inputOp = input.template getDefiningOp<Op>();
+      if (inputOp && inputOp.getTwoState() == op.getTwoState() &&
+          checked.insert(inputOp).second)
+        worklist.push_back({inputOp, depth + 1});
+    }
+  };
+
+  for (auto input : uniqueInputs)
+    enqueue(input, 0);
+
+  while (!worklist.empty()) {
+    auto item = worklist.pop_back_val();
+
+    for (auto input : item.op.getInputs()) {
+      uniqueInputs.remove(input);
+      enqueue(input, item.depth);
+    }
+  }
 
   if (uniqueInputs.size() < inputs.size()) {
     replaceOpWithNewOpAndCopyName<Op>(rewriter, op, op.getType(),
-                                      uniqueInputs.getArrayRef());
+                                      uniqueInputs.getArrayRef(),
+                                      op.getTwoState());
     return true;
   }
 
@@ -853,16 +995,24 @@ static bool canonicalizeIdempotentInputs(Op op, PatternRewriter &rewriter) {
 LogicalResult AndOp::canonicalize(AndOp op, PatternRewriter &rewriter) {
   auto inputs = op.getInputs();
   auto size = inputs.size();
-  assert(size > 1 && "expected 2 or more operands, `fold` should handle this");
+
+  // and(x, and(...)) -> and(x, ...) -- flatten
+  if (tryFlatteningOperands(op, rewriter))
+    return success();
 
   // and(..., x, ..., x) -> and(..., x, ...) -- idempotent
+  // and(..., x, and(..., x, ...)) -> and(..., and(..., x, ...)) -- idempotent
   // Trivial and(x), and(x, x) cases are handled by [AndOp::fold] above.
-  if (size > 2 && canonicalizeIdempotentInputs(op, rewriter))
+  if (size > 1 && canonicalizeIdempotentInputs(op, rewriter))
     return success();
+
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+  assert(size > 1 && "expected 2 or more operands, `fold` should handle this");
 
   // Patterns for and with a constant on RHS.
   APInt value;
-  if (matchPattern(inputs.back(), m_RConstant(value))) {
+  if (matchPattern(inputs.back(), m_ConstantInt(&value))) {
     // and(..., '1) -> and(...) -- identity
     if (value.isAllOnes()) {
       replaceOpWithNewOpAndCopyName<AndOp>(rewriter, op, op.getType(),
@@ -874,7 +1024,7 @@ LogicalResult AndOp::canonicalize(AndOp op, PatternRewriter &rewriter) {
     // end. and(..., c1, c2) -> and(..., c3) where c3 = c1 & c2 -- constant
     // folding
     APInt value2;
-    if (matchPattern(inputs[size - 2], m_RConstant(value2))) {
+    if (matchPattern(inputs[size - 2], m_ConstantInt(&value2))) {
       auto cst = rewriter.create<hw::ConstantOp>(op.getLoc(), value & value2);
       SmallVector<Value, 4> newOperands(inputs.drop_back(/*n=*/2));
       newOperands.push_back(cst);
@@ -962,10 +1112,6 @@ LogicalResult AndOp::canonicalize(AndOp op, PatternRewriter &rewriter) {
     }
   }
 
-  // and(x, and(...)) -> and(x, ...) -- flatten
-  if (tryFlatteningOperands(op, rewriter))
-    return success();
-
   // extracts only of and(...) -> and(extract()...)
   if (narrowOperationWidth(op, true, rewriter))
     return success();
@@ -984,20 +1130,23 @@ LogicalResult AndOp::canonicalize(AndOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
-  auto value = APInt::getZero(getType().cast<IntegerType>().getWidth());
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
+  auto value = APInt::getZero(cast<IntegerType>(getType()).getWidth());
   auto inputs = adaptor.getInputs();
   // or(x, 10, 01) -> 11
   for (auto operand : inputs) {
     if (!operand)
       continue;
-    value |= operand.cast<IntegerAttr>().getValue();
+    value |= cast<IntegerAttr>(operand).getValue();
     if (value.isAllOnes())
       return getIntAttr(value, getContext());
   }
 
   // or(x, 0) -> x
   if (inputs.size() == 2 && inputs[1] &&
-      inputs[1].cast<IntegerAttr>().getValue().isZero())
+      cast<IntegerAttr>(inputs[1]).getValue().isZero())
     return getInputs()[0];
 
   // or(x, x, x) -> x.  This also handles or(x) -> x
@@ -1012,129 +1161,44 @@ OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
       for (Value arg2 : getInputs())
         if (arg2 == subExpr)
           return getIntAttr(
-              APInt::getAllOnes(getType().cast<IntegerType>().getWidth()),
+              APInt::getAllOnes(cast<IntegerType>(getType()).getWidth()),
               getContext());
     }
   }
+
+  // x0 = icmp(pred, x, y)
+  // x1 = icmp(!pred, x, y)
+  // or(x0, x1) -> 1
+  if (canCombineOppositeBinCmpIntoConstant(getInputs()))
+    return getIntAttr(
+        APInt::getAllOnes(cast<IntegerType>(getType()).getWidth()),
+        getContext());
 
   // Constant fold
   return constFoldAssociativeOp(inputs, hw::PEO::Or);
 }
 
-/// Simplify concat ops in an or op when a constant operand is present in either
-/// concat.
-///
-/// This will invert an or(concat, concat) into concat(or, or, ...), which can
-/// often be further simplified due to the smaller or ops being easier to fold.
-///
-/// For example:
-///
-/// or(..., concat(x, 0), concat(0, y))
-///    ==> or(..., concat(x, 0, y)), when x and y don't overlap.
-///
-/// or(..., concat(x: i2, cst1: i4), concat(cst2: i5, y: i1))
-///    ==> or(..., concat(or(x: i2,               extract(cst2, 4..3)),
-///                       or(extract(cst1, 3..1), extract(cst2, 2..0)),
-///                       or(extract(cst1, 0..0), y: i1))
-static bool canonicalizeOrOfConcatsWithCstOperands(OrOp op, size_t concatIdx1,
-                                                   size_t concatIdx2,
-                                                   PatternRewriter &rewriter) {
-  assert(concatIdx1 < concatIdx2 && "concatIdx1 must be < concatIdx2");
-
-  auto inputs = op.getInputs();
-  auto concat1 = inputs[concatIdx1].getDefiningOp<ConcatOp>();
-  auto concat2 = inputs[concatIdx2].getDefiningOp<ConcatOp>();
-
-  assert(concat1 && concat2 && "expected indexes to point to ConcatOps");
-
-  // We can simplify as long as a constant is present in either concat.
-  bool hasConstantOp1 =
-      llvm::any_of(concat1->getOperands(), [&](Value operand) -> bool {
-        return operand.getDefiningOp<hw::ConstantOp>();
-      });
-  if (!hasConstantOp1) {
-    bool hasConstantOp2 =
-        llvm::any_of(concat2->getOperands(), [&](Value operand) -> bool {
-          return operand.getDefiningOp<hw::ConstantOp>();
-        });
-    if (!hasConstantOp2)
-      return false;
-  }
-
-  SmallVector<Value> newConcatOperands;
-
-  // Simultaneously iterate over the operands of both concat ops, from MSB to
-  // LSB, pushing out or's of overlapping ranges of the operands. When operands
-  // span different bit ranges, we extract only the maximum overlap.
-  auto operands1 = concat1->getOperands();
-  auto operands2 = concat2->getOperands();
-  // Number of bits already consumed from operands 1 and 2, respectively.
-  unsigned consumedWidth1 = 0;
-  unsigned consumedWidth2 = 0;
-  for (auto it1 = operands1.begin(), end1 = operands1.end(),
-            it2 = operands2.begin(), end2 = operands2.end();
-       it1 != end1 && it2 != end2;) {
-    auto operand1 = *it1;
-    auto operand2 = *it2;
-
-    unsigned remainingWidth1 =
-        hw::getBitWidth(operand1.getType()) - consumedWidth1;
-    unsigned remainingWidth2 =
-        hw::getBitWidth(operand2.getType()) - consumedWidth2;
-    unsigned widthToConsume = std::min(remainingWidth1, remainingWidth2);
-    auto narrowedType = rewriter.getIntegerType(widthToConsume);
-
-    auto extract1 = rewriter.createOrFold<ExtractOp>(
-        op.getLoc(), narrowedType, operand1, remainingWidth1 - widthToConsume);
-    auto extract2 = rewriter.createOrFold<ExtractOp>(
-        op.getLoc(), narrowedType, operand2, remainingWidth2 - widthToConsume);
-
-    newConcatOperands.push_back(
-        rewriter.createOrFold<OrOp>(op.getLoc(), extract1, extract2, false));
-
-    consumedWidth1 += widthToConsume;
-    consumedWidth2 += widthToConsume;
-
-    if (widthToConsume == remainingWidth1) {
-      ++it1;
-      consumedWidth1 = 0;
-    }
-    if (widthToConsume == remainingWidth2) {
-      ++it2;
-      consumedWidth2 = 0;
-    }
-  }
-
-  ConcatOp newOp = rewriter.create<ConcatOp>(op.getLoc(), newConcatOperands);
-
-  // Copy the old operands except for concatIdx1 and concatIdx2, and append the
-  // new ConcatOp to the end.
-  SmallVector<Value> newOrOperands;
-  newOrOperands.append(inputs.begin(), inputs.begin() + concatIdx1);
-  newOrOperands.append(inputs.begin() + concatIdx1 + 1,
-                       inputs.begin() + concatIdx2);
-  newOrOperands.append(inputs.begin() + concatIdx2 + 1,
-                       inputs.begin() + inputs.size());
-  newOrOperands.push_back(newOp);
-
-  replaceOpWithNewOpAndCopyName<OrOp>(rewriter, op, op.getType(),
-                                      newOrOperands);
-  return true;
-}
-
 LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
   auto inputs = op.getInputs();
   auto size = inputs.size();
-  assert(size > 1 && "expected 2 or more operands");
+
+  // or(x, or(...)) -> or(x, ...) -- flatten
+  if (tryFlatteningOperands(op, rewriter))
+    return success();
 
   // or(..., x, ..., x, ...) -> or(..., x) -- idempotent
+  // or(..., x, or(..., x, ...)) -> or(..., or(..., x, ...)) -- idempotent
   // Trivial or(x), or(x, x) cases are handled by [OrOp::fold].
-  if (size > 2 && canonicalizeIdempotentInputs(op, rewriter))
+  if (size > 1 && canonicalizeIdempotentInputs(op, rewriter))
     return success();
+
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+  assert(size > 1 && "expected 2 or more operands");
 
   // Patterns for and with a constant on RHS.
   APInt value;
-  if (matchPattern(inputs.back(), m_RConstant(value))) {
+  if (matchPattern(inputs.back(), m_ConstantInt(&value))) {
     // or(..., '0) -> or(...) -- identity
     if (value.isZero()) {
       replaceOpWithNewOpAndCopyName<OrOp>(rewriter, op, op.getType(),
@@ -1144,7 +1208,7 @@ LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
 
     // or(..., c1, c2) -> or(..., c3) where c3 = c1 | c2 -- constant folding
     APInt value2;
-    if (matchPattern(inputs[size - 2], m_RConstant(value2))) {
+    if (matchPattern(inputs[size - 2], m_ConstantInt(&value2))) {
       auto cst = rewriter.create<hw::ConstantOp>(op.getLoc(), value | value2);
       SmallVector<Value, 4> newOperands(inputs.drop_back(/*n=*/2));
       newOperands.push_back(cst);
@@ -1163,20 +1227,6 @@ LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
     }
   }
 
-  // or(x, or(...)) -> or(x, ...) -- flatten
-  if (tryFlatteningOperands(op, rewriter))
-    return success();
-
-  // or(..., concat(x, cst1), concat(cst2, y)
-  //    ==> or(..., concat(x, cst3, y)), when x and y don't overlap.
-  for (size_t i = 0; i < size - 1; ++i) {
-    if (auto concat = inputs[i].getDefiningOp<ConcatOp>())
-      for (size_t j = i + 1; j < size; ++j)
-        if (auto concat = inputs[j].getDefiningOp<ConcatOp>())
-          if (canonicalizeOrOfConcatsWithCstOperands(op, i, j, rewriter))
-            return success();
-  }
-
   // extracts only of or(...) -> or(extract()...)
   if (narrowOperationWidth(op, true, rewriter))
     return success();
@@ -1190,11 +1240,41 @@ LogicalResult OrOp::canonicalize(OrOp op, PatternRewriter &rewriter) {
     return success();
   }
 
+  // or(mux(c_1, a, 0), mux(c_2, a, 0), ..., mux(c_n, a, 0)) -> mux(or(c_1, c_2,
+  // .., c_n), a, 0)
+  if (auto firstMux = op.getOperand(0).getDefiningOp<comb::MuxOp>()) {
+    APInt value;
+    if (op.getTwoState() && firstMux.getTwoState() &&
+        matchPattern(firstMux.getFalseValue(), m_ConstantInt(&value)) &&
+        value.isZero()) {
+      SmallVector<Value> conditions{firstMux.getCond()};
+      auto check = [&](Value v) {
+        auto mux = v.getDefiningOp<comb::MuxOp>();
+        if (!mux)
+          return false;
+        conditions.push_back(mux.getCond());
+        return mux.getTwoState() &&
+               firstMux.getTrueValue() == mux.getTrueValue() &&
+               firstMux.getFalseValue() == mux.getFalseValue();
+      };
+      if (llvm::all_of(op.getOperands().drop_front(), check)) {
+        auto cond = rewriter.create<comb::OrOp>(op.getLoc(), conditions, true);
+        replaceOpWithNewOpAndCopyName<comb::MuxOp>(
+            rewriter, op, cond, firstMux.getTrueValue(),
+            firstMux.getFalseValue(), true);
+        return success();
+      }
+    }
+  }
+
   /// TODO: or(..., x, not(x)) -> or(..., '1) -- complement
   return failure();
 }
 
 OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   auto size = getInputs().size();
   auto inputs = adaptor.getInputs();
 
@@ -1208,7 +1288,7 @@ OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
 
   // xor(x, 0) -> x
   if (inputs.size() == 2 && inputs[1] &&
-      inputs[1].cast<IntegerAttr>().getValue().isZero())
+      cast<IntegerAttr>(inputs[1]).getValue().isZero())
     return getInputs()[0];
 
   // xor(xor(x,1),1) -> x
@@ -1247,6 +1327,9 @@ static void canonicalizeXorIcmpTrue(XorOp op, unsigned icmpOperand,
 }
 
 LogicalResult XorOp::canonicalize(XorOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   auto inputs = op.getInputs();
   auto size = inputs.size();
   assert(size > 1 && "expected 2 or more operands");
@@ -1262,7 +1345,7 @@ LogicalResult XorOp::canonicalize(XorOp op, PatternRewriter &rewriter) {
 
   // Patterns for xor with a constant on RHS.
   APInt value;
-  if (matchPattern(inputs.back(), m_RConstant(value))) {
+  if (matchPattern(inputs.back(), m_ConstantInt(&value))) {
     // xor(..., 0) -> xor(...) -- identity
     if (value.isZero()) {
       replaceOpWithNewOpAndCopyName<XorOp>(rewriter, op, op.getType(),
@@ -1272,7 +1355,7 @@ LogicalResult XorOp::canonicalize(XorOp op, PatternRewriter &rewriter) {
 
     // xor(..., c1, c2) -> xor(..., c3) where c3 = c1 ^ c2.
     APInt value2;
-    if (matchPattern(inputs[size - 2], m_RConstant(value2))) {
+    if (matchPattern(inputs[size - 2], m_ConstantInt(&value2))) {
       auto cst = rewriter.create<hw::ConstantOp>(op.getLoc(), value ^ value2);
       SmallVector<Value, 4> newOperands(inputs.drop_back(/*n=*/2));
       newOperands.push_back(cst);
@@ -1322,6 +1405,9 @@ LogicalResult XorOp::canonicalize(XorOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // sub(x - x) -> 0
   if (getRhs() == getLhs())
     return getIntAttr(
@@ -1335,13 +1421,14 @@ OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
       auto negOne = getIntAttr(
           APInt::getAllOnes(getLhs().getType().getIntOrFloatBitWidth()),
           getContext());
-      auto rhsNeg =
-          hw::ParamExprAttr::get(hw::PEO::Mul, adaptor.getRhs(), negOne);
-      return hw::ParamExprAttr::get(hw::PEO::Add, adaptor.getLhs(), rhsNeg);
+      auto rhsNeg = hw::ParamExprAttr::get(
+          hw::PEO::Mul, cast<TypedAttr>(adaptor.getRhs()), negOne);
+      return hw::ParamExprAttr::get(hw::PEO::Add,
+                                    cast<TypedAttr>(adaptor.getLhs()), rhsNeg);
     }
 
     // sub(x - 0) -> x
-    if (auto rhsC = adaptor.getRhs().dyn_cast<IntegerAttr>()) {
+    if (auto rhsC = dyn_cast<IntegerAttr>(adaptor.getRhs())) {
       if (rhsC.getValue().isZero())
         return getLhs();
     }
@@ -1351,9 +1438,12 @@ OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult SubOp::canonicalize(SubOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   // sub(x, cst) -> add(x, -cst)
   APInt value;
-  if (matchPattern(op.getRhs(), m_RConstant(value))) {
+  if (matchPattern(op.getRhs(), m_ConstantInt(&value))) {
     auto negCst = rewriter.create<hw::ConstantOp>(op.getLoc(), -value);
     replaceOpWithNewOpAndCopyName<AddOp>(rewriter, op, op.getLhs(), negCst,
                                          false);
@@ -1368,6 +1458,9 @@ LogicalResult SubOp::canonicalize(SubOp op, PatternRewriter &rewriter) {
 }
 
 OpFoldResult AddOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   auto size = getInputs().size();
 
   // add(x) -> x -- noop
@@ -1379,6 +1472,9 @@ OpFoldResult AddOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   auto inputs = op.getInputs();
   auto size = inputs.size();
   assert(size > 1 && "expected 2 or more operands");
@@ -1386,15 +1482,15 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
   APInt value, value2;
 
   // add(..., 0) -> add(...) -- identity
-  if (matchPattern(inputs.back(), m_RConstant(value)) && value.isZero()) {
+  if (matchPattern(inputs.back(), m_ConstantInt(&value)) && value.isZero()) {
     replaceOpWithNewOpAndCopyName<AddOp>(rewriter, op, op.getType(),
                                          inputs.drop_back(), false);
     return success();
   }
 
   // add(..., c1, c2) -> add(..., c3) where c3 = c1 + c2 -- constant folding
-  if (matchPattern(inputs[size - 1], m_RConstant(value)) &&
-      matchPattern(inputs[size - 2], m_RConstant(value2))) {
+  if (matchPattern(inputs[size - 1], m_ConstantInt(&value)) &&
+      matchPattern(inputs[size - 2], m_ConstantInt(&value2))) {
     auto cst = rewriter.create<hw::ConstantOp>(op.getLoc(), value + value2);
     SmallVector<Value, 4> newOperands(inputs.drop_back(/*n=*/2));
     newOperands.push_back(cst);
@@ -1420,7 +1516,7 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
   auto shlOp = inputs[size - 1].getDefiningOp<comb::ShlOp>();
   // add(..., x, shl(x, c)) -> add(..., mul(x, (1 << c) + 1))
   if (shlOp && shlOp.getLhs() == inputs[size - 2] &&
-      matchPattern(shlOp.getRhs(), m_RConstant(value))) {
+      matchPattern(shlOp.getRhs(), m_ConstantInt(&value))) {
 
     APInt one(/*numBits=*/value.getBitWidth(), 1, /*isSigned=*/false);
     auto rhs =
@@ -1440,7 +1536,7 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
   // add(..., x, mul(x, c)) -> add(..., mul(x, c + 1))
   if (mulOp && mulOp.getInputs().size() == 2 &&
       mulOp.getInputs()[0] == inputs[size - 2] &&
-      matchPattern(mulOp.getInputs()[1], m_RConstant(value))) {
+      matchPattern(mulOp.getInputs()[1], m_ConstantInt(&value))) {
 
     APInt one(/*numBits=*/value.getBitWidth(), 1, /*isSigned=*/false);
     auto rhs = rewriter.create<hw::ConstantOp>(op.getLoc(), value + one);
@@ -1454,7 +1550,7 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
     return success();
   }
 
-  // add(x, add(...)) -> add(x, ...) -- flatten
+  // add(a, add(...)) -> add(a, ...) -- flatten
   if (tryFlatteningOperands(op, rewriter))
     return success();
 
@@ -1462,10 +1558,26 @@ LogicalResult AddOp::canonicalize(AddOp op, PatternRewriter &rewriter) {
   if (narrowOperationWidth(op, false, rewriter))
     return success();
 
+  // add(add(x, c1), c2) -> add(x, c1 + c2)
+  auto addOp = inputs[0].getDefiningOp<comb::AddOp>();
+  if (addOp && addOp.getInputs().size() == 2 &&
+      matchPattern(addOp.getInputs()[1], m_ConstantInt(&value2)) &&
+      inputs.size() == 2 && matchPattern(inputs[1], m_ConstantInt(&value))) {
+
+    auto rhs = rewriter.create<hw::ConstantOp>(op.getLoc(), value + value2);
+    replaceOpWithNewOpAndCopyName<AddOp>(
+        rewriter, op, op.getType(), ArrayRef<Value>{addOp.getInputs()[0], rhs},
+        /*twoState=*/op.getTwoState() && addOp.getTwoState());
+    return success();
+  }
+
   return failure();
 }
 
 OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   auto size = getInputs().size();
   auto inputs = adaptor.getInputs();
 
@@ -1473,14 +1585,14 @@ OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
   if (size == 1u)
     return getInputs()[0];
 
-  auto width = getType().cast<IntegerType>().getWidth();
+  auto width = cast<IntegerType>(getType()).getWidth();
   APInt value(/*numBits=*/width, 1, /*isSigned=*/false);
 
   // mul(x, 0, 1) -> 0 -- annulment
   for (auto operand : inputs) {
     if (!operand)
       continue;
-    value *= operand.cast<IntegerAttr>().getValue();
+    value *= cast<IntegerAttr>(operand).getValue();
     if (value.isZero())
       return getIntAttr(value, getContext());
   }
@@ -1490,6 +1602,9 @@ OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult MulOp::canonicalize(MulOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   auto inputs = op.getInputs();
   auto size = inputs.size();
   assert(size > 1 && "expected 2 or more operands");
@@ -1497,7 +1612,7 @@ LogicalResult MulOp::canonicalize(MulOp op, PatternRewriter &rewriter) {
   APInt value, value2;
 
   // mul(x, c) -> shl(x, log2(c)), where c is a power of two.
-  if (size == 2 && matchPattern(inputs.back(), m_RConstant(value)) &&
+  if (size == 2 && matchPattern(inputs.back(), m_ConstantInt(&value)) &&
       value.isPowerOf2()) {
     auto shift = rewriter.create<hw::ConstantOp>(op.getLoc(), op.getType(),
                                                  value.exactLogBase2());
@@ -1510,15 +1625,15 @@ LogicalResult MulOp::canonicalize(MulOp op, PatternRewriter &rewriter) {
   }
 
   // mul(..., 1) -> mul(...) -- identity
-  if (matchPattern(inputs.back(), m_RConstant(value)) && value.isOne()) {
+  if (matchPattern(inputs.back(), m_ConstantInt(&value)) && value.isOne()) {
     replaceOpWithNewOpAndCopyName<MulOp>(rewriter, op, op.getType(),
                                          inputs.drop_back());
     return success();
   }
 
   // mul(..., c1, c2) -> mul(..., c3) where c3 = c1 * c2 -- constant folding
-  if (matchPattern(inputs[size - 1], m_RConstant(value)) &&
-      matchPattern(inputs[size - 2], m_RConstant(value2))) {
+  if (matchPattern(inputs[size - 1], m_ConstantInt(&value)) &&
+      matchPattern(inputs[size - 2], m_ConstantInt(&value2))) {
     auto cst = rewriter.create<hw::ConstantOp>(op.getLoc(), value * value2);
     SmallVector<Value, 4> newOperands(inputs.drop_back(/*n=*/2));
     newOperands.push_back(cst);
@@ -1540,7 +1655,7 @@ LogicalResult MulOp::canonicalize(MulOp op, PatternRewriter &rewriter) {
 
 template <class Op, bool isSigned>
 static OpFoldResult foldDiv(Op op, ArrayRef<Attribute> constants) {
-  if (auto rhsValue = constants[1].dyn_cast_or_null<IntegerAttr>()) {
+  if (auto rhsValue = dyn_cast_or_null<IntegerAttr>(constants[1])) {
     // divu(x, 1) -> x, divs(x, 1) -> x
     if (rhsValue.getValue() == 1)
       return op.getLhs();
@@ -1554,16 +1669,22 @@ static OpFoldResult foldDiv(Op op, ArrayRef<Attribute> constants) {
 }
 
 OpFoldResult DivUOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   return foldDiv<DivUOp, /*isSigned=*/false>(*this, adaptor.getOperands());
 }
 
 OpFoldResult DivSOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   return foldDiv<DivSOp, /*isSigned=*/true>(*this, adaptor.getOperands());
 }
 
 template <class Op, bool isSigned>
 static OpFoldResult foldMod(Op op, ArrayRef<Attribute> constants) {
-  if (auto rhsValue = constants[1].dyn_cast_or_null<IntegerAttr>()) {
+  if (auto rhsValue = dyn_cast_or_null<IntegerAttr>(constants[1])) {
     // modu(x, 1) -> 0, mods(x, 1) -> 0
     if (rhsValue.getValue() == 1)
       return getIntAttr(APInt::getZero(op.getType().getIntOrFloatBitWidth()),
@@ -1574,7 +1695,7 @@ static OpFoldResult foldMod(Op op, ArrayRef<Attribute> constants) {
       return {};
   }
 
-  if (auto lhsValue = constants[0].dyn_cast_or_null<IntegerAttr>()) {
+  if (auto lhsValue = dyn_cast_or_null<IntegerAttr>(constants[0])) {
     // modu(0, x) -> 0, mods(0, x) -> 0
     if (lhsValue.getValue().isZero())
       return getIntAttr(APInt::getZero(op.getType().getIntOrFloatBitWidth()),
@@ -1585,10 +1706,16 @@ static OpFoldResult foldMod(Op op, ArrayRef<Attribute> constants) {
 }
 
 OpFoldResult ModUOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   return foldMod<ModUOp, /*isSigned=*/false>(*this, adaptor.getOperands());
 }
 
 OpFoldResult ModSOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   return foldMod<ModSOp, /*isSigned=*/true>(*this, adaptor.getOperands());
 }
 //===----------------------------------------------------------------------===//
@@ -1597,12 +1724,15 @@ OpFoldResult ModSOp::fold(FoldAdaptor adaptor) {
 
 // Constant folding
 OpFoldResult ConcatOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   if (getNumOperands() == 1)
     return getOperand(0);
 
   // If all the operands are constant, we can fold.
   for (auto attr : adaptor.getInputs())
-    if (!attr || !attr.isa<IntegerAttr>())
+    if (!attr || !isa<IntegerAttr>(attr))
       return {};
 
   // If we got here, we can constant fold.
@@ -1612,7 +1742,7 @@ OpFoldResult ConcatOp::fold(FoldAdaptor adaptor) {
   unsigned nextInsertion = resultWidth;
   // Insert each chunk into the result.
   for (auto attr : adaptor.getInputs()) {
-    auto chunk = attr.cast<IntegerAttr>().getValue();
+    auto chunk = cast<IntegerAttr>(attr).getValue();
     nextInsertion -= chunk.getBitWidth();
     result.insertBits(chunk, nextInsertion);
   }
@@ -1621,6 +1751,9 @@ OpFoldResult ConcatOp::fold(FoldAdaptor adaptor) {
 }
 
 LogicalResult ConcatOp::canonicalize(ConcatOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   auto inputs = op.getInputs();
   auto size = inputs.size();
   assert(size > 1 && "expected 2 or more operands");
@@ -1710,7 +1843,7 @@ LogicalResult ConcatOp::canonicalize(ConcatOp op, PatternRewriter &rewriter) {
       if (auto extract = inputs[i].getDefiningOp<ExtractOp>()) {
         if (auto prevExtract = inputs[i - 1].getDefiningOp<ExtractOp>()) {
           if (extract.getInput() == prevExtract.getInput()) {
-            auto thisWidth = extract.getType().cast<IntegerType>().getWidth();
+            auto thisWidth = cast<IntegerType>(extract.getType()).getWidth();
             if (prevExtract.getLowBit() == extract.getLowBit() + thisWidth) {
               auto prevWidth = prevExtract.getType().getIntOrFloatBitWidth();
               auto resType = rewriter.getIntegerType(thisWidth + prevWidth);
@@ -1731,7 +1864,7 @@ LogicalResult ConcatOp::canonicalize(ConcatOp op, PatternRewriter &rewriter) {
         Value index;
         size_t width;
         static std::optional<ArraySlice> get(Value value) {
-          assert(value.getType().isa<IntegerType>() && "expected integer type");
+          assert(isa<IntegerType>(value.getType()) && "expected integer type");
           if (auto arrayGet = value.getDefiningOp<hw::ArrayGetOp>())
             return ArraySlice{arrayGet.getInput(), arrayGet.getIndex(), 1};
           // array slice op is wrapped with bitcast.
@@ -1740,7 +1873,8 @@ LogicalResult ConcatOp::canonicalize(ConcatOp op, PatternRewriter &rewriter) {
                     bitcast.getInput().getDefiningOp<hw::ArraySliceOp>())
               return ArraySlice{
                   arraySlice.getInput(), arraySlice.getLowIndex(),
-                  hw::type_cast<hw::ArrayType>(arraySlice.getType()).getSize()};
+                  hw::type_cast<hw::ArrayType>(arraySlice.getType())
+                      .getNumElements()};
           return std::nullopt;
         }
       };
@@ -1783,21 +1917,27 @@ LogicalResult ConcatOp::canonicalize(ConcatOp op, PatternRewriter &rewriter) {
 //===----------------------------------------------------------------------===//
 
 OpFoldResult MuxOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // mux (c, b, b) -> b
-  if (getTrueValue() == getFalseValue())
+  if (getTrueValue() == getFalseValue() && getTrueValue() != getResult())
     return getTrueValue();
+  if (auto tv = adaptor.getTrueValue())
+    if (tv == adaptor.getFalseValue())
+      return tv;
 
   // mux(0, a, b) -> b
   // mux(1, a, b) -> a
-  if (auto pred = adaptor.getCond().dyn_cast_or_null<IntegerAttr>()) {
+  if (auto pred = dyn_cast_or_null<IntegerAttr>(adaptor.getCond())) {
     if (pred.getValue().isZero())
       return getFalseValue();
     return getTrueValue();
   }
 
   // mux(cond, 1, 0) -> cond
-  if (auto tv = adaptor.getTrueValue().dyn_cast_or_null<IntegerAttr>())
-    if (auto fv = adaptor.getFalseValue().dyn_cast_or_null<IntegerAttr>())
+  if (auto tv = dyn_cast_or_null<IntegerAttr>(adaptor.getTrueValue()))
+    if (auto fv = dyn_cast_or_null<IntegerAttr>(adaptor.getFalseValue()))
       if (tv.getValue().isOne() && fv.getValue().isZero() &&
           hw::getBitWidth(getType()) == 1)
         return getCond();
@@ -1928,7 +2068,7 @@ static bool foldMuxChain(MuxOp rootMux, bool isFalseSide,
 
   // If the array is greater that 9 bits, it will take over 512 elements and
   // it will be too large for a single expression.
-  auto indexWidth = indexValue.getType().cast<IntegerType>().getWidth();
+  auto indexWidth = cast<IntegerType>(indexValue.getType()).getWidth();
   if (indexWidth >= 9)
     return false;
 
@@ -1985,7 +2125,8 @@ static Value extractOperandFromFullyAssociative(Operation *fullyAssoc,
 
   // If the operation has a single use, mutate it in place.
   if (fullyAssoc->hasOneUse()) {
-    fullyAssoc->eraseOperand(operandNo);
+    rewriter.modifyOpInPlace(fullyAssoc,
+                             [&]() { fullyAssoc->eraseOperand(operandNo); });
     return fullyAssoc->getResult(0);
   }
 
@@ -2042,6 +2183,9 @@ static bool foldCommonMuxValue(MuxOp op, bool isTrueOperand,
   // `mux(cond, mux(cond2, a, b), a)` -> `mux(~cond|cond2, a, b)`
   // `mux(cond, mux(cond2, b, a), a)` -> `mux(~cond|~cond2, a, b)`
   if (auto subMux = dyn_cast<MuxOp>(subExpr)) {
+    if (subMux == op)
+      return false;
+
     Value otherValue;
     Value subCond = subMux.getCond();
 
@@ -2232,9 +2376,15 @@ struct MuxRewriter : public mlir::OpRewritePattern<MuxOp> {
 
 LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
                                            PatternRewriter &rewriter) const {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
+  // If the op has a SV attribute, don't optimize it.
+  if (hasSVAttributes(op))
+    return failure();
   APInt value;
 
-  if (matchPattern(op.getTrueValue(), m_RConstant(value))) {
+  if (matchPattern(op.getTrueValue(), m_ConstantInt(&value))) {
     if (value.getBitWidth() == 1) {
       // mux(a, 0, b) -> and(~a, b) for single-bit values.
       if (value.isZero()) {
@@ -2252,7 +2402,7 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
 
     // Check for mux of two constants.  There are many ways to simplify them.
     APInt value2;
-    if (matchPattern(op.getFalseValue(), m_RConstant(value2))) {
+    if (matchPattern(op.getFalseValue(), m_ConstantInt(&value2))) {
       // When both inputs are constants and differ by only one bit, we can
       // simplify by splitting the mux into up to three contiguous chunks: one
       // for the differing bit and up to two for the bits that are the same.
@@ -2301,7 +2451,7 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
     }
   }
 
-  if (matchPattern(op.getFalseValue(), m_RConstant(value)) &&
+  if (matchPattern(op.getFalseValue(), m_ConstantInt(&value)) &&
       value.getBitWidth() == 1) {
     // mux(a, b, 0) -> and(a, b) for single-bit values.
     if (value.isZero()) {
@@ -2367,8 +2517,8 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
     }
   }
 
-  if (auto falseMux =
-          dyn_cast_or_null<MuxOp>(op.getFalseValue().getDefiningOp())) {
+  if (auto falseMux = op.getFalseValue().getDefiningOp<MuxOp>();
+      falseMux && falseMux != op) {
     // mux(selector, x, mux(selector, y, z) = mux(selector, x, z)
     if (op.getCond() == falseMux.getCond()) {
       replaceOpWithNewOpAndCopyName<MuxOp>(
@@ -2382,8 +2532,8 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
       return success();
   }
 
-  if (auto trueMux =
-          dyn_cast_or_null<MuxOp>(op.getTrueValue().getDefiningOp())) {
+  if (auto trueMux = op.getTrueValue().getDefiningOp<MuxOp>();
+      trueMux && trueMux != op) {
     // mux(selector, mux(selector, a, b), c) = mux(selector, a, c)
     if (op.getCond() == trueMux.getCond()) {
       replaceOpWithNewOpAndCopyName<MuxOp>(
@@ -2401,10 +2551,11 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
   if (auto trueMux = dyn_cast_or_null<MuxOp>(op.getTrueValue().getDefiningOp()),
       falseMux = dyn_cast_or_null<MuxOp>(op.getFalseValue().getDefiningOp());
       trueMux && falseMux && trueMux.getCond() == falseMux.getCond() &&
-      trueMux.getTrueValue() == falseMux.getTrueValue()) {
+      trueMux.getTrueValue() == falseMux.getTrueValue() && trueMux != op &&
+      falseMux != op) {
     auto subMux = rewriter.create<MuxOp>(
-        rewriter.getFusedLoc(trueMux.getLoc(), falseMux.getLoc()), op.getCond(),
-        trueMux.getFalseValue(), falseMux.getFalseValue());
+        rewriter.getFusedLoc({trueMux.getLoc(), falseMux.getLoc()}),
+        op.getCond(), trueMux.getFalseValue(), falseMux.getFalseValue());
     replaceOpWithNewOpAndCopyName<MuxOp>(rewriter, op, trueMux.getCond(),
                                          trueMux.getTrueValue(), subMux,
                                          op.getTwoStateAttr());
@@ -2415,10 +2566,11 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
   if (auto trueMux = dyn_cast_or_null<MuxOp>(op.getTrueValue().getDefiningOp()),
       falseMux = dyn_cast_or_null<MuxOp>(op.getFalseValue().getDefiningOp());
       trueMux && falseMux && trueMux.getCond() == falseMux.getCond() &&
-      trueMux.getFalseValue() == falseMux.getFalseValue()) {
+      trueMux.getFalseValue() == falseMux.getFalseValue() && trueMux != op &&
+      falseMux != op) {
     auto subMux = rewriter.create<MuxOp>(
-        rewriter.getFusedLoc(trueMux.getLoc(), falseMux.getLoc()), op.getCond(),
-        trueMux.getTrueValue(), falseMux.getTrueValue());
+        rewriter.getFusedLoc({trueMux.getLoc(), falseMux.getLoc()}),
+        op.getCond(), trueMux.getTrueValue(), falseMux.getTrueValue());
     replaceOpWithNewOpAndCopyName<MuxOp>(rewriter, op, trueMux.getCond(),
                                          subMux, trueMux.getFalseValue(),
                                          op.getTwoStateAttr());
@@ -2430,7 +2582,8 @@ LogicalResult MuxRewriter::matchAndRewrite(MuxOp op,
       falseMux = dyn_cast_or_null<MuxOp>(op.getFalseValue().getDefiningOp());
       trueMux && falseMux &&
       trueMux.getTrueValue() == falseMux.getTrueValue() &&
-      trueMux.getFalseValue() == falseMux.getFalseValue()) {
+      trueMux.getFalseValue() == falseMux.getFalseValue() && trueMux != op &&
+      falseMux != op) {
     auto subMux = rewriter.create<MuxOp>(
         rewriter.getFusedLoc(
             {op.getLoc(), trueMux.getLoc(), falseMux.getLoc()}),
@@ -2477,7 +2630,7 @@ static bool foldArrayOfMuxes(hw::ArrayCreateOp op, PatternRewriter &rewriter) {
   // Check the operands to the array create.  Ensure all of them are the
   // same op with the same number of operands.
   auto first = inputs[0].getDefiningOp<comb::MuxOp>();
-  if (!first)
+  if (!first || hasSVAttributes(first))
     return false;
 
   // Check whether all operands are muxes with the same condition.
@@ -2519,17 +2672,20 @@ struct ArrayRewriter : public mlir::OpRewritePattern<hw::ArrayCreateOp> {
 
   LogicalResult matchAndRewrite(hw::ArrayCreateOp op,
                                 PatternRewriter &rewriter) const override {
+    if (hasOperandsOutsideOfBlock(&*op))
+      return failure();
+
     if (foldArrayOfMuxes(op, rewriter))
       return success();
     return failure();
   }
 };
+
 } // namespace
 
 void MuxOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                         MLIRContext *context) {
-  results.insert<MuxRewriter>(context);
-  results.insert<ArrayRewriter>(context);
+  results.insert<MuxRewriter, ArrayRewriter>(context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2598,6 +2754,9 @@ static bool applyCmpPredicateToEqualOperands(ICmpPredicate predicate) {
 }
 
 OpFoldResult ICmpOp::fold(FoldAdaptor adaptor) {
+  if (hasOperandsOutsideOfBlock(getOperation()))
+    return {};
+
   // gt a, a -> false
   // gte a, a -> true
   if (getLhs() == getRhs()) {
@@ -2606,8 +2765,8 @@ OpFoldResult ICmpOp::fold(FoldAdaptor adaptor) {
   }
 
   // gt 1, 2 -> false
-  if (auto lhs = adaptor.getLhs().dyn_cast_or_null<IntegerAttr>()) {
-    if (auto rhs = adaptor.getRhs().dyn_cast_or_null<IntegerAttr>()) {
+  if (auto lhs = dyn_cast_or_null<IntegerAttr>(adaptor.getLhs())) {
+    if (auto rhs = dyn_cast_or_null<IntegerAttr>(adaptor.getRhs())) {
       auto val =
           applyCmpPredicate(getPredicate(), lhs.getValue(), rhs.getValue());
       return IntegerAttr::get(getType(), val);
@@ -2833,6 +2992,9 @@ static void combineEqualityICmpWithKnownBitsAndConstant(
 static void combineEqualityICmpWithXorOfConstant(ICmpOp cmpOp, XorOp xorOp,
                                                  const APInt &rhs,
                                                  PatternRewriter &rewriter) {
+  auto ip = rewriter.saveInsertionPoint();
+  rewriter.setInsertionPoint(xorOp);
+
   auto xorRHS = xorOp.getOperands().back().getDefiningOp<hw::ConstantOp>();
   auto newRHS = rewriter.create<hw::ConstantOp>(xorRHS->getLoc(),
                                                 xorRHS.getValue() ^ rhs);
@@ -2859,22 +3021,26 @@ static void combineEqualityICmpWithXorOfConstant(ICmpOp cmpOp, XorOp xorOp,
 
   // If the xor has multiple uses (not just the compare, then we need/want to
   // replace them as well.
-  if (xorMultipleUses) {
-    auto newXor = rewriter.create<XorOp>(xorOp.getLoc(), newLHS, xorRHS, false);
-    replaceOpAndCopyName(rewriter, xorOp, newXor->getResult(0));
-  }
+  if (xorMultipleUses)
+    replaceOpWithNewOpAndCopyName<XorOp>(rewriter, xorOp, newLHS, xorRHS,
+                                         false);
 
   // Replace the comparison.
+  rewriter.restoreInsertionPoint(ip);
   replaceOpWithNewOpAndCopyName<ICmpOp>(rewriter, cmpOp, cmpOp.getPredicate(),
                                         newLHS, newRHS, false);
 }
 
 LogicalResult ICmpOp::canonicalize(ICmpOp op, PatternRewriter &rewriter) {
+  if (hasOperandsOutsideOfBlock(&*op))
+    return failure();
+
   APInt lhs, rhs;
 
   // icmp 1, x -> icmp x, 1
-  if (matchPattern(op.getLhs(), m_RConstant(lhs))) {
-    assert(!matchPattern(op.getRhs(), m_RConstant(rhs)) && "Should be folded");
+  if (matchPattern(op.getLhs(), m_ConstantInt(&lhs))) {
+    assert(!matchPattern(op.getRhs(), m_ConstantInt(&rhs)) &&
+           "Should be folded");
     replaceOpWithNewOpAndCopyName<ICmpOp>(
         rewriter, op, ICmpOp::getFlippedPredicate(op.getPredicate()),
         op.getRhs(), op.getLhs(), op.getTwoState());
@@ -2882,7 +3048,7 @@ LogicalResult ICmpOp::canonicalize(ICmpOp op, PatternRewriter &rewriter) {
   }
 
   // Canonicalize with RHS constant
-  if (matchPattern(op.getRhs(), m_RConstant(rhs))) {
+  if (matchPattern(op.getRhs(), m_ConstantInt(&rhs))) {
     auto getConstant = [&](APInt constant) -> Value {
       return rewriter.create<hw::ConstantOp>(op.getLoc(), std::move(constant));
     };

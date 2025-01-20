@@ -4,32 +4,56 @@ llvm_canonicalize_cmake_booleans(
 
 set(CIRCT_INTEGRATION_TEST_DEPENDS
   FileCheck count not split-file
+  arcilator
   circt-opt
   circt-translate
   circt-rtl-sim
-  esi-cosim-runner
+  circt-lec
+  circt-bmc
+  circt-test
+  circt-test-runners
   firtool
   hlstool
+  kanagawatool
   handshake-runner
   )
+
+if (MLIR_ENABLE_EXECUTION_ENGINE)
+  list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS mlir-cpu-runner)
+endif()
 
 # If Python bindings are available to build then enable the tests.
 if(CIRCT_BINDINGS_PYTHON_ENABLED)
   list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS CIRCTPythonModules)
 endif()
 
-# If ESI Cosim is available to build then enable its tests.
-if (TARGET EsiCosimDpiServer)
-  list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS EsiCosimDpiServer)
-  get_property(ESI_COSIM_LIB_DIR TARGET EsiCosimDpiServer PROPERTY LIBRARY_OUTPUT_DIRECTORY)
-  set(ESI_COSIM_PATH ${ESI_COSIM_LIB_DIR}/libEsiCosimDpiServer.so)
+
+# If the ESI runtime build and test is enabled, require those components.
+llvm_canonicalize_cmake_booleans(ESI_RUNTIME)
+if (ESI_RUNTIME)
+  list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS
+    ESIRuntime
+    esitester
+  )
+
+  # If ESI Cosim is available to build then enable its tests.
+  if (TARGET EsiCosimDpiServer)
+    list(APPEND CIRCT_INTEGRATION_TEST_DEPENDS
+      EsiCosimDpiServer
+      esi-cosim
+    )
+
+  endif()
 endif()
+
+get_target_property(ESI_PrimsDir ESIPrimitives SOURCE_DIR)
+set(ESI_Prims "${ESI_PrimsDir}/ESIPrimitives.sv")
 
 set(CIRCT_INTEGRATION_TIMEOUT 60) # Set a 60s timeout on individual tests.
 configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.py.in
   ${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py
-  INTEGRATION_CONFIG
+  MAIN_CONFIG
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
 )
 

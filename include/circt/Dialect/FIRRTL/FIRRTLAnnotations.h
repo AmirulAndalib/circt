@@ -15,10 +15,15 @@
 
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Operation.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/PointerLikeTypeTraits.h"
 
 namespace circt {
+namespace hw {
+struct InnerSymbolNamespace;
+} // namespace hw
 namespace firrtl {
 
 class AnnotationSetIterator;
@@ -26,7 +31,6 @@ class FModuleOp;
 class FModuleLike;
 class MemOp;
 class InstanceOp;
-struct ModuleNamespace;
 class FIRRTLType;
 
 /// Return the name of the attribute used for annotations on FIRRTL ops.
@@ -35,20 +39,30 @@ inline StringRef getAnnotationAttrName() { return "annotations"; }
 /// Return the name of the attribute used for port annotations on FIRRTL ops.
 inline StringRef getPortAnnotationAttrName() { return "portAnnotations"; }
 
-/// Return the name of the dialect-prefixed attribute used for annotations.
-inline StringRef getDialectAnnotationAttrName() { return "firrtl.annotations"; }
-
-/// Check if an OMIR type is a string-encoded value that the FIRRTL dialect
-/// simply passes through as a string without any decoding.
-bool isOMIRStringEncodedPassthrough(StringRef type);
+inline ArrayAttr getAnnotationsIfPresent(Operation *op) {
+  return op->getAttrOfType<ArrayAttr>(getAnnotationAttrName());
+}
 
 /// This class provides a read-only projection of an annotation.
 class Annotation {
 public:
-  Annotation() {}
+  Annotation() = default;
 
   explicit Annotation(Attribute attr) : attr(attr) {
     assert(attr && "null attributes not allowed");
+  }
+
+  // Make a new annotation which is a clone of anno with a new fieldID.
+  Annotation(Annotation anno, uint64_t fieldID) : attr(anno.attr) {
+    auto oldFieldID = anno.getMember<IntegerAttr>("circt.fieldID");
+    if (oldFieldID && !fieldID) {
+      removeMember("circt.fieldID");
+      return;
+    }
+    if (fieldID)
+      setMember("circt.fieldID",
+                IntegerAttr::get(IntegerType::get(anno.attr.getContext(), 32),
+                                 APInt(32, fieldID)));
   }
 
   /// Get the data dictionary of this attribute.
@@ -127,6 +141,8 @@ private:
 ///
 class AnnotationSet {
 public:
+  using ElementType = Annotation;
+
   /// Form an empty annotation set.
   explicit AnnotationSet(MLIRContext *context)
       : annotations(ArrayAttr::get(context, {})) {}
@@ -160,7 +176,10 @@ public:
   ArrayRef<Attribute> getArray() const { return annotations.getValue(); }
 
   /// Return this annotation set as an ArrayAttr.
-  ArrayAttr getArrayAttr() const { return annotations; }
+  ArrayAttr getArrayAttr() const {
+    assert(annotations && "Cannot use null attribute set");
+    return annotations;
+  }
 
   /// Store the annotations in this set in an operation's `annotations`
   /// attribute, overwriting any existing annotations. Removes the `annotations`
@@ -174,59 +193,22 @@ public:
   bool applyToPort(FModuleLike op, size_t portNo) const;
   bool applyToPort(MemOp op, size_t portNo) const;
 
-  /// Store the annotations in this set in a `NamedAttrList` as an array
-  /// attribute with the name `annotations`. Overwrites existing annotations.
-  /// Removes the `annotations` attribute if the set is empty. Returns true if
-  /// the list was modified, false otherwise.
-  ///
-  /// This function is useful if you are in the process of modifying an
-  /// operation's attributes as a `NamedAttrList`, or you are preparing the
-  /// attributes of a operation yet to be created. In that case
-  /// `applyToAttrList` allows you to set the `annotations` attribute in that
-  /// list to the contents of this set.
-  bool applyToAttrList(NamedAttrList &attrs) const;
-
-  /// Store the annotations in this set in a `NamedAttrList` as an array
-  /// attribute with the name `firrtl.annotations`. Overwrites existing
-  /// annotations. Removes the `firrtl.annotations` attribute if the set is
-  /// empty. Returns true if the list was modified, false otherwise.
-  ///
-  /// This function is useful if you are in the process of modifying a port's
-  /// attributes as a `NamedAttrList`, or you are preparing the attributes of a
-  /// port yet to be created as part of an operation. In that case
-  /// `applyToPortAttrList` allows you to set the `firrtl.annotations` attribute
-  /// in that list to the contents of this set.
-  bool applyToPortAttrList(NamedAttrList &attrs) const;
-
-  /// Insert this annotation set into a `DictionaryAttr` under the `annotations`
-  /// key. Overwrites any existing attribute stored under `annotations`. Removes
-  /// the `annotations` attribute in the dictionary if the set is empty. Returns
-  /// the updated dictionary.
-  ///
-  /// This function is useful if you hold an operation's attributes dictionary
-  /// and want to set the `annotations` key in the dictionary to the contents of
-  /// this set.
-  DictionaryAttr applyToDictionaryAttr(DictionaryAttr attrs) const;
-  DictionaryAttr applyToDictionaryAttr(ArrayRef<NamedAttribute> attrs) const;
-
-  /// Insert this annotation set into a `DictionaryAttr` under the
-  /// `firrtl.annotations` key. Overwrites any existing attribute stored under
-  /// `firrtl.annotations`. Removes the `firrtl.annotations` attribute in the
-  /// dictionary if the set is empty. Returns the updated dictionary.
-  ///
-  /// This function is useful if you hold a port's attributes dictionary and
-  /// want to set the `firrtl.annotations` key in the dictionary to the contents
-  /// of this set.
-  DictionaryAttr applyToPortDictionaryAttr(DictionaryAttr attrs) const;
-  DictionaryAttr
-  applyToPortDictionaryAttr(ArrayRef<NamedAttribute> attrs) const;
-
   /// Return true if we have an annotation with the specified class name.
   bool hasAnnotation(StringRef className) const {
     return !annotations.empty() && hasAnnotationImpl(className);
   }
   bool hasAnnotation(StringAttr className) const {
     return !annotations.empty() && hasAnnotationImpl(className);
+  }
+
+  /// Return true if we have an annotation with the specified class name.
+  template <typename... Args>
+  static bool hasAnnotation(Operation *op, Args... args) {
+    auto annosArray = getAnnotationsIfPresent(op);
+    if (!annosArray)
+      return false;
+    AnnotationSet annotations(annosArray);
+    return !annotations.empty() && (... || annotations.hasAnnotationImpl(args));
   }
 
   /// If this annotation set has an annotation with the specified class name,
@@ -389,25 +371,6 @@ protected:
 struct AnnoTarget {
   AnnoTarget(detail::AnnoTargetImpl impl = nullptr) : impl(impl){};
 
-  template <typename U>
-  bool isa() const { // NOLINT(readability-identifier-naming)
-    assert(*this && "isa<> used on a null type.");
-    return U::classof(*this);
-  }
-  template <typename U>
-  U dyn_cast() const { // NOLINT(readability-identifier-naming)
-    return isa<U>() ? U(impl) : U(nullptr);
-  }
-  template <typename U>
-  U dyn_cast_or_null() const { // NOLINT(readability-identifier-naming)
-    return (*this && isa<U>()) ? U(impl) : U(nullptr);
-  }
-  template <typename U>
-  U cast() const {
-    assert(isa<U>());
-    return U(impl);
-  }
-
   operator bool() const { return impl; }
   bool operator==(const AnnoTarget &other) const { return impl == other.impl; }
   bool operator!=(const AnnoTarget &other) const { return !(*this == other); }
@@ -424,12 +387,8 @@ struct AnnoTarget {
   /// Get the parent module of the target.
   FModuleLike getModule() const;
 
-  /// Get the inner_sym attribute of an op.  If there is no attached inner_sym,
-  /// then one will be created and attached to the op.
-  StringAttr getInnerSym(ModuleNamespace &moduleNamespace) const;
-
   /// Get a reference to this target suitable for use in an NLA.
-  Attribute getNLAReference(ModuleNamespace &moduleNamespace) const;
+  Attribute getNLAReference(hw::InnerSymbolNamespace &moduleNamespace) const;
 
   /// Get the type of the target.
   FIRRTLType getType() const;
@@ -448,8 +407,7 @@ struct OpAnnoTarget : public AnnoTarget {
 
   AnnotationSet getAnnotations() const;
   void setAnnotations(AnnotationSet annotations) const;
-  StringAttr getInnerSym(ModuleNamespace &moduleNamespace) const;
-  Attribute getNLAReference(ModuleNamespace &moduleNamespace) const;
+  Attribute getNLAReference(hw::InnerSymbolNamespace &moduleNamespace) const;
   FIRRTLType getType() const;
 
   static bool classof(const AnnoTarget &annoTarget) {
@@ -470,28 +428,13 @@ struct PortAnnoTarget : public AnnoTarget {
 
   AnnotationSet getAnnotations() const;
   void setAnnotations(AnnotationSet annotations) const;
-  StringAttr getInnerSym(ModuleNamespace &moduleNamespace) const;
-  Attribute getNLAReference(ModuleNamespace &moduleNamespace) const;
+  Attribute getNLAReference(hw::InnerSymbolNamespace &moduleNamespace) const;
   FIRRTLType getType() const;
 
   static bool classof(const AnnoTarget &annoTarget) {
     return annoTarget.getImpl().isPort();
   }
 };
-
-//===----------------------------------------------------------------------===//
-// Utilities for Specific Annotations
-//
-// TODO: Remove these in favor of first-class annotations.
-//===----------------------------------------------------------------------===//
-
-/// Utility that searches for a MarkDUTAnnotation on a specific module, `mod`,
-/// and tries to update a design-under-test (DUT), `dut`, with this module if
-/// the module is the DUT.  This function returns success if either no DUT was
-/// found or if the DUT was found and a previous DUT was not set (if `dut` is
-/// null).  This returns failure if a DUT was found and a previous DUT was set.
-/// This function generates an error message in the failure case.
-LogicalResult extractDUT(FModuleOp mod, FModuleOp &dut);
 
 } // namespace firrtl
 } // namespace circt
@@ -501,6 +444,24 @@ LogicalResult extractDUT(FModuleOp mod, FModuleOp &dut);
 //===----------------------------------------------------------------------===//
 
 namespace llvm {
+
+/// Add support for llvm style casts to AnnoTarget.
+template <typename To, typename From>
+struct CastInfo<
+    To, From,
+    std::enable_if_t<std::is_base_of_v<::circt::firrtl::AnnoTarget, From>>>
+    : NullableValueCastFailed<To>,
+      DefaultDoCastIfPossible<To, From, CastInfo<To, From>> {
+  static inline bool isPossible(From target) {
+    // Allow constant upcasting.  This also gets around the fact that AnnoTarget
+    // does not implement classof.
+    if constexpr (std::is_base_of_v<To, From>)
+      return true;
+    else
+      return To::classof(target);
+  }
+  static inline To doCast(From target) { return To(target.getImpl()); }
+};
 
 /// Make `Annotation` behave like a `Attribute` in terms of pointer-likeness.
 template <>
@@ -532,7 +493,7 @@ struct DenseMapInfo<circt::firrtl::Annotation> {
   static unsigned getHashValue(Annotation val) {
     return mlir::hash_value(val.getAttr());
   }
-  static bool isEqual(Annotation LHS, Annotation RHS) { return LHS == RHS; }
+  static bool isEqual(Annotation lhs, Annotation rhs) { return lhs == rhs; }
 };
 
 /// Make `AnnoTarget` hash.

@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLVisitors.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
@@ -20,18 +19,25 @@
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_LOWERCHIRRTLPASS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
 using namespace chirrtl;
 
 namespace {
-struct LowerCHIRRTLPass : public LowerCHIRRTLPassBase<LowerCHIRRTLPass>,
-                          public CHIRRTLVisitor<LowerCHIRRTLPass>,
-                          public FIRRTLVisitor<LowerCHIRRTLPass> {
+struct LowerCHIRRTLPass
+    : public circt::firrtl::impl::LowerCHIRRTLPassBase<LowerCHIRRTLPass>,
+      public CHIRRTLVisitor<LowerCHIRRTLPass>,
+      public FIRRTLVisitor<LowerCHIRRTLPass> {
 
   using FIRRTLVisitor<LowerCHIRRTLPass>::visitDecl;
   using FIRRTLVisitor<LowerCHIRRTLPass>::visitExpr;
@@ -46,7 +52,7 @@ struct LowerCHIRRTLPass : public LowerCHIRRTLPassBase<LowerCHIRRTLPass>,
   void visitExpr(SubfieldOp op);
   void visitExpr(SubindexOp op);
   void visitStmt(ConnectOp op);
-  void visitStmt(StrictConnectOp op);
+  void visitStmt(MatchingConnectOp op);
   void visitUnhandledOp(Operation *op);
 
   // Chain the CHIRRTL visitor to the FIRRTL visitor.
@@ -125,10 +131,10 @@ struct LowerCHIRRTLPass : public LowerCHIRRTLPassBase<LowerCHIRRTLPass>,
 static void forEachLeaf(ImplicitLocOpBuilder &builder, Value value,
                         llvm::function_ref<void(Value)> func) {
   auto type = value.getType();
-  if (auto bundleType = type.dyn_cast<BundleType>()) {
+  if (auto bundleType = type_dyn_cast<BundleType>(type)) {
     for (size_t i = 0, e = bundleType.getNumElements(); i < e; ++i)
       forEachLeaf(builder, builder.create<SubfieldOp>(value, i), func);
-  } else if (auto vectorType = type.dyn_cast<FVectorType>()) {
+  } else if (auto vectorType = type_dyn_cast<FVectorType>(type)) {
     for (size_t i = 0, e = vectorType.getNumElements(); i != e; ++i)
       forEachLeaf(builder, builder.create<SubindexOp>(value, i), func);
   } else {
@@ -244,7 +250,7 @@ MemDirAttr LowerCHIRRTLPass::inferMemoryPortKind(MemoryPortOp memPort) {
         } else {
           element.mode |= MemDirAttr::Read;
         }
-      } else if (auto connectOp = dyn_cast<StrictConnectOp>(user)) {
+      } else if (auto connectOp = dyn_cast<MatchingConnectOp>(user)) {
         if (use.get() == connectOp.getDest()) {
           element.mode |= MemDirAttr::Write;
         } else {
@@ -277,7 +283,7 @@ void LowerCHIRRTLPass::replaceMem(Operation *cmem, StringRef name,
   opsToDelete.push_back(cmem);
   ++numLoweredMems;
 
-  auto cmemType = cmem->getResult(0).getType().cast<CMemoryType>();
+  auto cmemType = type_cast<CMemoryType>(cmem->getResult(0).getType());
   auto depth = cmemType.getNumElements();
   auto type = cmemType.getElementType();
 
@@ -349,14 +355,15 @@ void LowerCHIRRTLPass::replaceMem(Operation *cmem, StringRef name,
 
   // Create the memory.
   ImplicitLocOpBuilder memBuilder(cmem->getLoc(), cmem);
+  auto symOp = cast<hw::InnerSymbolOpInterface>(cmem);
   auto memory = memBuilder.create<MemOp>(
       resultTypes, readLatency, writeLatency, depth, ruw,
       memBuilder.getArrayAttr(resultNames), name,
       cmem->getAttrOfType<firrtl::NameKindEnumAttr>("nameKind").getValue(),
-      annotations, memBuilder.getArrayAttr(portAnnotations), hw::InnerSymAttr(),
-      IntegerAttr(), cmem->getAttrOfType<firrtl::MemoryInitAttr>("init"));
-  if (auto innerSym = cmem->getAttr("inner_sym"))
-    memory->setAttr("inner_sym", innerSym);
+      annotations, memBuilder.getArrayAttr(portAnnotations),
+      symOp.getInnerSymAttr(),
+      cmem->getAttrOfType<firrtl::MemoryInitAttr>("init"),
+      cmem->getAttrOfType<StringAttr>("prefix"));
   ++numCreatedMems;
 
   // Process each memory port, initializing the memory port and inferring when
@@ -459,7 +466,7 @@ void LowerCHIRRTLPass::replaceMem(Operation *cmem, StringRef name,
                 if (cmemoryPortAccess.getIndex() == connectOp.getDest())
                   return !dyn_cast_or_null<InvalidValueOp>(
                       connectOp.getSrc().getDefiningOp());
-              } else if (auto connectOp = dyn_cast<StrictConnectOp>(op)) {
+              } else if (auto connectOp = dyn_cast<MatchingConnectOp>(op)) {
                 if (cmemoryPortAccess.getIndex() == connectOp.getDest())
                   return !dyn_cast_or_null<InvalidValueOp>(
                       connectOp.getSrc().getDefiningOp());
@@ -469,15 +476,15 @@ void LowerCHIRRTLPass::replaceMem(Operation *cmem, StringRef name,
 
         // At each location where we drive a value to the index, set the enable.
         for (auto *driver : drivers) {
-          OpBuilder(driver).create<StrictConnectOp>(driver->getLoc(), enable,
-                                                    getConst(1));
+          ImplicitLocOpBuilder builder(driver->getLoc(), driver);
+          emitConnect(builder, enable, getConst(1));
           success = true;
         }
       } else if (isa<NodeOp>(indexOp)) {
         // If using a Node for the address, then the we place the enable at the
         // Node op's
-        OpBuilder(indexOp).create<StrictConnectOp>(indexOp->getLoc(), enable,
-                                                   getConst(1));
+        ImplicitLocOpBuilder builder(indexOp->getLoc(), indexOp);
+        emitConnect(builder, enable, getConst(1));
         success = true;
       }
 
@@ -536,7 +543,7 @@ void LowerCHIRRTLPass::visitStmt(ConnectOp connect) {
   }
 }
 
-void LowerCHIRRTLPass::visitStmt(StrictConnectOp connect) {
+void LowerCHIRRTLPass::visitStmt(MatchingConnectOp connect) {
   // Check if we are writing to a memory and, if we are, replace the
   // destination.
   auto writeIt = wdataValues.find(connect.getDest());

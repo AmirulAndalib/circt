@@ -10,49 +10,46 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
-#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
-#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
-#include "llvm/ADT/DepthFirstIterator.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "mem-to-reg-of-vec"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_MEMTOREGOFVEC
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
 
 namespace {
-struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
+struct MemToRegOfVecPass
+    : public circt::firrtl::impl::MemToRegOfVecBase<MemToRegOfVecPass> {
   MemToRegOfVecPass(bool replSeqMem, bool ignoreReadEnable)
       : replSeqMem(replSeqMem), ignoreReadEnable(ignoreReadEnable){};
 
   void runOnOperation() override {
     auto circtOp = getOperation();
-    DenseSet<Operation *> dutModuleSet;
+    auto &instanceInfo = getAnalysis<InstanceInfo>();
+
     if (!AnnotationSet::removeAnnotations(circtOp,
                                           convertMemToRegOfVecAnnoClass))
-      return;
-    auto *body = circtOp.getBodyBlock();
+      return markAllAnalysesPreserved();
 
-    // Find the device under test and create a set of all modules underneath it.
-    auto it = llvm::find_if(*body, [&](Operation &op) -> bool {
-      return AnnotationSet(&op).hasAnnotation(dutAnnoClass);
-    });
-    if (it != body->end()) {
-      auto &instanceGraph = getAnalysis<InstanceGraph>();
-      auto *node = instanceGraph.lookup(&(*it));
-      llvm::for_each(llvm::depth_first(node), [&](hw::InstanceGraphNode *node) {
-        dutModuleSet.insert(node->getModule());
-      });
-    }
+    DenseSet<Operation *> dutModuleSet;
+    for (auto moduleOp : circtOp.getOps<FModuleOp>())
+      if (instanceInfo.anyInstanceInEffectiveDesign(moduleOp))
+        dutModuleSet.insert(moduleOp);
 
     mlir::parallelForEach(circtOp.getContext(), dutModuleSet,
                           [&](Operation *op) {
@@ -92,13 +89,13 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
       return pipeInput;
 
     while (stages--) {
-      auto reg = b.create<RegOp>(pipeInput.getType(), clock,
-                                 moduleNamespace.newName(name));
+      auto reg = b.create<RegOp>(pipeInput.getType(), clock, name).getResult();
       if (gate) {
-        b.create<WhenOp>(gate, /*withElseRegion*/ false,
-                         [&]() { b.create<StrictConnectOp>(reg, pipeInput); });
+        b.create<WhenOp>(gate, /*withElseRegion*/ false, [&]() {
+          b.create<MatchingConnectOp>(reg, pipeInput);
+        });
       } else
-        b.create<StrictConnectOp>(reg, pipeInput);
+        b.create<MatchingConnectOp>(reg, pipeInput);
 
       pipeInput = reg;
     }
@@ -123,7 +120,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
   }
 
   Value getMask(ImplicitLocOpBuilder &builder, Value bundle) {
-    auto bType = bundle.getType().cast<FIRRTLType>().cast<BundleType>();
+    auto bType = type_cast<BundleType>(bundle.getType());
     if (bType.getElement("mask"))
       return builder.create<SubfieldOp>(bundle, "mask");
     return builder.create<SubfieldOp>(bundle, "wmask");
@@ -131,7 +128,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
 
   Value getData(ImplicitLocOpBuilder &builder, Value bundle,
                 bool getWdata = false) {
-    auto bType = bundle.getType().cast<FIRRTLType>().cast<BundleType>();
+    auto bType = type_cast<BundleType>(bundle.getType());
     if (bType.getElement("data"))
       return builder.create<SubfieldOp>(bundle, "data");
     if (bType.getElement("rdata") && !getWdata)
@@ -164,15 +161,15 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     Value rdata = builder.create<SubaccessOp>(regOfVec, addr);
     if (!ignoreReadEnable) {
       // Initialize read data out with invalid.
-      builder.create<StrictConnectOp>(
+      builder.create<MatchingConnectOp>(
           data, builder.create<InvalidValueOp>(data.getType()));
       // If enable is true, then connect the data read from memory register.
       builder.create<WhenOp>(enable, /*withElseRegion*/ false, [&]() {
-        builder.create<StrictConnectOp>(data, rdata);
+        builder.create<MatchingConnectOp>(data, rdata);
       });
     } else {
       // Ignore read enable signal.
-      builder.create<StrictConnectOp>(data, rdata);
+      builder.create<MatchingConnectOp>(data, rdata);
     }
   }
 
@@ -188,7 +185,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     wdataIn = addPipelineStages(builder, numStages, clock, wdataIn, "wdata");
     maskBits = addPipelineStages(builder, numStages, clock, maskBits, "wmask");
     // Create the register access.
-    auto rdata = builder.create<SubaccessOp>(regOfVec, addr);
+    FIRRTLBaseValue rdata = builder.create<SubaccessOp>(regOfVec, addr);
 
     // The tuple for the access to individual fields of an aggregate data type.
     // Tuple::<register, data, mask>
@@ -225,7 +222,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
         auto maskField = std::get<2>(regDataMask);
         // If mask, then update the register field.
         builder.create<WhenOp>(maskField, /*withElseRegion*/ false, [&]() {
-          builder.create<StrictConnectOp>(regField, dataField);
+          builder.create<MatchingConnectOp>(regField, dataField);
         });
       }
     });
@@ -255,7 +252,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
       return;
     }
     // Initialize read data out with invalid.
-    builder.create<StrictConnectOp>(
+    builder.create<MatchingConnectOp>(
         rdataOut, builder.create<InvalidValueOp>(rdataOut.getType()));
     // If enable:
     builder.create<WhenOp>(enable, /*withElseRegion*/ false, [&]() {
@@ -272,12 +269,12 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
               // If mask true, then set the field.
               builder.create<WhenOp>(
                   maskField, /*withElseRegion*/ false, [&]() {
-                    builder.create<StrictConnectOp>(regField, dataField);
+                    builder.create<MatchingConnectOp>(regField, dataField);
                   });
             }
           },
           // Read block:
-          [&]() { builder.create<StrictConnectOp>(rdataOut, rdata); });
+          [&]() { builder.create<MatchingConnectOp>(rdataOut, rdata); });
     });
   }
 
@@ -294,11 +291,11 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
 
     // Check if the number of fields of mask and input type match.
     auto isValidMask = [&](FIRRTLType inType, FIRRTLType maskType) -> bool {
-      if (auto bundle = inType.dyn_cast<BundleType>()) {
-        if (auto mBundle = maskType.dyn_cast<BundleType>())
+      if (auto bundle = type_dyn_cast<BundleType>(inType)) {
+        if (auto mBundle = type_dyn_cast<BundleType>(maskType))
           return mBundle.getNumElements() == bundle.getNumElements();
-      } else if (auto vec = inType.dyn_cast<FVectorType>()) {
-        if (auto mVec = maskType.dyn_cast<FVectorType>())
+      } else if (auto vec = type_dyn_cast<FVectorType>(inType)) {
+        if (auto mVec = type_dyn_cast<FVectorType>(maskType))
           return mVec.getNumElements() == vec.getNumElements();
       } else
         return true;
@@ -307,12 +304,12 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
 
     std::function<bool(Value, Value, Value)> flatAccess =
         [&](Value reg, Value input, Value mask) -> bool {
-      FIRRTLType inType = input.getType().cast<FIRRTLType>();
-      if (!isValidMask(inType, mask.getType().cast<FIRRTLType>())) {
+      FIRRTLType inType = type_cast<FIRRTLType>(input.getType());
+      if (!isValidMask(inType, type_cast<FIRRTLType>(mask.getType()))) {
         input.getDefiningOp()->emitOpError("Mask type is not valid");
         return false;
       }
-      return TypeSwitch<FIRRTLType, bool>(inType)
+      return FIRRTLTypeSwitch<FIRRTLType, bool>(inType)
           .Case<BundleType>([&](BundleType bundle) {
             for (size_t i = 0, e = bundle.getNumElements(); i != e; ++i) {
               auto regField = builder.create<SubfieldOp>(reg, i);
@@ -348,11 +345,11 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
                          ImplicitLocOpBuilder &builder) {
     AnnotationSet annos(attr);
     SmallVector<Attribute> regAnnotations;
-    auto vecType = op.getType().cast<FVectorType>();
+    auto vecType = type_cast<FVectorType>(op.getResult().getType());
     for (auto anno : annos) {
       if (anno.isClass(memTapSourceClass)) {
-        for (size_t i = 0,
-                    e = op.getType().cast<FVectorType>().getNumElements();
+        for (size_t i = 0, e = type_cast<FVectorType>(op.getResult().getType())
+                                   .getNumElements();
              i != e; ++i) {
           NamedAttrList newAnno;
           newAnno.append("class", anno.getMember("class"));
@@ -376,7 +373,6 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
   /// Generate the logic for implementing the memory using Registers.
   void generateMemory(MemOp memOp, FirMemory &firMem) {
     ImplicitLocOpBuilder builder(memOp.getLoc(), memOp);
-    moduleNamespace.add(memOp->getParentOfType<FModuleOp>());
     auto dataType = memOp.getDataType();
 
     auto innerSym = memOp.getInnerSym();
@@ -386,7 +382,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     for (size_t index = 0, rend = memOp.getNumResults(); index < rend;
          ++index) {
       auto result = memOp.getResult(index);
-      if (result.getType().cast<FIRRTLType>().isa<RefType>()) {
+      if (type_isa<RefType>(result.getType())) {
         debugPorts.push_back(result);
         continue;
       }
@@ -397,7 +393,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
           (memOp.getName() + "_" + memOp.getPortName(index).getValue()).str(),
           memOp.getNameKind());
       result.replaceAllUsesWith(wire.getResult());
-      result = wire;
+      result = wire.getResult();
       // Create an access to all the common subfields.
       auto adr = getAddr(builder, result);
       auto enb = getEnable(builder, result);
@@ -417,16 +413,17 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
       }
       auto portKind = memOp.getPortKind(index);
       if (portKind == MemOp::PortKind::Read) {
-        generateRead(firMem, clk, adr, enb, dta, regOfVec, builder);
+        generateRead(firMem, clk, adr, enb, dta, regOfVec.getResult(), builder);
       } else if (portKind == MemOp::PortKind::Write) {
         auto mask = getMask(builder, result);
-        generateWrite(firMem, clk, adr, enb, mask, dta, regOfVec, builder);
+        generateWrite(firMem, clk, adr, enb, mask, dta, regOfVec.getResult(),
+                      builder);
       } else {
         auto wmode = getWmode(builder, result);
         auto wDta = getData(builder, result, true);
         auto mask = getMask(builder, result);
         generateReadWrite(firMem, clk, adr, enb, mask, wDta, dta, wmode,
-                          regOfVec, builder);
+                          regOfVec.getResult(), builder);
       }
     }
     // If a valid register is created, then replace all the debug port users
@@ -434,13 +431,12 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     // RefSend on the register.
     if (regOfVec)
       for (auto r : debugPorts)
-        r.replaceAllUsesWith(builder.create<RefSendOp>(regOfVec));
+        r.replaceAllUsesWith(builder.create<RefSendOp>(regOfVec.getResult()));
   }
 
 private:
   bool replSeqMem;
   bool ignoreReadEnable;
-  ModuleNamespace moduleNamespace;
 };
 } // end anonymous namespace
 

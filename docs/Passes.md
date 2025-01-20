@@ -8,9 +8,21 @@ This document describes the available CIRCT passes and their contracts.
 
 [include "CIRCTConversionPasses.md"]
 
+## Arc Dialect Passes
+
+[include "ArcPasses.md"]
+
 ## Calyx Dialect Passes
 
 [include "CalyxPasses.md"]
+
+## Comb Dialect Passes
+
+[include "CombPasses.md"]
+
+## DC Dialect Passes
+
+[include "DCPasses.md"]
 
 ## ESI Dialect Passes
 
@@ -32,6 +44,10 @@ This document describes the available CIRCT passes and their contracts.
 
 [include "HWPasses.md"]
 
+## Kanagawa Dialect Passes
+
+[include "KanagawaPasses.md"]
+
 ## LLHD Dialect Passes
 
 [include "LLHDPasses.md"]
@@ -39,6 +55,10 @@ This document describes the available CIRCT passes and their contracts.
 ## MSFT Dialect Passes
 
 [include "MSFTPasses.md"]
+
+## OM Dialect Passes
+
+[include "OMPasses.md"]
 
 ## Pipeline Dialect Passes
 
@@ -55,3 +75,7 @@ This document describes the available CIRCT passes and their contracts.
 ## SV Dialect Passes
 
 [include "SVPasses.md"]
+
+## SystemC Dialect Passes
+
+[include "SystemCPasses.md"]

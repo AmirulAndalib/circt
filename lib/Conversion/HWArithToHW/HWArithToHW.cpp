@@ -11,15 +11,22 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HWArithToHW.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/ConversionPatterns.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HWArith/HWArithOps.h"
 #include "circt/Dialect/MSFT/MSFTOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/Pass/Pass.h"
+
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+#define GEN_PASS_DEF_HWARITHTOHW
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -49,13 +56,12 @@ improveNamehint(Value oldValue, Operation *newOp,
 // Extract a bit range, specified via start bit and width, from a given value.
 static Value extractBits(OpBuilder &builder, Location loc, Value value,
                          unsigned startBit, unsigned bitWidth) {
-  SmallVector<Value, 1> result;
-  builder.createOrFold<comb::ExtractOp>(result, loc, value, startBit, bitWidth);
-  Value extractedValue = result[0];
-  if (extractedValue != value) {
+  Value extractedValue =
+      builder.createOrFold<comb::ExtractOp>(loc, value, startBit, bitWidth);
+  Operation *definingOp = extractedValue.getDefiningOp();
+  if (extractedValue != value && definingOp) {
     // only change namehint if a new operation was created.
-    auto *newOp = extractedValue.getDefiningOp();
-    improveNamehint(value, newOp, [&](StringRef oldNamehint) {
+    improveNamehint(value, definingOp, [&](StringRef oldNamehint) {
       return (oldNamehint + "_" + std::to_string(startBit) + "_to_" +
               std::to_string(startBit + bitWidth))
           .str();
@@ -80,10 +86,8 @@ static Value extendTypeWidth(OpBuilder &builder, Location loc, Value value,
     // Sign extension
     Value highBit = extractBits(builder, loc, value,
                                 /*startBit=*/sourceWidth - 1, /*bitWidth=*/1);
-    SmallVector<Value, 1> result;
-    builder.createOrFold<comb::ReplicateOp>(result, loc, highBit,
-                                            extensionLength);
-    extensionBits = result[0];
+    extensionBits =
+        builder.createOrFold<comb::ReplicateOp>(loc, highBit, extensionLength);
   } else {
     // Zero extension
     extensionBits = builder
@@ -102,6 +106,58 @@ static Value extendTypeWidth(OpBuilder &builder, Location loc, Value value,
   return extOp->getOpResult(0);
 }
 
+static bool isSignednessType(Type type) {
+  auto match =
+      llvm::TypeSwitch<Type, bool>(type)
+          .Case<IntegerType>([](auto type) { return !type.isSignless(); })
+          .Case<hw::ArrayType>(
+              [](auto type) { return isSignednessType(type.getElementType()); })
+          .Case<hw::StructType>([](auto type) {
+            return llvm::any_of(type.getElements(), [](auto element) {
+              return isSignednessType(element.type);
+            });
+          })
+          .Case<hw::InOutType>(
+              [](auto type) { return isSignednessType(type.getElementType()); })
+          .Case<hw::TypeAliasType>(
+              [](auto type) { return isSignednessType(type.getInnerType()); })
+          .Default([](auto type) { return false; });
+
+  return match;
+}
+
+static bool isSignednessAttr(Attribute attr) {
+  if (auto typeAttr = dyn_cast<TypeAttr>(attr))
+    return isSignednessType(typeAttr.getValue());
+  return false;
+}
+
+/// Returns true if the given `op` is considered as legal for HWArith
+/// conversion.
+static bool isLegalOp(Operation *op) {
+  if (auto funcOp = dyn_cast<FunctionOpInterface>(op)) {
+    return llvm::none_of(funcOp.getArgumentTypes(), isSignednessType) &&
+           llvm::none_of(funcOp.getResultTypes(), isSignednessType) &&
+           llvm::none_of(funcOp.getFunctionBody().getArgumentTypes(),
+                         isSignednessType);
+  }
+
+  if (auto modOp = dyn_cast<hw::HWModuleLike>(op)) {
+    return llvm::none_of(modOp.getPortTypes(), isSignednessType) &&
+           llvm::none_of(modOp.getModuleBody().getArgumentTypes(),
+                         isSignednessType);
+  }
+
+  auto attrs = llvm::map_range(op->getAttrs(), [](const NamedAttribute &attr) {
+    return attr.getValue();
+  });
+
+  bool operandsOK = llvm::none_of(op->getOperandTypes(), isSignednessType);
+  bool resultsOK = llvm::none_of(op->getResultTypes(), isSignednessType);
+  bool attrsOK = llvm::none_of(attrs, isSignednessAttr);
+  return operandsOK && resultsOK && attrsOK;
+}
+
 //===----------------------------------------------------------------------===//
 // Conversion patterns
 //===----------------------------------------------------------------------===//
@@ -118,9 +174,6 @@ struct ConstantOpLowering : public OpConversionPattern<ConstantOp> {
     return success();
   }
 };
-} // namespace
-
-namespace {
 struct DivOpLowering : public OpConversionPattern<DivOp> {
   using OpConversionPattern<DivOp>::OpConversionPattern;
 
@@ -129,9 +182,9 @@ struct DivOpLowering : public OpConversionPattern<DivOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto isLhsTypeSigned =
-        op.getOperand(0).getType().template cast<IntegerType>().isSigned();
-    auto rhsType = op.getOperand(1).getType().template cast<IntegerType>();
-    auto targetType = op.getResult().getType().template cast<IntegerType>();
+        cast<IntegerType>(op.getOperand(0).getType()).isSigned();
+    auto rhsType = cast<IntegerType>(op.getOperand(1).getType());
+    auto targetType = cast<IntegerType>(op.getResult().getType());
 
     // comb.div* needs identical bitwidths for its operands and its result.
     // Hence, we need to calculate the minimal bitwidth that can be used to
@@ -162,7 +215,9 @@ struct DivOpLowering : public OpConversionPattern<DivOp> {
                       ->getOpResult(0);
 
     // Carry over any attributes from the original div op.
-    divResult.getDefiningOp()->setDialectAttrs(op->getDialectAttrs());
+    auto *divOp = divResult.getDefiningOp();
+    rewriter.modifyOpInPlace(
+        divOp, [&]() { divOp->setDialectAttrs(op->getDialectAttrs()); });
 
     // finally truncate back to the expected result size!
     Value truncateResult = extractBits(rewriter, loc, divResult, /*startBit=*/0,
@@ -181,10 +236,10 @@ struct CastOpLowering : public OpConversionPattern<CastOp> {
   LogicalResult
   matchAndRewrite(CastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto sourceType = op.getIn().getType().cast<IntegerType>();
+    auto sourceType = cast<IntegerType>(op.getIn().getType());
     auto sourceWidth = sourceType.getWidth();
     bool isSourceTypeSigned = sourceType.isSigned();
-    auto targetWidth = op.getOut().getType().cast<IntegerType>().getWidth();
+    auto targetWidth = cast<IntegerType>(op.getOut().getType()).getWidth();
 
     Value replaceValue;
     if (sourceWidth == targetWidth) {
@@ -214,24 +269,20 @@ namespace {
 // the information whether the comparison contains signed values to the
 // corresponding comb::ICmpPredicate.
 static comb::ICmpPredicate lowerPredicate(ICmpPredicate pred, bool isSigned) {
-#define _CREATE_HWARITH_ICMP_CASE(x)                                           \
-  case ICmpPredicate::x:                                                       \
-    return isSigned ? comb::ICmpPredicate::s##x : comb::ICmpPredicate::u##x
-
   switch (pred) {
   case ICmpPredicate::eq:
     return comb::ICmpPredicate::eq;
-
   case ICmpPredicate::ne:
     return comb::ICmpPredicate::ne;
-
-    _CREATE_HWARITH_ICMP_CASE(lt);
-    _CREATE_HWARITH_ICMP_CASE(ge);
-    _CREATE_HWARITH_ICMP_CASE(le);
-    _CREATE_HWARITH_ICMP_CASE(gt);
+  case ICmpPredicate::lt:
+    return isSigned ? comb::ICmpPredicate::slt : comb::ICmpPredicate::ult;
+  case ICmpPredicate::ge:
+    return isSigned ? comb::ICmpPredicate::sge : comb::ICmpPredicate::uge;
+  case ICmpPredicate::le:
+    return isSigned ? comb::ICmpPredicate::sle : comb::ICmpPredicate::ule;
+  case ICmpPredicate::gt:
+    return isSigned ? comb::ICmpPredicate::sgt : comb::ICmpPredicate::ugt;
   }
-
-#undef _CREATE_HWARITH_ICMP_CASE
 
   llvm_unreachable(
       "Missing hwarith::ICmpPredicate to comb::ICmpPredicate lowering");
@@ -244,8 +295,8 @@ struct ICmpOpLowering : public OpConversionPattern<ICmpOp> {
   LogicalResult
   matchAndRewrite(ICmpOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto lhsType = op.getLhs().getType().cast<IntegerType>();
-    auto rhsType = op.getRhs().getType().cast<IntegerType>();
+    auto lhsType = cast<IntegerType>(op.getLhs().getType());
+    auto rhsType = cast<IntegerType>(op.getRhs().getType());
     IntegerType::SignednessSemantics cmpSignedness;
     const unsigned cmpWidth =
         inferAddResultType(cmpSignedness, lhsType, rhsType) - 1;
@@ -260,18 +311,16 @@ struct ICmpOpLowering : public OpConversionPattern<ICmpOp> {
     Value rhsValue = extendTypeWidth(rewriter, loc, adaptor.getRhs(), cmpWidth,
                                      rhsType.isSigned());
 
-    auto newOp = rewriter.replaceOpWithNewOp<comb::ICmpOp>(
-        op, combPred, lhsValue, rhsValue, false);
-    newOp->setDialectAttrs(op->getDialectAttrs());
+    auto newOp = rewriter.create<comb::ICmpOp>(op->getLoc(), combPred, lhsValue,
+                                               rhsValue, false);
+    rewriter.modifyOpInPlace(
+        newOp, [&]() { newOp->setDialectAttrs(op->getDialectAttrs()); });
+    rewriter.replaceOp(op, newOp);
 
     return success();
   }
 };
-} // namespace
 
-// Templated patterns
-
-namespace {
 template <class BinOp, class ReplaceOp>
 struct BinaryOpLowering : public OpConversionPattern<BinOp> {
   using OpConversionPattern<BinOp>::OpConversionPattern;
@@ -282,104 +331,24 @@ struct BinaryOpLowering : public OpConversionPattern<BinOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto isLhsTypeSigned =
-        op.getOperand(0).getType().template cast<IntegerType>().isSigned();
+        cast<IntegerType>(op.getOperand(0).getType()).isSigned();
     auto isRhsTypeSigned =
-        op.getOperand(1).getType().template cast<IntegerType>().isSigned();
-    auto targetWidth =
-        op.getResult().getType().template cast<IntegerType>().getWidth();
+        cast<IntegerType>(op.getOperand(1).getType()).isSigned();
+    auto targetWidth = cast<IntegerType>(op.getResult().getType()).getWidth();
 
     Value lhsValue = extendTypeWidth(rewriter, loc, adaptor.getInputs()[0],
                                      targetWidth, isLhsTypeSigned);
     Value rhsValue = extendTypeWidth(rewriter, loc, adaptor.getInputs()[1],
                                      targetWidth, isRhsTypeSigned);
     auto newOp =
-        rewriter.replaceOpWithNewOp<ReplaceOp>(op, lhsValue, rhsValue, false);
-    newOp->setDialectAttrs(op->getDialectAttrs());
+        rewriter.create<ReplaceOp>(op.getLoc(), lhsValue, rhsValue, false);
+    rewriter.modifyOpInPlace(
+        newOp, [&]() { newOp->setDialectAttrs(op->getDialectAttrs()); });
+    rewriter.replaceOp(op, newOp);
+
     return success();
   }
 };
-
-template <class TOp>
-struct ArgResOpConversion : public OpConversionPattern<TOp> {
-  // Generic pattern which replaces an op by one of the same type, but with
-  // converted operands and result types.
-  using OpConversionPattern<TOp>::OpConversionPattern;
-  using OpAdaptor = typename OpConversionPattern<TOp>::OpAdaptor;
-
-  // Function that will replace the op with a type-converted new op.
-  using ReplacementFunc = std::function<void(
-      ConversionPatternRewriter &, TOp, llvm::SmallVector<Type>, OpAdaptor &)>;
-
-  ArgResOpConversion(TypeConverter &tc, MLIRContext *ctx, ReplacementFunc f)
-      : OpConversionPattern<TOp>(tc, ctx), replacementFunc(f) {}
-
-  LogicalResult
-  matchAndRewrite(TOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    llvm::SmallVector<Type> convResTypes;
-    if (failed(this->getTypeConverter()->convertTypes(op->getResultTypes(),
-                                                      convResTypes)))
-      return failure();
-    replacementFunc(rewriter, op, convResTypes, adaptor);
-    return success();
-  }
-
-  ReplacementFunc replacementFunc;
-};
-
-// Adds the ArgResOpConversion for 'TOp' to the set of conversion patterns,
-// using TReplFunc as the replacement function inside the pattern, as well as a
-// legality check on the conversion status of the op's operands and results.
-template <typename TOp, typename TReplFunc>
-static void addOperandConversion(ConversionTarget &target,
-                                 RewritePatternSet &patterns,
-                                 HWArithToHWTypeConverter &typeConverter,
-                                 TReplFunc replFunc) {
-  patterns.add<ArgResOpConversion<TOp>>(typeConverter, patterns.getContext(),
-                                        replFunc);
-
-  target.addDynamicallyLegalOp<TOp>([&](auto op) {
-    return !typeConverter.hasSignednessSemantics(op->getOperandTypes()) &&
-           !typeConverter.hasSignednessSemantics(op->getResultTypes());
-  });
-}
-
-// Generic version of addOperandConversion (above) which uses the generic
-// operation builder signature.
-template <typename... TOp>
-static void addOperandConversion(ConversionTarget &target,
-                                 RewritePatternSet &patterns,
-                                 HWArithToHWTypeConverter &typeConverter) {
-  (addOperandConversion<TOp>(
-       target, patterns, typeConverter,
-       [](ConversionPatternRewriter &rewriter, TOp op,
-          llvm::ArrayRef<Type> convResTypes,
-          typename ArgResOpConversion<TOp>::OpAdaptor &adaptor) {
-         // Use the generic builder to allow this pattern to apply to all ops
-         // with default builders.
-         rewriter.replaceOpWithNewOp<TOp>(
-             op, convResTypes, adaptor.getOperands(), op->getAttrs());
-       }),
-   ...);
-}
-
-template <typename... TOp>
-static void addSignatureConversion(ConversionTarget &target,
-                                   RewritePatternSet &patterns,
-                                   HWArithToHWTypeConverter &typeConverter) {
-  (mlir::populateFunctionOpInterfaceTypeConversionPattern<TOp>(patterns,
-                                                               typeConverter),
-   ...);
-
-  target.addDynamicallyLegalOp<TOp...>([&](FunctionOpInterface moduleLikeOp) {
-    // Legal if all results and args have no signedness integers.
-    bool legalResults =
-        !typeConverter.hasSignednessSemantics(moduleLikeOp.getResultTypes());
-    bool legalArgs =
-        !typeConverter.hasSignednessSemantics(moduleLikeOp.getArgumentTypes());
-    return legalResults && legalArgs;
-  });
-}
 
 } // namespace
 
@@ -397,7 +366,7 @@ Type HWArithToHWTypeConverter::removeSignedness(Type type) {
           })
           .Case<hw::ArrayType>([this](auto type) {
             return hw::ArrayType::get(removeSignedness(type.getElementType()),
-                                      type.getSize());
+                                      type.getNumElements());
           })
           .Case<hw::StructType>([this](auto type) {
             // Recursively convert each element.
@@ -411,81 +380,38 @@ Type HWArithToHWTypeConverter::removeSignedness(Type type) {
           .Case<hw::InOutType>([this](auto type) {
             return hw::InOutType::get(removeSignedness(type.getElementType()));
           })
+          .Case<hw::TypeAliasType>([this](auto type) {
+            return hw::TypeAliasType::get(
+                type.getRef(), removeSignedness(type.getInnerType()));
+          })
           .Default([](auto type) { return type; });
 
   return convertedType;
-}
-
-bool HWArithToHWTypeConverter::hasSignednessSemantics(Type type) {
-  auto it = conversionCache.find(type);
-  if (it != conversionCache.end())
-    return it->second.hadSignednessSemantics;
-
-  auto match =
-      llvm::TypeSwitch<Type, bool>(type)
-          .Case<IntegerType>([](auto type) { return !type.isSignless(); })
-          .Case<hw::ArrayType>([this](auto type) {
-            return hasSignednessSemantics(type.getElementType());
-          })
-          .Case<hw::StructType>([this](auto type) {
-            return llvm::any_of(type.getElements(), [this](auto element) {
-              return this->hasSignednessSemantics(element.type);
-            });
-          })
-          .Case<hw::InOutType>([this](auto type) {
-            return hasSignednessSemantics(type.getElementType());
-          })
-          .Default([](auto type) { return false; });
-
-  if (match) {
-    // Prime the conversion cache by pre-converting the type.
-    conversionCache[type] = {removeSignedness(type), true};
-  } else {
-    // Prime the conversion cache by not converting the type - this prevents
-    // iterating through the type on future removeSignedness calls for this
-    // type.
-    conversionCache[type] = {type, false};
-  }
-
-  return match;
-}
-
-bool HWArithToHWTypeConverter::hasSignednessSemantics(TypeRange types) {
-  return llvm::any_of(types,
-                      [this](Type t) { return hasSignednessSemantics(t); });
 }
 
 HWArithToHWTypeConverter::HWArithToHWTypeConverter() {
   // Pass any type through the signedness remover.
   addConversion([this](Type type) { return removeSignedness(type); });
 
-  addTargetMaterialization(
-      [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
-        if (inputs.size() != 1)
-          return std::nullopt;
-        return inputs[0];
-      });
+  addTargetMaterialization([&](mlir::OpBuilder &builder, mlir::Type resultType,
+                               mlir::ValueRange inputs,
+                               mlir::Location loc) -> mlir::Value {
+    if (inputs.size() != 1)
+      return Value();
+    return builder
+        .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+        ->getResult(0);
+  });
 
-  addSourceMaterialization(
-      [&](mlir::OpBuilder &builder, mlir::Type resultType,
-          mlir::ValueRange inputs,
-          mlir::Location loc) -> std::optional<mlir::Value> {
-        if (inputs.size() != 1)
-          return std::nullopt;
-        return inputs[0];
-      });
-}
-
-template <class TOp>
-void wireRegReplacementFunction(
-    ConversionPatternRewriter &rewriter, TOp op,
-    llvm::ArrayRef<Type> convResTypes,
-    typename ArgResOpConversion<TOp>::OpAdaptor &adaptor) {
-  hw::InOutType convIOType = convResTypes.front().cast<hw::InOutType>();
-  rewriter.replaceOpWithNewOp<TOp>(op, convIOType.getElementType(),
-                                   op.getNameAttr());
+  addSourceMaterialization([&](mlir::OpBuilder &builder, mlir::Type resultType,
+                               mlir::ValueRange inputs,
+                               mlir::Location loc) -> mlir::Value {
+    if (inputs.size() != 1)
+      return Value();
+    return builder
+        .create<UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+        ->getResult(0);
+  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -503,53 +429,30 @@ void circt::populateHWArithToHWConversionPatterns(
 
 namespace {
 
-class HWArithToHWPass : public HWArithToHWBase<HWArithToHWPass> {
+class HWArithToHWPass : public circt::impl::HWArithToHWBase<HWArithToHWPass> {
 public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
     ConversionTarget target(getContext());
+    target.markUnknownOpDynamicallyLegal(isLegalOp);
     RewritePatternSet patterns(&getContext());
     HWArithToHWTypeConverter typeConverter;
     target.addIllegalDialect<HWArithDialect>();
-    target.addLegalDialect<comb::CombDialect, hw::HWDialect>();
 
-    // Signature conversion and legalization patterns.
-    addSignatureConversion<hw::HWModuleOp, hw::HWModuleExternOp,
-                           msft::MSFTModuleOp, msft::MSFTModuleExternOp>(
-        target, patterns, typeConverter);
-
-    // Generic conversion and legalization patterns for operations that we
-    // expect to be using in conjunction with the signedness values of hwarith.
-    addOperandConversion<sv::ReadInOutOp, sv::AssignOp, hw::OutputOp,
-                         comb::MuxOp, seq::CompRegOp, hw::ArrayCreateOp,
-                         hw::ArrayGetOp, hw::ArrayConcatOp, hw::ArraySliceOp,
-                         hw::StructCreateOp, hw::StructExplodeOp,
-                         hw::StructExtractOp, hw::StructInjectOp,
-                         hw::UnionCreateOp, hw::UnionExtractOp>(
-        target, patterns, typeConverter);
-
-    addOperandConversion<sv::WireOp>(target, patterns, typeConverter,
-                                     wireRegReplacementFunction<sv::WireOp>);
-
-    addOperandConversion<sv::RegOp>(target, patterns, typeConverter,
-                                    wireRegReplacementFunction<sv::RegOp>);
-
+    // Add HWArith-specific conversion patterns.
     populateHWArithToHWConversionPatterns(typeConverter, patterns);
 
-    if (failed(applyPartialConversion(module, target, std::move(patterns))))
-      return signalPassFailure();
+    // ALL other operations are converted via the TypeConversionPattern which
+    // will replace an operation to an identical operation with replaced
+    // result types and operands.
+    patterns.add<TypeConversionPattern>(typeConverter, patterns.getContext());
 
-    // Fix up block argument locations since the signature converter drops
-    // all locations.
-    for (auto &op : module.getOps()) {
-      auto argLocs = op.getAttrOfType<ArrayAttr>("argLocs");
-      if (argLocs && op.getNumRegions() == 1 && op.getRegion(0).hasOneBlock()) {
-        auto *block = &op.getRegion(0).front();
-        for (auto [arg, loc] : llvm::zip(block->getArguments(), argLocs))
-          arg.setLoc(loc.cast<LocationAttr>());
-      }
-    }
+    // Apply a full conversion - all operations must either be legal, be caught
+    // by one of the HWArith patterns or be converted by the
+    // TypeConversionPattern.
+    if (failed(applyFullConversion(module, target, std::move(patterns))))
+      return signalPassFailure();
   }
 };
 } // namespace

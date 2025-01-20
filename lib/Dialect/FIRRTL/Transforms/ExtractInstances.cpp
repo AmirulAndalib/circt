@@ -10,29 +10,45 @@
 // `ExtractBlackBoxes`, `ExtractClockGates`, and `ExtractSeqMems` passes in the
 // Scala FIRRTL implementation.
 //
+// This pass will make no modifications if the circuit does not contain a
+// design-under-test (DUT).  I.e., this pass does not use the "effecctive" DUT.
+// If a DUT exists, then anything in the design is extracted.  Using the
+// standard interpretation of passes like this, layers are not in the design.
+// If a situation arise where a module is instantiated inside and outside the
+// design that needs to be extracted, then it will be extracted in both up to
+// the point where it no longer needs to be further extracted.  See the tests
+// for examples of this.
+//
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
+#include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
-#include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/SV/SVOps.h"
-#include "circt/Support/Path.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Path.h"
 
 #define DEBUG_TYPE "firrtl-extract-instances"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_EXTRACTINSTANCES
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -57,28 +73,25 @@ struct ExtractionInfo {
 };
 
 struct ExtractInstancesPass
-    : public ExtractInstancesBase<ExtractInstancesPass> {
+    : public circt::firrtl::impl::ExtractInstancesBase<ExtractInstancesPass> {
   void runOnOperation() override;
   void collectAnnos();
   void collectAnno(InstanceOp inst, Annotation anno);
   void extractInstances();
   void groupInstances();
-  void createTraceFiles();
+  void createTraceFiles(ClassOp &sifiveMetadata);
+  void createSchema();
 
   /// Get the cached namespace for a module.
-  ModuleNamespace &getModuleNamespace(FModuleLike module) {
-    auto it = moduleNamespaces.find(module);
-    if (it != moduleNamespaces.end())
-      return it->second;
-    return moduleNamespaces.try_emplace(module, ModuleNamespace(module))
-        .first->second;
+  hw::InnerSymbolNamespace &getModuleNamespace(FModuleLike module) {
+    return moduleNamespaces.try_emplace(module, module).first->second;
   }
 
   /// Obtain an inner reference to an operation, possibly adding an `inner_sym`
   /// to that operation.
   InnerRefAttr getInnerRefTo(Operation *op) {
-    return ::getInnerRefTo(op, "extraction_sym",
-                           [&](FModuleOp mod) -> ModuleNamespace & {
+    return ::getInnerRefTo(op,
+                           [&](FModuleLike mod) -> hw::InnerSymbolNamespace & {
                              return getModuleNamespace(mod);
                            });
   }
@@ -94,29 +107,34 @@ struct ExtractInstancesPass
     return newPathOp;
   }
 
+  /// Return a handle to the unique instance of file with a given name.
+  emit::FileOp getOrCreateFile(StringRef fileName) {
+    auto [it, inserted] = files.try_emplace(fileName, emit::FileOp{});
+    if (inserted) {
+      auto builder = ImplicitLocOpBuilder::atBlockEnd(
+          UnknownLoc::get(&getContext()), getOperation().getBodyBlock());
+      it->second = builder.create<emit::FileOp>(fileName);
+    }
+    return it->second;
+  }
+
   bool anythingChanged;
   bool anyFailures;
 
+  CircuitOp circuitOp;
   InstanceGraph *instanceGraph = nullptr;
+  InstanceInfo *instanceInfo = nullptr;
+  SymbolTable *symbolTable = nullptr;
 
   /// The modules in the design that are annotated with one or more annotations
   /// relevant for instance extraction.
   DenseMap<Operation *, SmallVector<Annotation, 1>> annotatedModules;
 
-  /// All modules that are marked as DUT themselves. Realistically this is only
-  /// ever one module in the design.
-  DenseSet<Operation *> dutRootModules;
-  /// All modules that are marked as DUT themselves, or that have a DUT parent
-  /// module.
-  DenseSet<Operation *> dutModules;
-  /// All DUT module names.
-  DenseSet<Attribute> dutModuleNames;
-  /// The prefix of the DUT module.  This is used when creating new modules
-  /// under the DUT.
-  StringRef dutPrefix = "";
-
   /// A worklist of instances that need to be moved.
   SmallVector<std::pair<InstanceOp, ExtractionInfo>> extractionWorklist;
+
+  /// A mapping from file names to file ops for de-duplication.
+  DenseMap<StringRef, emit::FileOp> files;
 
   /// The path along which instances have been extracted. This essentially
   /// documents the original location of the instance in reverse. Every push
@@ -138,19 +156,24 @@ struct ExtractInstancesPass
   /// The current circuit namespace valid within the call to `runOnOperation`.
   CircuitNamespace circuitNamespace;
   /// Cached module namespaces.
-  DenseMap<Operation *, ModuleNamespace> moduleNamespaces;
+  DenseMap<Operation *, hw::InnerSymbolNamespace> moduleNamespaces;
+  /// The metadata class ops.
+  ClassOp extractMetadataClass, schemaClass;
+  const unsigned prefixNameFieldId = 0, pathFieldId = 2, fileNameFieldId = 4;
+  /// Cache of the inner ref to the new instances created. Will be used to
+  /// create a path to the instance
+  DenseMap<InnerRefAttr, InstanceOp> innerRefToInstances;
 };
 } // end anonymous namespace
 
 /// Emit the annotated source code for black boxes in a circuit.
 void ExtractInstancesPass::runOnOperation() {
-  CircuitOp circuitOp = getOperation();
+  circuitOp = getOperation();
   anythingChanged = false;
   anyFailures = false;
   annotatedModules.clear();
-  dutRootModules.clear();
-  dutModules.clear();
   extractionWorklist.clear();
+  files.clear();
   extractionPaths.clear();
   originalInstanceParents.clear();
   extractedInstances.clear();
@@ -158,10 +181,15 @@ void ExtractInstancesPass::runOnOperation() {
   moduleNamespaces.clear();
   circuitNamespace.clear();
   circuitNamespace.add(circuitOp);
+  innerRefToInstances.clear();
+  extractMetadataClass = {};
+  schemaClass = {};
 
   // Walk the IR and gather all the annotations relevant for extraction that
   // appear on instances and the instantiated modules.
   instanceGraph = &getAnalysis<InstanceGraph>();
+  instanceInfo = &getAnalysis<InstanceInfo>();
+  symbolTable = &getAnalysis<SymbolTable>();
   collectAnnos();
   if (anyFailures)
     return signalPassFailure();
@@ -176,12 +204,15 @@ void ExtractInstancesPass::runOnOperation() {
   if (anyFailures)
     return signalPassFailure();
 
+  ClassOp sifiveMetadata =
+      dyn_cast_or_null<ClassOp>(symbolTable->lookup("SiFive_Metadata"));
+
   // Generate the trace files that list where each instance was extracted from.
-  createTraceFiles();
+  createTraceFiles(sifiveMetadata);
   if (anyFailures)
     return signalPassFailure();
 
-  // If nothing has changed we can preseve the analysis.
+  // If nothing has changed we can preserve the analysis.
   LLVM_DEBUG(llvm::dbgs() << "\n");
   if (!anythingChanged)
     markAllAnalysesPreserved();
@@ -260,18 +291,9 @@ void ExtractInstancesPass::collectAnnos() {
   // annotations.
   for (auto module : circuit.getOps<FModuleLike>()) {
     AnnotationSet::removeAnnotations(module, [&](Annotation anno) {
-      if (anno.isClass(dutAnnoClass)) {
-        LLVM_DEBUG(llvm::dbgs()
-                   << "Marking DUT `" << module.moduleName() << "`\n");
-        dutRootModules.insert(module);
-        dutModules.insert(module);
-        if (auto prefix = anno.getMember<StringAttr>("prefix"))
-          dutPrefix = prefix;
-        return false; // other passes may rely on this anno; keep it
-      }
       if (!isAnnoInteresting(anno))
         return false;
-      LLVM_DEBUG(llvm::dbgs() << "Annotated module `" << module.moduleName()
+      LLVM_DEBUG(llvm::dbgs() << "Annotated module `" << module.getModuleName()
                               << "`:\n  " << anno.getDict() << "\n");
       annotatedModules[module].push_back(anno);
       return true;
@@ -281,7 +303,7 @@ void ExtractInstancesPass::collectAnnos() {
   // Gather the annotations on instances to be extracted.
   circuit.walk([&](InstanceOp inst) {
     SmallVector<Annotation, 1> instAnnos;
-    Operation *module = instanceGraph->getReferencedModule(inst);
+    Operation *module = inst.getReferencedModule(*instanceGraph);
 
     // Module-level annotations.
     auto it = annotatedModules.find(module);
@@ -318,35 +340,19 @@ void ExtractInstancesPass::collectAnnos() {
     collectAnno(inst, instAnnos[0]);
   });
 
-  // Propagate the DUT marking to all arbitrarily nested submodules of the DUT.
-  LLVM_DEBUG(llvm::dbgs() << "Marking DUT hierarchy\n");
-  SmallVector<InstanceGraphNode *> worklist;
-  for (Operation *op : dutModules)
-    worklist.push_back(instanceGraph->lookup(cast<hw::HWModuleLike>(op)));
-  while (!worklist.empty()) {
-    auto *module = worklist.pop_back_val();
-    dutModuleNames.insert(module->getModule().moduleNameAttr());
-    LLVM_DEBUG(llvm::dbgs()
-               << "- " << module->getModule().moduleName() << "\n");
-    for (auto *instRecord : *module) {
-      auto *target = instRecord->getTarget();
-      if (dutModules.insert(target->getModule()).second)
-        worklist.push_back(target);
-    }
-  }
-
-  // If clock gate extraction is requested, find instances of extmodules with
-  // the corresponding `defname` and mark them as to be extracted.
-  // TODO: This defname really shouldn't be hardcoded here. Make this at least
-  // somewhat configurable.
+  // If clock gate extraction is requested, find instances of extmodules which
+  // have a defname that ends with "EICG_wrapper".  This also allows this to
+  // compose with Chisel-time module prefixing.
+  //
+  // TODO: This defname matching is a terrible hack and should be replaced with
+  // something better.
   if (!clkgateFileName.empty()) {
-    auto clkgateDefNameAttr = StringAttr::get(&getContext(), "EICG_wrapper");
     for (auto module : circuit.getOps<FExtModuleOp>()) {
-      if (module.getDefnameAttr() != clkgateDefNameAttr)
+      if (!module.getDefnameAttr().getValue().ends_with("EICG_wrapper"))
         continue;
       LLVM_DEBUG(llvm::dbgs()
-                 << "Clock gate `" << module.moduleName() << "`\n");
-      if (!dutModules.contains(module)) {
+                 << "Clock gate `" << module.getModuleName() << "`\n");
+      if (!instanceInfo->anyInstanceInDesign(module)) {
         LLVM_DEBUG(llvm::dbgs() << "- Ignored (outside DUT)\n");
         continue;
       }
@@ -356,13 +362,12 @@ void ExtractInstancesPass::collectAnnos() {
       info.prefix = "clock_gate"; // TODO: Don't hardcode this
       info.wrapperModule = clkgateWrapperModule;
       info.stopAtDUT = !info.wrapperModule.empty();
-      for (auto *instRecord :
-           instanceGraph->lookup(cast<hw::HWModuleLike>(*module))->uses()) {
+      for (auto *instRecord : instanceGraph->lookup(module)->uses()) {
         if (auto inst = dyn_cast<InstanceOp>(*instRecord->getInstance())) {
           LLVM_DEBUG(llvm::dbgs()
                      << "- Marking `"
-                     << inst->getParentOfType<FModuleLike>().moduleName() << "."
-                     << inst.getName() << "`\n");
+                     << inst->getParentOfType<FModuleLike>().getModuleName()
+                     << "." << inst.getName() << "`\n");
           extractionWorklist.push_back({inst, info});
         }
       }
@@ -373,21 +378,14 @@ void ExtractInstancesPass::collectAnnos() {
   // mark them as to be extracted.
   // somewhat configurable.
   if (!memoryFileName.empty()) {
-    // Create an empty verbatim to guarantee that this file will exist even if
-    // no memories are found.  This is done to align with the SFC implementation
-    // of this pass where the file is always created.  This does introduce an
-    // additional leading newline in the file.
-    auto *context = circuit.getContext();
-    auto builder = ImplicitLocOpBuilder::atBlockEnd(UnknownLoc::get(context),
-                                                    circuit.getBodyBlock());
-    builder.create<sv::VerbatimOp>("")->setAttr(
-        "output_file",
-        hw::OutputFileAttr::getFromFilename(context, memoryFileName,
-                                            /*excludeFromFilelist=*/true));
+    // Create a potentially empty file if a name is specified. This is done to
+    // align with the SFC implementation of this pass where the file is always
+    // created.  This does introduce an additional leading newline in the file.
+    getOrCreateFile(memoryFileName);
 
     for (auto module : circuit.getOps<FMemModuleOp>()) {
-      LLVM_DEBUG(llvm::dbgs() << "Memory `" << module.moduleName() << "`\n");
-      if (!dutModules.contains(module)) {
+      LLVM_DEBUG(llvm::dbgs() << "Memory `" << module.getModuleName() << "`\n");
+      if (!instanceInfo->anyInstanceInDesign(module)) {
         LLVM_DEBUG(llvm::dbgs() << "- Ignored (outside DUT)\n");
         continue;
       }
@@ -397,13 +395,12 @@ void ExtractInstancesPass::collectAnnos() {
       info.prefix = "mem_wiring"; // TODO: Don't hardcode this
       info.wrapperModule = memoryWrapperModule;
       info.stopAtDUT = !info.wrapperModule.empty();
-      for (auto *instRecord :
-           instanceGraph->lookup(cast<hw::HWModuleLike>(*module))->uses()) {
+      for (auto *instRecord : instanceGraph->lookup(module)->uses()) {
         if (auto inst = dyn_cast<InstanceOp>(*instRecord->getInstance())) {
           LLVM_DEBUG(llvm::dbgs()
                      << "- Marking `"
-                     << inst->getParentOfType<FModuleLike>().moduleName() << "."
-                     << inst.getName() << "`\n");
+                     << inst->getParentOfType<FModuleLike>().getModuleName()
+                     << "." << inst.getName() << "`\n");
           extractionWorklist.push_back({inst, info});
         }
       }
@@ -456,7 +453,7 @@ void ExtractInstancesPass::collectAnno(InstanceOp inst, Annotation anno) {
 static unsigned findInstanceInNLA(InstanceOp inst, hw::HierPathOp nla) {
   unsigned nlaLen = nla.getNamepath().size();
   auto instName = getInnerSymName(inst);
-  auto parentName = cast<FModuleOp>(inst->getParentOp()).moduleNameAttr();
+  auto parentName = cast<FModuleOp>(inst->getParentOp()).getModuleNameAttr();
   for (unsigned nlaIdx = 0; nlaIdx < nlaLen; ++nlaIdx) {
     auto refPart = nla.refPart(nlaIdx);
     if (nla.modPart(nlaIdx) == parentName && (!refPart || refPart == instName))
@@ -482,12 +479,13 @@ void ExtractInstancesPass::extractInstances() {
   // Keep track of where the instance was originally.
   for (auto &[inst, info] : extractionWorklist)
     originalInstanceParents[inst] =
-        inst->getParentOfType<FModuleLike>().moduleNameAttr();
+        inst->getParentOfType<FModuleLike>().getModuleNameAttr();
 
   while (!extractionWorklist.empty()) {
     InstanceOp inst;
     ExtractionInfo info;
     std::tie(inst, info) = extractionWorklist.pop_back_val();
+
     auto parent = inst->getParentOfType<FModuleOp>();
 
     // Figure out the wiring prefix to use for this instance. If we are supposed
@@ -506,13 +504,14 @@ void ExtractInstancesPass::extractInstances() {
       prefix = prefixSlot;
     }
 
-    // If the instance is already in the right place (outside the DUT or already
-    // in the root module), there's nothing left for us to do. Otherwise we
-    // proceed to bubble it up one level in the hierarchy and add the resulting
-    // instances back to the worklist.
-    if (!dutModules.contains(parent) ||
+    // If the instance is already in the right place (outside the DUT, already
+    // in the root module, or has hit a layer), there's nothing left for us to
+    // do.  Otherwise we proceed to bubble it up one level in the hierarchy and
+    // add the resulting instances back to the worklist.
+    if (inst->getParentOfType<LayerBlockOp>() ||
+        !instanceInfo->anyInstanceInDesign(parent) ||
         instanceGraph->lookup(parent)->noUses() ||
-        (info.stopAtDUT && dutRootModules.contains(parent))) {
+        (info.stopAtDUT && instanceInfo->isDut(parent))) {
       LLVM_DEBUG(llvm::dbgs() << "\nNo need to further move " << inst << "\n");
       extractedInstances.push_back({inst, info});
       continue;
@@ -538,7 +537,7 @@ void ExtractInstancesPass::extractInstances() {
           prefix.empty() ? Twine(name) : Twine(prefix) + "_" + name);
 
       PortInfo newPort{nameAttr,
-                       inst.getResult(portIdx).getType().cast<FIRRTLType>(),
+                       type_cast<FIRRTLType>(inst.getResult(portIdx).getType()),
                        direction::flip(inst.getPortDirection(portIdx))};
       newPort.loc = inst.getResult(portIdx).getLoc();
       newPorts.push_back({numParentPorts, newPort});
@@ -587,12 +586,14 @@ void ExtractInstancesPass::extractInstances() {
     // the instances of the parent module, and wire the instance ports up to
     // the newly added parent module ports.
     auto *instParentNode =
-        instanceGraph->lookup(cast<hw::HWModuleLike>(*parent));
+        instanceGraph->lookup(cast<igraph::ModuleOpInterface>(*parent));
     for (auto *instRecord : instParentNode->uses()) {
       auto oldParentInst = cast<InstanceOp>(*instRecord->getInstance());
       auto newParent = oldParentInst->getParentOfType<FModuleLike>();
       LLVM_DEBUG(llvm::dbgs() << "- Updating " << oldParentInst << "\n");
       auto newParentInst = oldParentInst.cloneAndInsertPorts(newPorts);
+      if (newParentInst.getInnerSymAttr())
+        innerRefToInstances[getInnerRefTo(newParentInst)] = newParentInst;
 
       // Migrate connections to existing ports.
       for (unsigned portIdx = 0; portIdx < numParentPorts; ++portIdx)
@@ -618,12 +619,14 @@ void ExtractInstancesPass::extractInstances() {
       ImplicitLocOpBuilder builder(inst.getLoc(), newParentInst);
       builder.setInsertionPointAfter(newParentInst);
       builder.insert(newInst);
+      if (newParentInst.getInnerSymAttr())
+        innerRefToInstances[getInnerRefTo(newInst)] = newInst;
       for (unsigned portIdx = 0; portIdx < numInstPorts; ++portIdx) {
         auto dst = newInst.getResult(portIdx);
         auto src = newParentInst.getResult(numParentPorts + portIdx);
         if (newPorts[portIdx].second.direction == Direction::In)
           std::swap(src, dst);
-        builder.create<StrictConnectOp>(dst, src);
+        builder.create<MatchingConnectOp>(dst, src);
       }
 
       // Move the wiring prefix from the old to the new instance. We just look
@@ -644,7 +647,9 @@ void ExtractInstancesPass::extractInstances() {
       // Inherit the old instance's extraction path.
       extractionPaths.try_emplace(newInst); // (create entry first)
       auto &extractionPath = (extractionPaths[newInst] = extractionPaths[inst]);
-      extractionPath.push_back(getInnerRefTo(newParentInst));
+      auto instInnerRef = getInnerRefTo(newParentInst);
+      innerRefToInstances[instInnerRef] = newParentInst;
+      extractionPath.push_back(instInnerRef);
       originalInstanceParents.try_emplace(newInst); // (create entry first)
       originalInstanceParents[newInst] = originalInstanceParents[inst];
       // Record the Nonlocal annotations that need to be applied to the new
@@ -678,9 +683,9 @@ void ExtractInstancesPass::extractInstances() {
         // module is multiply instantiated. In that case, we only move over NLAs
         // that actually affect the instance through the new parent module.
         if (nlaIdx > 0) {
-          auto innerRef = nlaPath[nlaIdx - 1].dyn_cast<InnerRefAttr>();
+          auto innerRef = dyn_cast<InnerRefAttr>(nlaPath[nlaIdx - 1]);
           if (innerRef &&
-              !(innerRef.getModule() == newParent.moduleNameAttr() &&
+              !(innerRef.getModule() == newParent.getModuleNameAttr() &&
                 innerRef.getName() == getInnerSymName(newParentInst))) {
             LLVM_DEBUG(llvm::dbgs()
                        << "    - Ignored since NLA parent " << innerRef
@@ -703,11 +708,10 @@ void ExtractInstancesPass::extractInstances() {
         // was rooted at.
         if (nlaIdx == 0) {
           LLVM_DEBUG(llvm::dbgs() << "    - Re-rooting " << nlaPath[0] << "\n");
-          assert(nlaPath[0].isa<InnerRefAttr>() &&
+          assert(isa<InnerRefAttr>(nlaPath[0]) &&
                  "head of hierpath must be an InnerRefAttr");
-          nlaPath[0] =
-              InnerRefAttr::get(newParent.moduleNameAttr(),
-                                nlaPath[0].cast<InnerRefAttr>().getName());
+          nlaPath[0] = InnerRefAttr::get(newParent.getModuleNameAttr(),
+                                         getInnerSymName(newInst));
 
           if (instParentNode->hasOneUse()) {
             // Simply update the existing NLA since our parent is only
@@ -741,9 +745,9 @@ void ExtractInstancesPass::extractInstances() {
             // entire subhierarchy and go replicate all annotations with the old
             // names.
             inst.emitWarning("extraction of instance `")
-                << inst.instanceName()
+                << inst.getInstanceName()
                 << "` could break non-local annotations rooted at `"
-                << parent.moduleName() << "`";
+                << parent.getModuleName() << "`";
           }
           continue;
         }
@@ -771,9 +775,9 @@ void ExtractInstancesPass::extractInstances() {
         // since we know that `nlaIdx` is a `InnerRefAttr`, we'll modify
         // `OldParent::BB` to be `NewParent::BB` and delete `NewParent::X`.
         StringAttr parentName =
-            nlaPath[nlaIdx - 1].cast<InnerRefAttr>().getModule();
+            cast<InnerRefAttr>(nlaPath[nlaIdx - 1]).getModule();
         Attribute newRef;
-        if (nlaPath[nlaIdx].isa<InnerRefAttr>())
+        if (isa<InnerRefAttr>(nlaPath[nlaIdx]))
           newRef = InnerRefAttr::get(parentName, getInnerSymName(newInst));
         else
           newRef = FlatSymbolRefAttr::get(parentName);
@@ -783,7 +787,7 @@ void ExtractInstancesPass::extractInstances() {
         nlaPath[nlaIdx] = newRef;
         nlaPath.erase(nlaPath.begin() + nlaIdx - 1);
 
-        if (newRef.isa<FlatSymbolRefAttr>()) {
+        if (isa<FlatSymbolRefAttr>(newRef)) {
           // Since the original NLA ended at the instance's parent module, there
           // is no guarantee that the instance is the sole user of the NLA (as
           // opposed to the original NLA explicitly naming the instance). Create
@@ -845,7 +849,7 @@ void ExtractInstancesPass::groupInstances() {
   // module. Note that we cannot group instances that landed in different parent
   // modules into the same submodule, so we use that parent module as a grouping
   // key.
-  SmallDenseMap<std::pair<Operation *, StringRef>, SmallVector<InstanceOp>>
+  llvm::MapVector<std::pair<Operation *, StringRef>, SmallVector<InstanceOp>>
       instsByWrapper;
   for (auto &[inst, info] : extractedInstances) {
     if (!info.wrapperModule.empty())
@@ -864,12 +868,13 @@ void ExtractInstancesPass::groupInstances() {
     auto [parentOp, wrapperName] = parentAndWrapperName;
     auto parent = cast<FModuleOp>(parentOp);
     LLVM_DEBUG(llvm::dbgs() << "- Wrapper `" << wrapperName << "` in `"
-                            << parent.moduleName() << "` with " << insts.size()
-                            << " instances\n");
+                            << parent.getModuleName() << "` with "
+                            << insts.size() << " instances\n");
     OpBuilder builder(parentOp);
 
     // Uniquify the wrapper name.
-    wrapperName = circuitNamespace.newName(wrapperName);
+    auto wrapperModuleName =
+        builder.getStringAttr(circuitNamespace.newName(wrapperName));
     auto wrapperInstName =
         builder.getStringAttr(getModuleNamespace(parent).newName(wrapperName));
 
@@ -887,7 +892,7 @@ void ExtractInstancesPass::groupInstances() {
         auto nameAttr = builder.getStringAttr(
             prefix.empty() ? Twine(name) : Twine(prefix) + "_" + name);
         PortInfo port{nameAttr,
-                      inst.getResult(portIdx).getType().cast<FIRRTLType>(),
+                      type_cast<FIRRTLType>(inst.getResult(portIdx).getType()),
                       inst.getPortDirection(portIdx)};
         port.loc = inst.getResult(portIdx).getLoc();
         ports.push_back(port);
@@ -921,13 +926,13 @@ void ExtractInstancesPass::groupInstances() {
 
         // The relevant part of the NLA is of the form `Top::bb`, which we want
         // to expand to `Top::wrapperInst` and `Wrapper::bb`.
-        auto wrapperNameAttr = builder.getStringAttr(wrapperName);
-        auto ref1 = InnerRefAttr::get(parent.moduleNameAttr(), wrapperInstName);
+        auto ref1 =
+            InnerRefAttr::get(parent.getModuleNameAttr(), wrapperInstName);
         Attribute ref2;
-        if (auto innerRef = nlaPath[nlaIdx].dyn_cast<InnerRefAttr>())
-          ref2 = InnerRefAttr::get(wrapperNameAttr, innerRef.getName());
+        if (auto innerRef = dyn_cast<InnerRefAttr>(nlaPath[nlaIdx]))
+          ref2 = InnerRefAttr::get(wrapperModuleName, innerRef.getName());
         else
-          ref2 = FlatSymbolRefAttr::get(wrapperNameAttr);
+          ref2 = FlatSymbolRefAttr::get(wrapperModuleName);
         LLVM_DEBUG(llvm::dbgs() << "    - Expanding " << nlaPath[nlaIdx]
                                 << " to (" << ref1 << ", " << ref2 << ")\n");
         nlaPath[nlaIdx] = ref1;
@@ -938,14 +943,14 @@ void ExtractInstancesPass::groupInstances() {
         nla.setNamepathAttr(builder.getArrayAttr(nlaPath));
         LLVM_DEBUG(llvm::dbgs() << "    - Modified to " << nla << "\n");
         // Add the NLA to the wrapper module.
-        nlaTable.addNLAtoModule(nla, wrapperNameAttr);
+        nlaTable.addNLAtoModule(nla, wrapperModuleName);
       }
     }
 
     // Create the wrapper module.
     auto wrapper = builder.create<FModuleOp>(
-        builder.getUnknownLoc(), builder.getStringAttr(dutPrefix + wrapperName),
-        ports);
+        builder.getUnknownLoc(), wrapperModuleName,
+        ConventionAttr::get(builder.getContext(), Convention::Internal), ports);
     SymbolTable::setSymbolVisibility(wrapper, SymbolTable::Visibility::Private);
 
     // Instantiate the wrapper module in the parent and replace uses of the
@@ -956,7 +961,7 @@ void ExtractInstancesPass::groupInstances() {
         wrapper.getLoc(), wrapper, wrapperName, NameKindEnum::DroppableName,
         ArrayRef<Attribute>{},
         /*portAnnotations=*/ArrayRef<Attribute>{}, /*lowerToBind=*/false,
-        wrapperInstName);
+        hw::InnerSymAttr::get(wrapperInstName));
     unsigned portIdx = 0;
     for (auto inst : insts)
       for (auto result : inst.getResults())
@@ -974,7 +979,7 @@ void ExtractInstancesPass::groupInstances() {
         Value src = wrapper.getArgument(portIdx);
         if (ports[portIdx].direction == Direction::Out)
           std::swap(dst, src);
-        builder.create<StrictConnectOp>(result.getLoc(), dst, src);
+        builder.create<MatchingConnectOp>(result.getLoc(), dst, src);
         ++portIdx;
       }
     }
@@ -984,12 +989,11 @@ void ExtractInstancesPass::groupInstances() {
 /// Generate trace files, which are plain text metadata files that list the
 /// hierarchical path where each instance was extracted from. The file lists one
 /// instance per line in the form `<prefix> -> <original-path>`.
-void ExtractInstancesPass::createTraceFiles() {
+void ExtractInstancesPass::createTraceFiles(ClassOp &sifiveMetadataClass) {
   LLVM_DEBUG(llvm::dbgs() << "\nGenerating trace files\n");
-  auto builder = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
 
   // Group the extracted instances by their trace file name.
-  SmallDenseMap<StringRef, SmallVector<InstanceOp>> instsByTraceFile;
+  llvm::MapVector<StringRef, SmallVector<InstanceOp>> instsByTraceFile;
   for (auto &[inst, info] : extractedInstances)
     if (!info.traceFilename.empty())
       instsByTraceFile[info.traceFilename].push_back(inst);
@@ -997,7 +1001,31 @@ void ExtractInstancesPass::createTraceFiles() {
   // Generate the trace files.
   SmallVector<Attribute> symbols;
   SmallDenseMap<Attribute, unsigned> symbolIndices;
+  if (sifiveMetadataClass && !extractMetadataClass)
+    createSchema();
 
+  auto addPortsToClass = [&](ArrayRef<std::pair<Value, Twine>> objFields,
+                             ClassOp classOp) {
+    auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        classOp.getLoc(), classOp.getBodyBlock());
+    auto portIndex = classOp.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> newPorts;
+    for (auto [index, port] : enumerate(objFields)) {
+      portIndex += index;
+      auto obj = port.first;
+      newPorts.emplace_back(
+          portIndex,
+          PortInfo(builderOM.getStringAttr(port.second + Twine(portIndex)),
+                   obj.getType(), Direction::Out));
+      auto blockarg =
+          classOp.getBodyBlock()->addArgument(obj.getType(), obj.getLoc());
+      builderOM.create<PropAssignOp>(blockarg, obj);
+    }
+    classOp.insertPorts(newPorts);
+  };
+
+  HierPathCache pathCache(circuitOp, *symbolTable);
+  SmallVector<std::pair<Value, Twine>> classFields;
   for (auto &[fileName, insts] : instsByTraceFile) {
     LLVM_DEBUG(llvm::dbgs() << "- " << fileName << "\n");
     std::string buffer;
@@ -1018,6 +1046,8 @@ void ExtractInstancesPass::createTraceFiles() {
       os << "{{" << id << "}}";
     };
 
+    auto file = getOrCreateFile(fileName);
+    auto builder = OpBuilder::atBlockEnd(file.getBody());
     for (auto inst : insts) {
       StringRef prefix(instPrefices[inst]);
       if (prefix.empty()) {
@@ -1035,11 +1065,39 @@ void ExtractInstancesPass::createTraceFiles() {
                  << "  - " << prefix << ": " << inst.getName() << "\n");
       os << prefix << " -> ";
 
+      if (sifiveMetadataClass) {
+        // Create the entry for this extracted instance in the metadata class.
+        auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+            inst.getLoc(), extractMetadataClass.getBodyBlock());
+        auto prefixName = builderOM.create<StringConstantOp>(prefix);
+        auto object = builderOM.create<ObjectOp>(schemaClass, prefix);
+        auto fPrefix =
+            builderOM.create<ObjectSubfieldOp>(object, prefixNameFieldId);
+        builderOM.create<PropAssignOp>(fPrefix, prefixName);
+
+        auto targetInstance = innerRefToInstances[path.front()];
+        SmallVector<Attribute> pathOpAttr(llvm::reverse(path));
+        auto nla = pathCache.getOpFor(
+            ArrayAttr::get(circuitOp->getContext(), pathOpAttr));
+
+        auto pathOp = createPathRef(targetInstance, nla, builderOM);
+        auto fPath = builderOM.create<ObjectSubfieldOp>(object, pathFieldId);
+        builderOM.create<PropAssignOp>(fPath, pathOp);
+        auto fFile =
+            builderOM.create<ObjectSubfieldOp>(object, fileNameFieldId);
+        auto fileNameOp =
+            builderOM.create<StringConstantOp>(builder.getStringAttr(fileName));
+        builderOM.create<PropAssignOp>(fFile, fileNameOp);
+
+        // Now add this to the output field of the class.
+        classFields.emplace_back(object, prefix + "_field");
+      }
       // HACK: To match the Scala implementation, we strip all non-DUT modules
       // from the path and make the path look like it's rooted at the first DUT
       // module (so `TestHarness.dut.foo.bar` becomes `DUTModule.foo.bar`).
       while (!path.empty() &&
-             !dutModuleNames.contains(path.back().getModule())) {
+             !instanceInfo->anyInstanceInDesign(cast<igraph::ModuleOpInterface>(
+                 symbolTable->lookup(path.back().getModule())))) {
         LLVM_DEBUG(llvm::dbgs()
                    << "    - Dropping non-DUT segment " << path.back() << "\n");
         path = path.drop_back();
@@ -1061,15 +1119,58 @@ void ExtractInstancesPass::createTraceFiles() {
     }
 
     // Put the information in a verbatim operation.
-    auto verbatimOp = builder.create<sv::VerbatimOp>(
-        builder.getUnknownLoc(), buffer, ValueRange{},
-        builder.getArrayAttr(symbols));
-    auto fileAttr = hw::OutputFileAttr::getFromFilename(
-        builder.getContext(), fileName, /*excludeFromFilelist=*/true);
-    verbatimOp->setAttr("output_file", fileAttr);
+    builder.create<sv::VerbatimOp>(builder.getUnknownLoc(), buffer,
+                                   ValueRange{}, builder.getArrayAttr(symbols));
+  }
+  if (!classFields.empty()) {
+    addPortsToClass(classFields, extractMetadataClass);
+    // This extract instances metadata class, now needs to be instantiated
+    // inside the SifiveMetadata class. This also updates its signature, so keep
+    // the object of the SifiveMetadata class updated.
+    auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        sifiveMetadataClass->getLoc(), sifiveMetadataClass.getBodyBlock());
+    SmallVector<std::pair<Value, Twine>> classFields = {
+        {builderOM.create<ObjectOp>(
+             extractMetadataClass,
+             builderOM.getStringAttr("extract_instances_metadata")),
+         "extractedInstances_field"}};
+
+    addPortsToClass(classFields, sifiveMetadataClass);
+    auto *node = instanceGraph->lookup(sifiveMetadataClass);
+    assert(node && node->hasOneUse());
+    ObjectOp metadataObj =
+        dyn_cast_or_null<ObjectOp>((*node->usesBegin())->getInstance());
+    assert(metadataObj &&
+           "expected the class to be instantiated by an object op");
+    builderOM.setInsertionPoint(metadataObj);
+    auto newObj =
+        builderOM.create<ObjectOp>(sifiveMetadataClass, metadataObj.getName());
+    metadataObj->replaceAllUsesWith(newObj);
+    metadataObj->remove();
   }
 }
 
+void ExtractInstancesPass::createSchema() {
+
+  auto *context = circuitOp->getContext();
+  auto unknownLoc = mlir::UnknownLoc::get(context);
+  auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+      unknownLoc, circuitOp.getBodyBlock());
+  mlir::Type portsType[] = {
+      StringType::get(context), // name
+      PathType::get(context),   // extracted instance path
+      StringType::get(context)  // filename
+  };
+  StringRef portFields[] = {"name", "path", "filename"};
+
+  schemaClass = builderOM.create<ClassOp>("ExtractInstancesSchema", portFields,
+                                          portsType);
+
+  // Now create the class that will instantiate the schema objects.
+  SmallVector<PortInfo> mports;
+  extractMetadataClass = builderOM.create<ClassOp>(
+      builderOM.getStringAttr("ExtractInstancesMetadata"), mports);
+}
 //===----------------------------------------------------------------------===//
 // Pass Creation
 //===----------------------------------------------------------------------===//

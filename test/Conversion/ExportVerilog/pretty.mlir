@@ -23,8 +23,8 @@ sv.interface @IValidReady_Struct  {
 // CHECK-NEXT:          _GEN_1,
 // CHECK-NEXT:          _GEN_0,
 // CHECK-NEXT:          _GEN_0})};{{.*}}
-hw.module @structs(%clk: i1, %rstn: i1) {
-  %0 = sv.interface.instance {name = "iface"} : !sv.interface<@IValidReady_Struct>
+hw.module @structs(in %clk: i1, in %rstn: i1) {
+  %0 = sv.interface.instance name "iface" : !sv.interface<@IValidReady_Struct>
   sv.interface.signal.assign %0(@IValidReady_Struct::@data) = %s : !hw.struct<foo: !hw.array<72xi1>, bar: !hw.array<128xi1>, baz: !hw.array<224xi1>>
   %c0 = hw.constant 0 : i8
   %c64 = hw.constant 100000 : i64
@@ -40,8 +40,8 @@ hw.module @structs(%clk: i1, %rstn: i1) {
 
 // CHECK-LABEL:module CoverAssert({{.*}}
 hw.module @CoverAssert(
-  %clock: i1, %reset: i1,
-  %eeeeee_fffff_gggggg_hhh_i_jjjjj_kkkkkkkkk_lllllll_mmmmmmmmm_nnnnnnnn_0: i4) {
+  in %clock: i1, in %reset: i1,
+  in %eeeeee_fffff_gggggg_hhh_i_jjjjj_kkkkkkkkk_lllllll_mmmmmmmmm_nnnnnnnn_0: i4) {
     %c0_i4 = hw.constant 0 : i4
     %true = hw.constant true
 
@@ -67,7 +67,7 @@ hw.module @CoverAssert(
     sv.assert.concurrent posedge %clock, %5 label "assert__label" message "assert failed"
 }
 
-hw.module @MuxChain(%a_0: i1, %a_1: i1, %a_2: i1, %c_0: i1, %c_1: i1, %c_2: i1) -> (out: i1) {
+hw.module @MuxChain(in %a_0: i1, in %a_1: i1, in %a_2: i1, in %c_0: i1, in %c_1: i1, in %c_2: i1, out out: i1) {
   %0 = comb.mux bin %a_1, %c_1, %c_0 : i1
   %1 = comb.mux bin %a_0, %0, %c_2 : i1
   %2 = comb.mux bin %a_2, %1, %c_1 : i1
@@ -157,4 +157,148 @@ hw.module @MuxChain(%a_0: i1, %a_1: i1, %a_2: i1, %c_0: i1, %c_1: i1, %c_2: i1) 
 // CHECK-NEXT:                                                                                                                    : c_0)
 // CHECK-NEXT:                                                                                                               : c_2)
 // CHECK-NEXT:                                                                                                          : c_1;{{.*}}
+}
+
+// -----
+
+// CHECK-LABEL:module svattrs{{.*}}
+hw.module @svattrs() {
+//      CHECK:  (* dont_merge, dont_retime = true, foo0 = bar0, foo1 = bar1, foo2 = bar2, foo3 = bar3,
+// CHECK-NEXT:     foo4 = bar4, foo5 = bar5, foo6 = bar6 *)
+// CHECK-NEXT:  reg [9:0] reg0;{{.*}}
+  %reg0 = sv.reg {
+    sv.attributes = [
+      #sv.attribute<"dont_merge">,
+      #sv.attribute<"dont_retime" ="true">,
+      #sv.attribute<"foo0"="bar0">,
+      #sv.attribute<"foo1"="bar1">,
+      #sv.attribute<"foo2"="bar2">,
+      #sv.attribute<"foo3"="bar3">,
+      #sv.attribute<"foo4"="bar4">,
+      #sv.attribute<"foo5"="bar5">,
+      #sv.attribute<"foo6"="bar6">
+   ]} : !hw.inout<i10>
+
+//      CHECK:  (* start *)
+// CHECK-NEXT:  /* foo0 = bar0, foo1 = bar1, foo2 = bar2, foo3 = bar3, foo4 = bar4, foo5 = bar5,
+// CHECK-NEXT:     foo6 = bar6 */
+// CHECK-NEXT:  (* foo0 = bar0, foo1 = bar1, foo2 = bar2, foo3 = bar3, foo4 = bar4, foo5 = bar5,
+// CHECK-NEXT:     foo6 = bar6 *)
+// CHECK-NEXT:  reg [9:0] reg1;{{.*}}
+  %reg1 = sv.reg {
+    sv.attributes = [
+      #sv.attribute<"start">,
+      #sv.attribute<"foo0"="bar0", emitAsComment>,
+      #sv.attribute<"foo1"="bar1", emitAsComment>,
+      #sv.attribute<"foo2"="bar2", emitAsComment>,
+      #sv.attribute<"foo3"="bar3", emitAsComment>,
+      #sv.attribute<"foo4"="bar4", emitAsComment>,
+      #sv.attribute<"foo5"="bar5", emitAsComment>,
+      #sv.attribute<"foo6"="bar6", emitAsComment>,
+      #sv.attribute<"foo0"="bar0">,
+      #sv.attribute<"foo1"="bar1">,
+      #sv.attribute<"foo2"="bar2">,
+      #sv.attribute<"foo3"="bar3">,
+      #sv.attribute<"foo4"="bar4">,
+      #sv.attribute<"foo5"="bar5">,
+      #sv.attribute<"foo6"="bar6">
+   ]} : !hw.inout<i10>
+
+// Put containers on same line if they fit!
+//      CHECK:  (* start *) /* comment */ (* end *)
+// CHECK-NEXT:  reg [9:0] reg2;{{.*}}
+  %reg2 = sv.reg {
+    sv.attributes = [
+      #sv.attribute<"start">,
+      #sv.attribute<"comment", emitAsComment>,
+      #sv.attribute<"end">
+   ]} : !hw.inout<i10>
+
+// Check behavior where some fit and some don't:
+// (notably don't glue '(* end *)' after the comment container)
+//      CHECK:  (* start *)
+// CHECK-NEXT:  /* foo0 = bar0, foo1 = bar1, foo2 = bar2, foo3 = bar3, foo4 = bar4, foo5 = bar5,
+// CHECK-NEXT:     foo6 = bar6 */
+// CHECK-NEXT:  (* end *)
+// CHECK-NEXT:  reg [9:0] reg3;{{.*}}
+  %reg3 = sv.reg {
+    sv.attributes = [
+      #sv.attribute<"start">,
+      #sv.attribute<"foo0"="bar0", emitAsComment>,
+      #sv.attribute<"foo1"="bar1", emitAsComment>,
+      #sv.attribute<"foo2"="bar2", emitAsComment>,
+      #sv.attribute<"foo3"="bar3", emitAsComment>,
+      #sv.attribute<"foo4"="bar4", emitAsComment>,
+      #sv.attribute<"foo5"="bar5", emitAsComment>,
+      #sv.attribute<"foo6"="bar6", emitAsComment>,
+      #sv.attribute<"end">
+   ]} : !hw.inout<i10>
+}
+
+// -----
+
+sv.macro.decl @RANDOM
+
+// CHECK-LABEL:module ForStatement{{.*}}
+hw.module @ForStatement(in %aaaaaaaaaaa: i5, in %xxxxxxxxxxxxxxx : i2, in %yyyyyyyyyyyyyyy : i2, in %zzzzzzzzzzzzzzz : i2) {
+  %_RANDOM = sv.logic : !hw.inout<uarray<3xi32>>
+  sv.initial {
+    %x_and_y = comb.and %xxxxxxxxxxxxxxx, %yyyyyyyyyyyyyyy : i2
+    %x_or_y = comb.or %xxxxxxxxxxxxxxx, %yyyyyyyyyyyyyyy : i2
+    %lowerBound = comb.sub %x_and_y, %x_or_y : i2
+    %upperBound = comb.and %x_or_y, %x_and_y : i2
+    %eq = comb.icmp eq %xxxxxxxxxxxxxxx, %yyyyyyyyyyyyyyy : i2
+    %step = comb.mux %eq, %x_and_y, %x_or_y : i2
+    //      CHECK:    for (logic [1:0] iiiiiiiiiiiiiiiiiiiiiiiii = _GEN - _GEN_0;
+    // CHECK-NEXT:         iiiiiiiiiiiiiiiiiiiiiiiii < _GEN_0 & _GEN;
+    // CHECK-NEXT:         iiiiiiiiiiiiiiiiiiiiiiiii +=
+    // CHECK-NEXT:           xxxxxxxxxxxxxxx == yyyyyyyyyyyyyyy ? _GEN : _GEN_0) begin
+    // CHECK-NEXT:      _RANDOM[iiiiiiiiiiiiiiiiiiiiiiiii] = `RANDOM;{{.*}}
+    // CHECK-NEXT:    end{{.*}}
+    sv.for %iiiiiiiiiiiiiiiiiiiiiiiii = %lowerBound to %upperBound step %step : i2 {
+      %RANDOM = sv.macro.ref.expr.se @RANDOM() : () -> i32
+      %index = sv.array_index_inout %_RANDOM[%iiiiiiiiiiiiiiiiiiiiiiiii] : !hw.inout<uarray<3xi32>>, i2
+      sv.bpassign %index, %RANDOM : i32
+    }
+  }
+}
+
+// -----
+
+sv.macro.decl @TEST_COND
+sv.macro.decl @TEST_COND_
+
+// CHECK-LABEL:module TestCond{{.*}}
+// CHECK-NEXT:  `ifdef TEST_COND_{{.*}}
+// CHECK-NEXT:    `define TEST_COND TEST_COND_
+// CHECK-NEXT:  `else  // TEST_COND_
+// CHECK-NEXT:    `define TEST_COND 1
+// CHECK-NEXT:  `endif // TEST_COND_
+hw.module @TestCond() {
+  sv.ifdef @TEST_COND_ {
+   sv.macro.def @TEST_COND "TEST_COND_"
+  } else {
+   sv.macro.def @TEST_COND "1"
+  }
+  hw.output
+}
+
+// -----
+
+// Declaration keyword, type, and name alignment should not produce excessively
+// long lines when large aggregate types are involved. Lack of a declaration
+// keyword, i.e. when the declaration directly starts with a type, should not
+// indent the declaration.
+//
+// See https://github.com/llvm/circt/pull/6171
+
+// CHECK-LABEL:module Top{{.*}}
+// CHECK-NEXT:  reg        foo;{{.*}}
+// CHECK-NEXT:  reg [63:0] bar;{{.*}}
+// CHECK-NEXT:  struct packed {logic dw; logic [3:0] fn; logic [63:0] in; } agg;{{.*}}
+// CHECK-NEXT:endmodule
+hw.module @Top() {
+  %foo = sv.reg : !hw.inout<i1>
+  %bar = sv.reg : !hw.inout<i64>
+  %agg = sv.reg : !hw.inout<struct<dw: i1, fn: i4, in: i64>>
 }

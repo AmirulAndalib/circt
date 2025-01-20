@@ -14,6 +14,9 @@
 #define CIRCT_DIALECT_SV_OPS_H
 
 #include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/LTL/LTLDialect.h"
+#include "circt/Dialect/LTL/LTLTypes.h"
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVTypes.h"

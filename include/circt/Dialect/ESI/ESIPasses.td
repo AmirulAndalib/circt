@@ -16,6 +16,8 @@
 
 include "mlir/Pass/PassBase.td"
 
+include "circt/Dialect/ESI/ESIDialect.td"
+
 def ESIConnectServices : Pass<"esi-connect-services", "mlir::ModuleOp"> {
   let summary = "Connect up ESI service requests to service providers";
   let constructor = "circt::esi::createESIConnectServicesPass()";
@@ -24,22 +26,40 @@ def ESIConnectServices : Pass<"esi-connect-services", "mlir::ModuleOp"> {
     "circt::comb::CombDialect"];
 }
 
-def ESIEmitCollateral: Pass<"esi-emit-collateral", "mlir::ModuleOp"> {
-  let summary = "Emit all the neccessary collateral";
-  let constructor = "circt::esi::createESIEmitCollateralPass()";
-  let dependentDialects = ["circt::sv::SVDialect"];
+def ESIAppIDHier : Pass<"esi-appid-hier", "mlir::ModuleOp"> {
+  let summary = "Build an AppID based hierarchy rooted at top module 'top'";
+  let constructor = "circt::esi::createESIAppIDHierPass()";
   let options = [
-    Option<"schemaFile", "schema-file", "std::string",
-           "", "File to output capnp schema into">,
-    ListOption<"tops", "tops", "std::string",
-               "List of top modules to export Tcl for",
-               "llvm::cl::ZeroOrMore,">
+    Option<"top", "top", "std::string",
+           "", "Root module of the instance hierarchy">
   ];
+}
+
+def ESIBuildManifest : Pass<"esi-build-manifest", "mlir::ModuleOp"> {
+  let summary = "Build a manifest of an ESI system";
+  let constructor = "circt::esi::createESIBuildManifestPass()";
+  let dependentDialects = ["circt::hw::HWDialect", "circt::sv::SVDialect"];
+  let options = [
+    Option<"top", "top", "std::string",
+           "", "Root module of the instance hierarchy">
+  ];
+}
+
+def ESICleanMetadata : Pass<"esi-clean-metadata", "mlir::ModuleOp"> {
+  let summary = "Clean up ESI service metadata";
+  let constructor = "circt::esi::createESICleanMetadataPass()";
+  let dependentDialects = ["circt::hw::HWDialect"];
 }
 
 def LowerESIToPhysical: Pass<"lower-esi-to-physical", "mlir::ModuleOp"> {
   let summary = "Lower ESI abstract Ops to ESI physical ops.";
   let constructor = "circt::esi::createESIPhysicalLoweringPass()";
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
+def LowerESIBundles: Pass<"lower-esi-bundles", "mlir::ModuleOp"> {
+  let summary = "Lower ESI bundles to channels.";
+  let constructor = "circt::esi::createESIBundleLoweringPass()";
   let dependentDialects = ["circt::hw::HWDialect"];
 }
 
@@ -49,10 +69,25 @@ def LowerESIPorts: Pass<"lower-esi-ports", "mlir::ModuleOp"> {
   let dependentDialects = ["circt::comb::CombDialect", "circt::sv::SVDialect"];
 }
 
+def LowerESITypes: Pass<"lower-esi-types", "mlir::ModuleOp"> {
+  let summary = "Lower ESI high level types.";
+  let constructor = "circt::esi::createESITypeLoweringPass()";
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
 def LowerESItoHW: Pass<"lower-esi-to-hw", "mlir::ModuleOp"> {
   let summary = "Lower ESI to HW where possible and SV elsewhere.";
   let constructor = "circt::esi::createESItoHWPass()";
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+  let options = [
+    Option<"platform", "platform", "std::string",
+           "", "Target this platform">
+  ];
+}
+
+def VerifyESIConnections: Pass<"verify-esi-connections"> {
+  let summary = "Verify that channels and bundles are only used once";
+  let constructor = "circt::esi::createESIVerifyConnectionsPass()";
 }
 
 #endif // CIRCT_DIALECT_ESI_ESIPASSES_TD

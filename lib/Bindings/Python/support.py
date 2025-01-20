@@ -4,6 +4,8 @@
 
 from . import ir
 
+from ._mlir_libs._circt._support import _walk_with_filter
+from .ir import Operation
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from typing import List
@@ -86,7 +88,7 @@ def type_to_pytype(t) -> ir.Type:
   if t.__class__ != ir.Type:
     return t
 
-  from .dialects import esi, hw
+  from .dialects import esi, hw, seq
   try:
     return ir.IntegerType(t)
   except ValueError:
@@ -112,7 +114,19 @@ def type_to_pytype(t) -> ir.Type:
   except ValueError:
     pass
   try:
+    return seq.ClockType(t)
+  except ValueError:
+    pass
+  try:
     return esi.ChannelType(t)
+  except ValueError:
+    pass
+  try:
+    return esi.AnyType(t)
+  except ValueError:
+    pass
+  try:
+    return esi.BundleType(t)
   except ValueError:
     pass
 
@@ -131,15 +145,20 @@ def attribute_to_var(attr):
 
   # If it's not the root type, assume it's already been downcasted and don't do
   # the expensive probing below.
-  if attr.__class__ != ir.Attribute:
-    return attr
+  if attr.__class__ != ir.Attribute and hasattr(attr, "value"):
+    return attr.value
 
+  from .dialects import hw, om
   try:
     return ir.BoolAttr(attr).value
   except ValueError:
     pass
   try:
     return ir.IntegerAttr(attr).value
+  except ValueError:
+    pass
+  try:
+    return ir.StringAttr(hw.InnerSymAttr(attr).symName).value
   except ValueError:
     pass
   try:
@@ -162,6 +181,31 @@ def attribute_to_var(attr):
   try:
     dict = ir.DictAttr(attr)
     return {i.name: attribute_to_var(i.attr) for i in dict}
+  except ValueError:
+    pass
+  try:
+    return attribute_to_var(om.ReferenceAttr(attr).inner_ref)
+  except ValueError:
+    pass
+  try:
+    ref = hw.InnerRefAttr(attr)
+    return (ir.StringAttr(ref.module).value, ir.StringAttr(ref.name).value)
+  except ValueError:
+    pass
+  try:
+    return list(map(attribute_to_var, om.ListAttr(attr)))
+  except ValueError:
+    pass
+  try:
+    return {name: attribute_to_var(value) for name, value in om.MapAttr(attr)}
+  except ValueError:
+    pass
+  try:
+    return int(str(om.OMIntegerAttr(attr)))
+  except ValueError:
+    pass
+  try:
+    return om.PathAttr(attr).value
   except ValueError:
     pass
 
@@ -195,6 +239,7 @@ class BackedgeBuilder(AbstractContextManager):
       self.instance_of = instance_of
       self.op_view = op_view
       self.port_name = backedge_name
+      self.loc = loc
       self.erased = False
 
     @property
@@ -208,7 +253,8 @@ class BackedgeBuilder(AbstractContextManager):
         self.creator.edges.remove(self)
         self.dummy_op.operation.erase()
 
-  def __init__(self):
+  def __init__(self, circuit_name: str = ""):
+    self.circuit_name = circuit_name
     self.edges = set()
 
   @staticmethod
@@ -249,10 +295,13 @@ class BackedgeBuilder(AbstractContextManager):
       if edge.op_view is not None:
         op = edge.op_view.operation
         msg += "Instance:   " + str(op)
+      if edge.loc is not None:
+        msg += "Location:   " + str(edge.loc)
       errors.append(msg)
 
     if errors:
-      errors.insert(0, "Uninitialized backedges remain in circuit!")
+      errors.insert(
+          0, f"Uninitialized backedges remain in module '{self.circuit_name}'")
       raise RuntimeError("\n".join(errors))
 
 
@@ -369,3 +418,13 @@ class NamedValueOpView:
   def operation(self):
     """Get the operation associated with this builder."""
     return self.opview.operation
+
+
+# Helper function to walk operation with a filter on operation names.
+# `op_views` is a list of operation views to visit. This is a wrapper
+# around the C++ implementation of walk_with_filter.
+def walk_with_filter(operation: Operation, op_views: List[ir.OpView], callback,
+                     walk_order):
+  op_names_identifiers = [name.OPERATION_NAME for name in op_views]
+  return _walk_with_filter(operation, op_names_identifiers, callback,
+                           walk_order)

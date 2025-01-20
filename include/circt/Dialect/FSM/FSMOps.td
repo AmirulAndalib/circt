@@ -12,14 +12,15 @@
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
-include "circt/Dialect/HW/HWOpInterfaces.td"
+include "circt/Dialect/Seq/SeqTypes.td"
+include "circt/Support/InstanceGraphInterface.td"
 
 def HasCustomSSAName : DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>;
 
 def MachineOp : FSMOp<"machine", [
       FunctionOpInterface,
       Symbol, SymbolTable, NoTerminator,
-      DeclareOpInterfaceMethods<HWModuleLike>]> {
+      DeclareOpInterfaceMethods<InstanceGraphModuleOpInterface>]> {
   let summary = "Define a finite-state machine";
   let description = [{
     `fsm.machine` represents a finite-state machine, including a machine name,
@@ -61,11 +62,18 @@ def MachineOp : FSMOp<"machine", [
     /// Returns the result types of this function.
     ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
 
+    /// Returns the region on the current operation that is callable. This may
+    /// return null in the case of an external callable object, e.g. an external
+    /// function.
+    ::mlir::Region *getCallableRegion() {
+      return &getBody();
+    }
+
     /// Verify the type attribute of this function. Returns failure and emits
     /// an error if the attribute is invalid.
     LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<FunctionType>())
+      if (!llvm::isa<FunctionType>(type))
         return emitOpError("requires '" + getFunctionTypeAttrName().getValue() +
                            "' attribute of function type");
       return success();
@@ -76,21 +84,11 @@ def MachineOp : FSMOp<"machine", [
 
     /// Return the name of the i'th result of this machine.
     StringAttr getResName(size_t i);
-  }];
 
-  let extraClassDefinition = [{
-    size_t $cppClass::getNumPorts() {
-      auto machineType = getFunctionType();
-      return machineType.getNumInputs() + machineType.getNumResults();
-    }
-
-    circt::hw::InnerSymAttr $cppClass::getPortSymbolAttr(size_t portIndex) {
-      for (NamedAttribute argAttr :
-           mlir::function_interface_impl::getArgAttrs(*this, portIndex))
-        if (auto sym = argAttr.getValue().dyn_cast<circt::hw::InnerSymAttr>())
-          return sym;
-      return circt::hw::InnerSymAttr();
-    }
+    //===------------------------------------------------------------------===//
+    // PortList Methods
+    //===------------------------------------------------------------------===//
+    SmallVector<::circt::hw::PortInfo> getPortList();
   }];
 
   let skipDefaultBuilders = 1;
@@ -98,21 +96,26 @@ def MachineOp : FSMOp<"machine", [
   let hasVerifier = 1;
 }
 
-def InstanceOp : FSMOp<"instance", [Symbol, HasCustomSSAName]> {
+def InstanceOp : FSMOp<"instance", [HasCustomSSAName]> {
   let summary = "Create an instance of a state machine";
   let description = [{
     `fsm.instance` represents an instance of a state machine, including an
     instance name and a symbol reference of the machine.
   }];
 
-  let arguments = (ins StrAttr:$sym_name, FlatSymbolRefAttr:$machine);
+  let arguments = (ins StrAttr:$name, FlatSymbolRefAttr:$machine);
   let results = (outs InstanceType:$instance);
 
-  let assemblyFormat = [{ $sym_name $machine attr-dict }];
+  let assemblyFormat = [{ $name $machine attr-dict }];
 
   let extraClassDeclaration = [{
     /// Lookup the machine for the symbol. This returns null on invalid IR.
     MachineOp getMachineOp();
+
+    //===------------------------------------------------------------------===//
+    // PortList Methods
+    //===------------------------------------------------------------------===//
+    SmallVector<::circt::hw::PortInfo> getPortList();
   }];
 
   let hasVerifier = 1;
@@ -142,8 +145,7 @@ def TriggerOp : FSMOp<"trigger", []> {
 }
 
 def HWInstanceOp : FSMOp<"hw_instance", [
-    Symbol,
-    DeclareOpInterfaceMethods<HWInstanceLike>
+    DeclareOpInterfaceMethods<InstanceGraphInstanceOpInterface>
   ]> {
   let summary = "Create a hardware-style instance of a state machine";
   let description = [{
@@ -153,12 +155,12 @@ def HWInstanceOp : FSMOp<"hw_instance", [
     machine.
   }];
 
-  let arguments = (ins StrAttr:$sym_name, FlatSymbolRefAttr:$machine,
-                       Variadic<AnyType>:$inputs, I1:$clock, I1:$reset);
+  let arguments = (ins StrAttr:$name, FlatSymbolRefAttr:$machine,
+                       Variadic<AnyType>:$inputs, ClockType:$clock, I1:$reset);
   let results = (outs Variadic<AnyType>:$outputs);
 
   let assemblyFormat = [{
-    $sym_name $machine attr-dict `(` $inputs `)`
+    $name $machine attr-dict `(` $inputs `)`
     `,` `clock` $clock `,` `reset` $reset `:` functional-type($inputs, $outputs)
   }];
 
@@ -167,20 +169,18 @@ def HWInstanceOp : FSMOp<"hw_instance", [
     MachineOp getMachineOp();
 
     /// Module name is the same as the machine name.
-    StringRef getModuleName() {
-      return getMachine();
-    }
-    FlatSymbolRefAttr getModuleNameAttr() {
-      return getMachineAttr();
+    StringRef getModuleName();
+
+    FlatSymbolRefAttr getModuleNameAttr();
+
+    StringAttr getReferencedModuleNameAttr() {
+      return getModuleNameAttr().getAttr();
     }
 
-    // HWInstanceLike interface
-    StringRef getInstanceName() {
-      return getSymName();
-    }
-    StringAttr getInstanceNameAttr() {
-      return getSymNameAttr();
-    }
+    //===------------------------------------------------------------------===//
+    // PortList Methods
+    //===------------------------------------------------------------------===//
+    SmallVector<::circt::hw::PortInfo> getPortList();
   }];
 
   let hasVerifier = 1;
@@ -222,7 +222,8 @@ def StateOp : FSMOp<"state", [HasParent<"MachineOp">, Symbol, NoTerminator]> {
   }];
 
   let builders = [
-    OpBuilder<(ins "StringRef":$stateName)>
+    OpBuilder<(ins "StringRef":$stateName)>,
+    OpBuilder<(ins "StringRef":$stateName, "ValueRange":$outputs)>
   ];
 
   let skipDefaultBuilders = 1;
@@ -301,8 +302,11 @@ def TransitionOp : FSMOp<"transition", [HasParent<"StateOp">, NoTerminator]> {
   }];
 
   let builders = [
-    OpBuilder<(ins "StringRef":$nextState)>,
-    OpBuilder<(ins "fsm::StateOp":$nextState)>
+    // OpBuilder<(ins "StringRef":$nextState)>,
+    OpBuilder<(ins "fsm::StateOp":$nextState)>,
+    OpBuilder<(ins "StringRef":$nextState,
+                   CArg<"llvm::function_ref<void()>", "{}">:$guardCtor,
+                   CArg<"llvm::function_ref<void()>", "{}">:$actionCtor)>
   ];
 
   let skipDefaultBuilders = 1;

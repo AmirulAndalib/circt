@@ -6,25 +6,32 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
-#include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Support/Debug.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/APSInt.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-remove-unused-ports"
 
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_REMOVEUNUSEDPORTS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
+
 using namespace circt;
 using namespace firrtl;
 
 namespace {
 struct RemoveUnusedPortsPass
-    : public RemoveUnusedPortsBase<RemoveUnusedPortsPass> {
+    : public circt::firrtl::impl::RemoveUnusedPortsBase<RemoveUnusedPortsPass> {
   void runOnOperation() override;
   void removeUnusedModulePorts(FModuleOp module,
                                InstanceGraphNode *instanceGraphNode);
@@ -39,8 +46,7 @@ struct RemoveUnusedPortsPass
 
 void RemoveUnusedPortsPass::runOnOperation() {
   auto &instanceGraph = getAnalysis<InstanceGraph>();
-  LLVM_DEBUG(llvm::dbgs() << "===----- Remove unused ports -----==="
-                          << "\n");
+  LLVM_DEBUG(debugPassHeader(this) << "\n");
   // Iterate in the reverse order of instance graph iterator, i.e. from leaves
   // to top.
   for (auto *node : llvm::post_order(&instanceGraph))
@@ -67,7 +73,7 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
     auto arg = module.getArgument(index);
 
     // If the port is don't touch or has unprocessed annotations, we cannot
-    // remove the port. Maybe we can allow annotations though.
+    // remove the port.
     if ((hasDontTouch(arg) || !port.annotations.empty()) && !ignoreDontTouch)
       continue;
 
@@ -96,7 +102,7 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
         auto builder = ImplicitLocOpBuilder::atBlockBegin(
             arg.getLoc(), module.getBodyBlock());
         auto wire = builder.create<WireOp>(arg.getType());
-        arg.replaceAllUsesWith(wire);
+        arg.replaceAllUsesWith(wire.getResult());
         outputPortConstants.push_back(std::nullopt);
       } else if (arg.hasOneUse()) {
         // If the port has a single use, check the port is only connected to
@@ -162,7 +168,7 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
           return false;
         });
 
-        result.replaceUsesWithIf(wire, [&](OpOperand &op) -> bool {
+        result.replaceUsesWithIf(wire.getResult(), [&](OpOperand &op) -> bool {
           // Connects can be deleted directly.
           if (onlyWritten && isa<FConnectLike>(op.getOwner())) {
             op.getOwner()->erase();

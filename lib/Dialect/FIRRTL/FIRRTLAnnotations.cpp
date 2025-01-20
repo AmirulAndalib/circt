@@ -17,15 +17,16 @@
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/HW/HWAttributes.h"
-#include "mlir/IR/FunctionImplementation.h"
+#include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 using namespace circt;
 using namespace firrtl;
 
 static ArrayAttr getAnnotationsFrom(Operation *op) {
-  if (auto annots = op->getAttrOfType<ArrayAttr>(getAnnotationAttrName()))
+  if (auto annots = getAnnotationsIfPresent(op))
     return annots;
   return ArrayAttr::get(op->getContext(), {});
 }
@@ -62,7 +63,7 @@ AnnotationSet::AnnotationSet(Operation *op)
 static AnnotationSet forPort(Operation *op, size_t portNo) {
   auto ports = op->getAttrOfType<ArrayAttr>(getPortAnnotationAttrName());
   if (ports && !ports.empty())
-    return AnnotationSet(ports[portNo].cast<ArrayAttr>());
+    return AnnotationSet(cast<ArrayAttr>(ports[portNo]));
   return AnnotationSet(ArrayAttr::get(op->getContext(), {}));
 }
 
@@ -76,10 +77,10 @@ AnnotationSet AnnotationSet::forPort(MemOp op, size_t portNo) {
 
 /// Get an annotation set for the specified value.
 AnnotationSet AnnotationSet::get(Value v) {
-  if (auto op = v.getDefiningOp())
+  if (auto *op = v.getDefiningOp())
     return AnnotationSet(op);
   // If its not an Operation, then must be a block argument.
-  auto arg = v.dyn_cast<BlockArgument>();
+  auto arg = dyn_cast<BlockArgument>(v);
   auto module = cast<FModuleOp>(arg.getOwner()->getParentOp());
   return forPort(module, arg.getArgNumber());
 }
@@ -104,106 +105,17 @@ static bool applyToPort(AnnotationSet annos, Operation *op, size_t portCount,
     portAnnotations.append(before.begin(), before.end());
   portAnnotations[portNo] = annos.getArrayAttr();
   auto after = ArrayAttr::get(context, portAnnotations);
-  op->setAttr(getPortAnnotationAttrName(), after);
+  if (before != after)
+    op->setAttr(getPortAnnotationAttrName(), after);
   return before != after;
 }
 
 bool AnnotationSet::applyToPort(FModuleLike op, size_t portNo) const {
-  return ::applyToPort(*this, op.getOperation(), getNumPorts(op), portNo);
+  return ::applyToPort(*this, op.getOperation(), op.getNumPorts(), portNo);
 }
 
 bool AnnotationSet::applyToPort(MemOp op, size_t portNo) const {
   return ::applyToPort(*this, op.getOperation(), op->getNumResults(), portNo);
-}
-
-static bool applyToAttrListImpl(const AnnotationSet &annoSet, StringRef key,
-                                NamedAttrList &attrs) {
-  if (annoSet.empty())
-    return bool(attrs.erase(key));
-  else {
-    auto attr = annoSet.getArrayAttr();
-    return attrs.set(key, attr) != attr;
-  }
-}
-
-/// Store the annotations in this set in a `NamedAttrList` as an array attribute
-/// with the name `annotations`.
-bool AnnotationSet::applyToAttrList(NamedAttrList &attrs) const {
-  return applyToAttrListImpl(*this, getAnnotationAttrName(), attrs);
-}
-
-/// Store the annotations in this set in a `NamedAttrList` as an array attribute
-/// with the name `firrtl.annotations`.
-bool AnnotationSet::applyToPortAttrList(NamedAttrList &attrs) const {
-  return applyToAttrListImpl(*this, getDialectAnnotationAttrName(), attrs);
-}
-
-static DictionaryAttr applyToDictionaryAttrImpl(const AnnotationSet &annoSet,
-                                                StringRef key,
-                                                ArrayRef<NamedAttribute> attrs,
-                                                bool sorted,
-                                                DictionaryAttr originalDict) {
-  // Find the location in the dictionary where the entry would go.
-  ArrayRef<NamedAttribute>::iterator it;
-  if (sorted) {
-    it = llvm::lower_bound(attrs, key);
-    if (it != attrs.end() && it->getName() != key)
-      it = attrs.end();
-  } else {
-    it = llvm::find_if(
-        attrs, [key](NamedAttribute attr) { return attr.getName() == key; });
-  }
-
-  // Fast path in case there are no annotations in the dictionary and we are not
-  // supposed to add any.
-  if (it == attrs.end() && annoSet.empty())
-    return originalDict;
-
-  // Fast path in case there already is an entry in the dictionary, it matches
-  // the set, and, in the case we're supposed to remove empty sets, we're not
-  // leaving an empty entry in the dictionary.
-  if (it != attrs.end() && it->getValue() == annoSet.getArrayAttr() &&
-      !annoSet.empty())
-    return originalDict;
-
-  // If we arrive here, we are supposed to assemble a new dictionary.
-  SmallVector<NamedAttribute> newAttrs;
-  newAttrs.reserve(attrs.size() + 1);
-  newAttrs.append(attrs.begin(), it);
-  if (!annoSet.empty())
-    newAttrs.push_back(
-        {StringAttr::get(annoSet.getContext(), key), annoSet.getArrayAttr()});
-  if (it != attrs.end())
-    newAttrs.append(it + 1, attrs.end());
-  return sorted ? DictionaryAttr::getWithSorted(annoSet.getContext(), newAttrs)
-                : DictionaryAttr::get(annoSet.getContext(), newAttrs);
-}
-
-/// Update the attribute dictionary of an operation to contain this annotation
-/// set.
-DictionaryAttr
-AnnotationSet::applyToDictionaryAttr(DictionaryAttr attrs) const {
-  return applyToDictionaryAttrImpl(*this, getAnnotationAttrName(),
-                                   attrs.getValue(), true, attrs);
-}
-
-DictionaryAttr
-AnnotationSet::applyToDictionaryAttr(ArrayRef<NamedAttribute> attrs) const {
-  return applyToDictionaryAttrImpl(*this, getAnnotationAttrName(), attrs, false,
-                                   {});
-}
-
-/// Update the attribute dictionary of a port to contain this annotation set.
-DictionaryAttr
-AnnotationSet::applyToPortDictionaryAttr(DictionaryAttr attrs) const {
-  return applyToDictionaryAttrImpl(*this, getDialectAnnotationAttrName(),
-                                   attrs.getValue(), true, attrs);
-}
-
-DictionaryAttr
-AnnotationSet::applyToPortDictionaryAttr(ArrayRef<NamedAttribute> attrs) const {
-  return applyToDictionaryAttrImpl(*this, getDialectAnnotationAttrName(), attrs,
-                                   false, {});
 }
 
 Annotation AnnotationSet::getAnnotationImpl(StringAttr className) const {
@@ -237,8 +149,7 @@ bool AnnotationSet::hasDontTouch() const {
 bool AnnotationSet::setDontTouch(bool dontTouch) {
   if (dontTouch)
     return addDontTouch();
-  else
-    return removeDontTouch();
+  return removeDontTouch();
 }
 
 bool AnnotationSet::addDontTouch() {
@@ -261,8 +172,7 @@ bool AnnotationSet::hasDontTouch(Operation *op) {
 bool AnnotationSet::setDontTouch(Operation *op, bool dontTouch) {
   if (dontTouch)
     return addDontTouch(op);
-  else
-    return removeDontTouch(op);
+  return removeDontTouch(op);
 }
 
 bool AnnotationSet::addDontTouch(Operation *op) {
@@ -350,14 +260,9 @@ bool AnnotationSet::removeAnnotation(StringRef className) {
 /// returns true.
 bool AnnotationSet::removeAnnotations(
     llvm::function_ref<bool(Annotation)> predicate) {
-  // Fast path for empty sets.
-  auto attr = getArrayAttr();
-  if (!attr)
-    return false;
-
   // Search for the first match.
   ArrayRef<Attribute> annos = getArrayAttr().getValue();
-  auto it = annos.begin();
+  auto *it = annos.begin();
   while (it != annos.end() && !predicate(Annotation(*it)))
     ++it;
 
@@ -382,8 +287,12 @@ bool AnnotationSet::removeAnnotations(
 /// Remove all annotations from an operation for which `predicate` returns true.
 bool AnnotationSet::removeAnnotations(
     Operation *op, llvm::function_ref<bool(Annotation)> predicate) {
-  AnnotationSet annos(op);
-  if (!annos.empty() && annos.removeAnnotations(predicate)) {
+  // Fast-path for no annotations.
+  auto annosArray = getAnnotationsIfPresent(op);
+  if (!annosArray)
+    return false;
+  AnnotationSet annos(annosArray);
+  if (annos.removeAnnotations(predicate)) {
     annos.applyToOperation(op);
     return true;
   }
@@ -400,7 +309,7 @@ bool AnnotationSet::removeAnnotations(Operation *op, StringRef className) {
 bool AnnotationSet::removePortAnnotations(
     Operation *module,
     llvm::function_ref<bool(unsigned, Annotation)> predicate) {
-  auto ports = module->getAttr("portAnnotations").dyn_cast_or_null<ArrayAttr>();
+  auto ports = dyn_cast_or_null<ArrayAttr>(module->getAttr("portAnnotations"));
   if (!ports || ports.empty())
     return false;
 
@@ -411,7 +320,7 @@ bool AnnotationSet::removePortAnnotations(
   bool changed = false;
   for (unsigned argNum = 0, argNumEnd = ports.size(); argNum < argNumEnd;
        ++argNum) {
-    AnnotationSet annos(AnnotationSet(ports[argNum].cast<ArrayAttr>()));
+    AnnotationSet annos(AnnotationSet(cast<ArrayAttr>(ports[argNum])));
 
     // Go through all annotations on this port and extract the interesting
     // ones. If any modifications were done, keep a reduced set of attributes
@@ -434,7 +343,7 @@ bool AnnotationSet::removePortAnnotations(
 //===----------------------------------------------------------------------===//
 
 DictionaryAttr Annotation::getDict() const {
-  return attr.cast<DictionaryAttr>();
+  return cast<DictionaryAttr>(attr);
 }
 
 void Annotation::setDict(DictionaryAttr dict) { attr = dict; }
@@ -486,8 +395,8 @@ void Annotation::removeMember(StringAttr name) {
   auto dict = getDict();
   SmallVector<NamedAttribute> attributes;
   attributes.reserve(dict.size() - 1);
-  auto i = dict.begin();
-  auto e = dict.end();
+  auto *i = dict.begin();
+  auto *e = dict.end();
   while (i != e && i->getValue() != name)
     attributes.push_back(*(i++));
   // If the member was not here, just return.
@@ -552,14 +461,8 @@ void AnnoTarget::setAnnotations(AnnotationSet annotations) const {
       [&](auto target) { target.setAnnotations(annotations); });
 }
 
-StringAttr AnnoTarget::getInnerSym(ModuleNamespace &moduleNamespace) const {
-  return TypeSwitch<AnnoTarget, StringAttr>(*this)
-      .Case<OpAnnoTarget, PortAnnoTarget>(
-          [&](auto target) { return target.getInnerSym(moduleNamespace); })
-      .Default([](auto target) { return StringAttr(); });
-}
-
-Attribute AnnoTarget::getNLAReference(ModuleNamespace &moduleNamespace) const {
+Attribute
+AnnoTarget::getNLAReference(hw::InnerSymbolNamespace &moduleNamespace) const {
   return TypeSwitch<AnnoTarget, Attribute>(*this)
       .Case<OpAnnoTarget, PortAnnoTarget>(
           [&](auto target) { return target.getNLAReference(moduleNamespace); })
@@ -581,32 +484,33 @@ void OpAnnoTarget::setAnnotations(AnnotationSet annotations) const {
   annotations.applyToOperation(getOp());
 }
 
-StringAttr OpAnnoTarget::getInnerSym(ModuleNamespace &moduleNamespace) const {
-  return ::getOrAddInnerSym(getOp(), "", getOp()->getParentOfType<FModuleOp>(),
-                            [&moduleNamespace](FModuleOp) -> ModuleNamespace & {
-                              return moduleNamespace;
-                            });
-}
-
 Attribute
-OpAnnoTarget::getNLAReference(ModuleNamespace &moduleNamespace) const {
+OpAnnoTarget::getNLAReference(hw::InnerSymbolNamespace &moduleNamespace) const {
   // If the op is a module, just return the module name.
   if (auto module = llvm::dyn_cast<FModuleLike>(getOp())) {
-    assert(module.moduleNameAttr() && "invalid NLA reference");
-    return FlatSymbolRefAttr::get(module.moduleNameAttr());
+    assert(module.getModuleNameAttr() && "invalid NLA reference");
+    return FlatSymbolRefAttr::get(module.getModuleNameAttr());
   }
   // Return an inner-ref to the target.
-  return ::getInnerRefTo(getOp(), "",
-                         [&moduleNamespace](FModuleOp) -> ModuleNamespace & {
-                           return moduleNamespace;
-                         });
+  return ::getInnerRefTo(
+      getOp(), [&moduleNamespace](auto _) -> hw::InnerSymbolNamespace & {
+        return moduleNamespace;
+      });
 }
 
 FIRRTLType OpAnnoTarget::getType() const {
   auto *op = getOp();
+  // Annotations that target operations are resolved like inner symbols.
+  if (auto is = llvm::dyn_cast<hw::InnerSymbolOpInterface>(op)) {
+    auto result = is.getTargetResult();
+    if (!result)
+      return {};
+    return type_cast<FIRRTLType>(result.getType());
+  }
+  // Fallback to assuming the single result is the target.
   if (op->getNumResults() != 1)
     return {};
-  return op->getResult(0).getType().cast<FIRRTLType>();
+  return type_cast<FIRRTLType>(op->getResult(0).getType());
 }
 
 PortAnnoTarget::PortAnnoTarget(FModuleLike op, unsigned portNo)
@@ -633,80 +537,23 @@ void PortAnnoTarget::setAnnotations(AnnotationSet annotations) const {
     llvm_unreachable("unknown port target");
 }
 
-StringAttr PortAnnoTarget::getInnerSym(ModuleNamespace &moduleNamespace) const {
-  // If this is not a module, we just need to get an inner_sym on the operation
-  // itself.
-  if (auto mod = ::llvm::dyn_cast<FModuleLike>(getOp()))
-    return ::getOrAddInnerSym(
-        mod, getPortNo(), "",
-        [&moduleNamespace](FModuleLike) -> ModuleNamespace & {
-          return moduleNamespace;
-        });
-  return ::getOrAddInnerSym(getOp(), "", getOp()->getParentOfType<FModuleOp>(),
-                            [&moduleNamespace](FModuleOp) -> ModuleNamespace & {
-                              return moduleNamespace;
-                            });
-}
-
-Attribute
-PortAnnoTarget::getNLAReference(ModuleNamespace &moduleNamespace) const {
+Attribute PortAnnoTarget::getNLAReference(
+    hw::InnerSymbolNamespace &moduleNamespace) const {
   auto module = llvm::dyn_cast<FModuleLike>(getOp());
-  if (!module)
-    return ::getInnerRefTo(getOp(), "",
-                           [&moduleNamespace](FModuleOp) -> ModuleNamespace & {
-                             return moduleNamespace;
-                           });
-
-  return ::getInnerRefTo(module, getPortNo(), "",
-                         [&moduleNamespace](FModuleLike) -> ModuleNamespace & {
-                           return moduleNamespace;
-                         });
+  auto target = module ? hw::InnerSymTarget(getPortNo(), module)
+                       : hw::InnerSymTarget(getOp());
+  return ::getInnerRefTo(
+      target, [&moduleNamespace](auto _) -> hw::InnerSymbolNamespace & {
+        return moduleNamespace;
+      });
 }
 
 FIRRTLType PortAnnoTarget::getType() const {
   auto *op = getOp();
   if (auto module = llvm::dyn_cast<FModuleLike>(op))
-    return module.getPortType(getPortNo()).cast<FIRRTLType>();
+    return type_cast<FIRRTLType>(module.getPortType(getPortNo()));
   if (llvm::isa<MemOp, InstanceOp>(op))
-    return op->getResult(getPortNo()).getType().cast<FIRRTLType>();
-  llvm_unreachable("unknow operation kind");
+    return type_cast<FIRRTLType>(op->getResult(getPortNo()).getType());
+  llvm_unreachable("unknown operation kind");
   return {};
-}
-
-//===----------------------------------------------------------------------===//
-// Annotation Details
-//===----------------------------------------------------------------------===//
-
-/// Check if an OMIR type is a string-encoded value that the FIRRTL dialect
-/// simply passes through as a string without any decoding.
-bool circt::firrtl::isOMIRStringEncodedPassthrough(StringRef type) {
-  return type == "OMID" || type == "OMReference" || type == "OMBigInt" ||
-         type == "OMLong" || type == "OMString" || type == "OMDouble" ||
-         type == "OMBigDecimal" || type == "OMDeleted" || type == "OMConstant";
-}
-
-//===----------------------------------------------------------------------===//
-// Utilities for Specific Annotations
-//
-// TODO: Remove these in favor of first-class annotations.
-//===----------------------------------------------------------------------===//
-
-LogicalResult circt::firrtl::extractDUT(const FModuleOp mod, FModuleOp &dut) {
-  if (!AnnotationSet(mod).hasAnnotation(dutAnnoClass))
-    return success();
-
-  // TODO: This check is duplicated multiple places, e.g., in
-  // WireDFT.  This should be factored out as part of the annotation
-  // lowering pass.
-  if (dut) {
-    auto diag = emitError(mod->getLoc())
-                << "is marked with a '" << dutAnnoClass << "', but '"
-                << dut.moduleName()
-                << "' also had such an annotation (this should "
-                   "be impossible!)";
-    diag.attachNote(dut.getLoc()) << "the first DUT was found here";
-    return failure();
-  }
-  dut = mod;
-  return success();
 }

@@ -59,9 +59,9 @@ with Context() as ctx, Location.unknown():
         print(e)
 
       # Note, the error here is actually caught and printed below.
-      # CHECK: Uninitialized backedges remain in circuit!
+      # CHECK: Uninitialized backedges remain in module 'instance_builder_tests'
       # CHECK: Backedge:   [[PORT_NAME:.+]]
-      # CHECK: InstanceOf: hw.module @one_input(%[[PORT_NAME]]: i32)
+      # CHECK: InstanceOf: hw.module @one_input(in %[[PORT_NAME]] : i32)
       # CHECK: Instance:   hw.instance "inst1" @one_input({{.+}})
       inst1 = one_input.instantiate("inst1")
 

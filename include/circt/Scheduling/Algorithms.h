@@ -48,8 +48,9 @@ LogicalResult scheduleSimplex(SharedOperatorsProblem &prob, Operation *lastOp);
 /// heuristic. The approach tries to determine the smallest feasible initiation
 /// interval, and to minimize the start time of the given \p lastOp, but
 /// optimality is not guaranteed. Fails if the dependence graph contains cycles
-/// that do not include at least one edge with a non-zero distance, or \p prob
-/// does not include \p lastOp.
+/// that do not include at least one edge with a non-zero distance, \p prob
+/// does not include \p lastOp, or \p lastOp is not the unique sink of the
+/// dependence graph.
 LogicalResult scheduleSimplex(ModuloProblem &prob, Operation *lastOp);
 
 /// Solve the acyclic, chaining-enabled problem using linear programming and a
@@ -59,6 +60,18 @@ LogicalResult scheduleSimplex(ModuloProblem &prob, Operation *lastOp);
 /// cycles, or individual operator types have delays larger than \p cycleTime,
 /// or \p prob does not include \p lastOp.
 LogicalResult scheduleSimplex(ChainingProblem &prob, Operation *lastOp,
+                              float cycleTime);
+
+/// Solve the resource-free cyclic, chaining-enabled problem using a linear
+/// programming-based and a handwritten implementation of the simplex algorithm.
+/// This approach is an hybrid approach of the ChainingProblem simplex scheduler
+/// and the CyclicProblem simplex scheduler. The objectives include determining
+/// the smallest feasible initiation interval, and to minimize the start time of
+/// a given \p lastOp. Fails if the dependence graph contains cycles that does
+/// not include at least one edge with a non-zero distance, individual operator
+/// types have delays larger than \p cycleTime, or \p prob does not include
+/// \p lastOp.
+LogicalResult scheduleSimplex(ChainingCyclicProblem &prob, Operation *lastOp,
                               float cycleTime);
 
 /// Solve the basic problem using linear programming and an external LP solver.

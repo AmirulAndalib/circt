@@ -16,13 +16,11 @@
 def HWArithDialect : Dialect {
   let name = "hwarith";
   let cppNamespace = "::circt::hwarith";
-
   let summary = "Types and operations for the HWArith dialect";
   let description = [{
     This dialect defines the `HWArith` dialect, modeling bit-width aware
     arithmetic operations.
   }];
-  let useFoldAPI = kEmitFoldAdaptorFolder;
 }
 
 #endif // HWARITHDIALECT_TD

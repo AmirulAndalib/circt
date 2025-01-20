@@ -11,14 +11,19 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HWToSystemC.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SystemC/SystemCOps.h"
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+#define GEN_PASS_DEF_CONVERTHWTOSYSTEMC
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -45,12 +50,11 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
     if (!module.getParameters().empty())
       return emitError(module->getLoc(), "module parameters not supported yet");
 
-    if (llvm::any_of(module.getAllPorts(),
-                     [](auto port) { return port.isInOut(); }))
+    auto ports = module.getPortList();
+    if (llvm::any_of(ports, [](auto &port) { return port.isInOut(); }))
       return emitError(module->getLoc(), "inout arguments not supported yet");
 
     // Create the SystemC module.
-    SmallVector<PortInfo> ports = module.getAllPorts();
     for (size_t i = 0; i < ports.size(); ++i)
       ports[i].type = typeConverter->convertType(ports[i].type);
 
@@ -59,17 +63,9 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
     auto *outputOp = module.getBodyBlock()->getTerminator();
     scModule.setVisibility(module.getVisibility());
 
-    SmallVector<Attribute> portAttrs;
-    if (auto argAttrs = module.getAllArgAttrs())
-      portAttrs.append(argAttrs.begin(), argAttrs.end());
-    else
-      portAttrs.append(module.getNumInputs(), Attribute());
-    if (auto resultAttrs = module.getAllResultAttrs())
-      portAttrs.append(resultAttrs.begin(), resultAttrs.end());
-    else
-      portAttrs.append(module.getNumOutputs(), Attribute());
-
-    scModule.setAllArgAttrs(portAttrs);
+    auto portAttrs = module.getAllPortAttrs();
+    if (!portAttrs.empty())
+      scModule.setAllArgAttrs(portAttrs);
 
     // Create a systemc.func operation inside the module after the ctor.
     // TODO: implement logic to extract a better name and properly unique it.
@@ -93,7 +89,7 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
     // Register the sensitivities of above SC_METHOD registration.
     SmallVector<Value> sensitivityValues(
         llvm::make_filter_range(scModule.getArguments(), [](BlockArgument arg) {
-          return !arg.getType().isa<OutputType>();
+          return !isa<OutputType>(arg.getType());
         }));
     if (!sensitivityValues.empty())
       rewriter.create<SensitiveOp>(scModule.getLoc(), sensitivityValues);
@@ -101,13 +97,14 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
     // Move the block arguments of the systemc.func (that we got from the
     // hw.module) to the systemc.module
     rewriter.setInsertionPointToStart(scFunc.getBodyBlock());
+    auto portsLocal = module.getPortList();
     for (size_t i = 0, e = scFunc.getRegion().getNumArguments(); i < e; ++i) {
       auto inputRead =
           rewriter
               .create<SignalReadOp>(scFunc.getLoc(), scModule.getArgument(i))
               .getResult();
       auto converted = typeConverter->materializeSourceConversion(
-          rewriter, scModule.getLoc(), module.getAllPorts()[i].type, inputRead);
+          rewriter, scModule.getLoc(), portsLocal[i].type, inputRead);
       scFuncBody.getArgument(0).replaceAllUsesWith(converted);
       scFuncBody.eraseArgument(0);
     }
@@ -117,7 +114,7 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
 
     SmallVector<Value> outPorts;
     for (auto val : scModule.getArguments()) {
-      if (val.getType().isa<OutputType>())
+      if (isa<OutputType>(val.getType()))
         outPorts.push_back(val);
     }
 
@@ -149,16 +146,16 @@ private:
   template <typename PortTy>
   LogicalResult
   collectPortInfo(ValueRange ports, ArrayAttr portNames,
-                  SmallVector<ModuleType::PortInfo> &portInfo) const {
+                  SmallVector<systemc::ModuleType::PortInfo> &portInfo) const {
     for (auto inPort : llvm::zip(ports, portNames)) {
       Type ty = std::get<0>(inPort).getType();
-      ModuleType::PortInfo info;
+      systemc::ModuleType::PortInfo info;
 
-      if (ty.isa<hw::InOutType>())
+      if (isa<hw::InOutType>(ty))
         return failure();
 
       info.type = typeConverter->convertType(PortTy::get(ty));
-      info.name = std::get<1>(inPort).cast<StringAttr>();
+      info.name = cast<StringAttr>(std::get<1>(inPort));
       portInfo.push_back(info);
     }
 
@@ -183,7 +180,7 @@ public:
 
     // Collect the port types and names of the instantiated module and convert
     // them to appropriate systemc types.
-    SmallVector<ModuleType::PortInfo> portInfo;
+    SmallVector<systemc::ModuleType::PortInfo> portInfo;
     if (failed(collectPortInfo<InputType>(adaptor.getInputs(),
                                           adaptor.getArgNames(), portInfo)) ||
         failed(collectPortInfo<OutputType>(instanceOp->getResults(),
@@ -337,7 +334,8 @@ static void populateTypeConversion(TypeConverter &converter) {
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct HWToSystemCPass : public ConvertHWToSystemCBase<HWToSystemCPass> {
+struct HWToSystemCPass
+    : public circt::impl::ConvertHWToSystemCBase<HWToSystemCPass> {
   void runOnOperation() override;
 };
 } // namespace

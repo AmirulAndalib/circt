@@ -1,13 +1,17 @@
 // RUN: circt-opt %s | FileCheck %s
 // RUN: circt-opt %s | circt-opt | FileCheck %s
 
-// CHECK-LABEL: hw.module @test1(%arg0: i1, %arg1: i1, %arg8: i8) {
-hw.module @test1(%arg0: i1, %arg1: i1, %arg8: i8) {
+sv.macro.decl @RANDOM
+sv.macro.decl @PRINTF_COND_
+sv.macro.decl @SYNTHESIS
+
+// CHECK-LABEL: hw.module @test1(in %arg0 : i1, in %arg1 : i1, in %arg8 : i8) {
+hw.module @test1(in %arg0: i1, in %arg1: i1, in %arg8: i8) {
   // CHECK: [[FD:%.*]] = hw.constant -2147483646 : i32
   %fd = hw.constant 0x80000002 : i32
 
-  // CHECK: %param_x = sv.localparam : i42 {value = 11 : i42}
-  %param_x = sv.localparam : i42 {value = 11 : i42}
+  // CHECK: %param_x = sv.localparam {value = 11 : i42} : i42
+  %param_x = sv.localparam {value = 11 : i42} : i42
 
 
   // This corresponds to this block of system verilog code:
@@ -18,9 +22,9 @@ hw.module @test1(%arg0: i1, %arg1: i1, %arg8: i8) {
   //    end // always @(posedge)
 
   sv.always posedge  %arg0 {
-    sv.ifdef.procedural "SYNTHESIS" {
+    sv.ifdef.procedural @SYNTHESIS {
     } else {
-      %tmp = sv.macro.ref< "PRINTF_COND_" > : i1
+      %tmp = sv.macro.ref.expr @PRINTF_COND_() : () -> i1
       %tmpx = sv.constantX : i1
       %tmpz = sv.constantZ : i1
       %tmp2 = comb.and %tmp, %tmpx, %tmpz, %arg1 : i1
@@ -37,9 +41,9 @@ hw.module @test1(%arg0: i1, %arg1: i1, %arg8: i8) {
   }
 
   // CHECK-NEXT: sv.always posedge %arg0 {
-  // CHECK-NEXT:   sv.ifdef.procedural "SYNTHESIS" {
+  // CHECK-NEXT:   sv.ifdef.procedural @SYNTHESIS {
   // CHECK-NEXT:   } else {
-  // CHECK-NEXT:     %PRINTF_COND_ = sv.macro.ref< "PRINTF_COND_"> : i1
+  // CHECK-NEXT:     %PRINTF_COND_ = sv.macro.ref.expr @PRINTF_COND
   // CHECK-NEXT:     %x_i1 = sv.constantX : i1
   // CHECK-NEXT:     %z_i1 = sv.constantZ : i1
   // CHECK-NEXT:     [[COND:%.*]] = comb.and %PRINTF_COND_, %x_i1, %z_i1, %arg1 : i1
@@ -289,19 +293,19 @@ sv.bind <@AB::@a1>
 sv.bind <@AB::@b1>
 
 
-hw.module.extern @ExternDestMod(%a: i1, %b: i2)
-hw.module @InternalDestMod(%a: i1, %b: i2) {}
-//CHECK-LABEL: hw.module @AB(%a: i1, %b: i2) {
-//CHECK-NEXT:   hw.instance "whatever" sym @a1 @ExternDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint = 1 : i64}
-//CHECK-NEXT:   hw.instance "yo" sym @b1 @InternalDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint = 1 : i64}
+hw.module.extern @ExternDestMod(in %a: i1, in %b: i2)
+hw.module @InternalDestMod(in %a: i1, in %b: i2) {}
+//CHECK-LABEL: hw.module @AB(in %a : i1, in %b : i2) {
+//CHECK-NEXT:   hw.instance "whatever" sym @a1 @ExternDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint}
+//CHECK-NEXT:   hw.instance "yo" sym @b1 @InternalDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint}
 
-hw.module @AB(%a: i1, %b: i2) {
-  hw.instance "whatever" sym @a1 @ExternDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint=1}
-  hw.instance "yo" sym @b1 @InternalDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint=1}
+hw.module @AB(in %a: i1, in %b: i2) {
+  hw.instance "whatever" sym @a1 @ExternDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint}
+  hw.instance "yo" sym @b1 @InternalDestMod(a: %a: i1, b: %b: i2) -> () {doNotPrint}
 }
 
 //CHECK-LABEL: hw.module @XMR_src
-hw.module @XMR_src(%a : i23) {
+hw.module @XMR_src(in %a : i23) {
   //CHECK-NEXT:   sv.xmr isRooted "a", "b", "c" : !hw.inout<i23>
   %xmr1 = sv.xmr isRooted a,b,c : !hw.inout<i23>
   //CHECK-NEXT:   sv.xmr "a", "b", "c" : !hw.inout<i3>
@@ -310,7 +314,7 @@ hw.module @XMR_src(%a : i23) {
   sv.assign %xmr1, %a : i23
 }
 
-  hw.module @part_select(%in4 : i4, %in8 : i8) -> (a : i3, b : i5) {
+  hw.module @part_select(in %in4 : i4, in %in8 : i8, out a : i3, out b : i5) {
   // CHECK-LABEL: hw.module @part_select
 
     %myReg2 = sv.reg : !hw.inout<i18>
@@ -333,10 +337,15 @@ hw.module @XMR_src(%a : i23) {
     hw.output %c, %d : i3, i5
 }
 
+// CHECK-LABEL: sv.macro.decl @foo
+sv.macro.decl @foo
+// CHECK-LABEL: sv.macro.decl @bar
+sv.macro.decl @bar
+
 // CHECK-LABEL: hw.module @nested_wire
-hw.module @nested_wire(%a: i1) {
-  // CHECK: sv.ifdef "foo"
-  sv.ifdef "foo" {
+hw.module @nested_wire(in %a: i1) {
+  // CHECK: sv.ifdef @foo
+  sv.ifdef @foo {
     // CHECK: sv.wire
     %wire = sv.wire : !hw.inout<i1>
     // CHECK: sv.assign
@@ -346,17 +355,17 @@ hw.module @nested_wire(%a: i1) {
 
 
 // CHECK-LABEL: hw.module @ordered_region
-hw.module @ordered_region(%a: i1) {
+hw.module @ordered_region(in %a: i1) {
   // CHECK: sv.ordered
   sv.ordered {
-    // CHECK: sv.ifdef "foo"
-    sv.ifdef "foo" {
+    // CHECK: sv.ifdef @foo
+    sv.ifdef @foo {
       // CHECK: sv.wire
       %wire = sv.wire : !hw.inout<i1>
       // CHECK: sv.assign
       sv.assign %wire, %a : i1
     }
-    sv.ifdef "bar" {
+    sv.ifdef @bar {
       // CHECK: sv.wire
       %wire = sv.wire : !hw.inout<i1>
       // CHECK: sv.assign
@@ -379,4 +388,38 @@ hw.module @XMRRefOp() {
   %0 = sv.xmr.ref @ref : !hw.inout<i2>
   // CHECK: %1 = sv.xmr.ref @ref2 ".x.y.z[42]" : !hw.inout<i8>
   %1 = sv.xmr.ref @ref2 ".x.y.z[42]" : !hw.inout<i8>
+}
+
+// Functions.
+// CHECK-LABEL: sv.func private @function_declare(in %in_0 : i2, in %in_1 : i2, out out_0 : i1, in %in_2 : !hw.array<2xi2>)
+sv.func private @function_declare(in %in_0 : i2, in %in_1 : i2, out out_0 : i1, in %in_2 : !hw.array<2xi2>)
+// CHECK-NEXT: sv.func.dpi.import linkage "c_func_name" @function_declare
+sv.func.dpi.import linkage "c_func_name" @function_declare
+
+// CHECK-LABEL: sv.func private @function_define(in %in_0 : i2, in %in_1 : i2, out out_0 : i1, in %in_2 : !hw.array<2xi2>)
+sv.func private @function_define(in %in_0 : i2, in %in_1 : i2, out out_0 : i1, in %in_2 : !hw.array<2xi2>) attributes {test = "foo"} {
+  %0 = comb.icmp eq %in_0, %in_1: i2
+  // CHECK: sv.return %{{.+}} : i1
+  sv.return %0 : i1
+}
+
+// CHECK-LABEL: sv.func @recurse(in %n : i32, out out : i32) {
+// CHECK: %0 = sv.func.call.procedural @recurse(%n) : (i32) -> i32
+// CHECK-NEXT:  sv.return %0
+sv.func @recurse(in %n : i32, out out : i32) {
+  %v = sv.func.call.procedural @recurse(%n) : (i32) -> i32
+  sv.return %v : i32
+}
+
+// CHECK-LABEL: sv.func private @open_array(in %array : !sv.open_uarray<i8>)
+// CHECK-LABEL:hw.module @test_open_array
+// CHECK:        %[[OPEN_ARRAY:.+]] = sv.unpacked_array_create %in_1, %in_0 : (i8, i8) -> !hw.uarray<2xi8>
+// CHECK-NEXT:   sv.unpacked_open_array_cast %[[OPEN_ARRAY:.+]] : (!hw.uarray<2xi8>) -> !sv.open_uarray<i8>
+sv.func private @open_array(in %array : !sv.open_uarray<i8>)
+hw.module @test_open_array(in %clock : i1, in %in_0 : i8, in %in_1 : i8) {
+  %0 = sv.unpacked_array_create %in_1, %in_0 : (i8, i8) -> !hw.uarray<2xi8>
+  %1 = sv.unpacked_open_array_cast %0 : (!hw.uarray<2xi8>) -> !sv.open_uarray<i8>
+  sv.always posedge %clock {
+    sv.func.call.procedural @open_array(%1) : (!sv.open_uarray<i8>) -> ()
+  }
 }

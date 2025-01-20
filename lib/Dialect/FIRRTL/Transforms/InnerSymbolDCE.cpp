@@ -9,27 +9,60 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
-#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOpInterfaces.h"
+#include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
+#include "circt/Dialect/HW/InnerSymbolTable.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Threading.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-inner-symbol-dce"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_INNERSYMBOLDCE
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
 using namespace firrtl;
 using namespace hw;
 
-struct InnerSymbolDCEPass : public InnerSymbolDCEBase<InnerSymbolDCEPass> {
+/// Drop the specified symbol.
+/// Belongs in InnerSymbolTable, need to move port symbols accessors
+/// into HW(ModuleLike) or perhaps a new inner-symbol interface that
+/// dialects can optionally elect to use on their "ModuleLike"s.
+/// For now, since InnerSymbolDCE is FIRRTL-only, define this here.
+static void dropSymbol(const InnerSymTarget &target) {
+  assert(target);
+  assert(InnerSymbolTable::getInnerSymbol(target));
+
+  if (target.isPort()) {
+    auto mod = cast<FModuleLike>(target.getOp());
+    assert(target.getPort() < mod.getNumPorts());
+    auto base = mod.getPortSymbolAttr(target.getPort());
+    cast<firrtl::FModuleLike>(*mod).setPortSymbolAttr(
+        target.getPort(), base.erase(target.getField()));
+    return;
+  }
+
+  auto symOp = cast<InnerSymbolOpInterface>(target.getOp());
+  auto base = symOp.getInnerSymAttr();
+  symOp.setInnerSymbolAttr(base.erase(target.getField()));
+}
+
+struct InnerSymbolDCEPass
+    : public circt::firrtl::impl::InnerSymbolDCEBase<InnerSymbolDCEPass> {
   void runOnOperation() override;
 
 private:
   void findInnerRefs(Attribute attr);
   void insertInnerRef(InnerRefAttr innerRef);
-  void removeInnerSyms(FModuleOp op);
+  void removeInnerSyms(FModuleLike mod);
 
   DenseSet<std::pair<StringAttr, StringAttr>> innerRefs;
 };
@@ -48,42 +81,36 @@ void InnerSymbolDCEPass::insertInnerRef(InnerRefAttr innerRef) {
   StringAttr moduleName = innerRef.getModule();
   StringAttr symName = innerRef.getName();
 
+  // Track total inner refs found.
+  ++numInnerRefsFound;
+
   auto [iter, inserted] = innerRefs.insert({moduleName, symName});
   if (!inserted)
     return;
 
-  ++numSymbolsFound;
-
-  LLVM_DEBUG(llvm::dbgs() << DEBUG_TYPE << ": found " << moduleName
+  LLVM_DEBUG(llvm::dbgs() << DEBUG_TYPE << ": found reference to " << moduleName
                           << "::" << symName << '\n';);
 }
 
-/// Remove all InnerSymAttrs within the FModuleOp that are dead code.
-void InnerSymbolDCEPass::removeInnerSyms(FModuleOp moduleOp) {
-  // Walk all ops in the FModuleOp.
-  moduleOp.walk([&](Operation *op) {
-    // Check if the op has an InnerSymAttr.
-    auto innerSym = op->getAttrOfType<InnerSymAttr>("inner_sym");
-    if (!innerSym)
-      return;
+/// Remove all dead inner symbols from the specified module.
+void InnerSymbolDCEPass::removeInnerSyms(FModuleLike mod) {
+  auto moduleName = mod.getModuleNameAttr();
 
-    assert(moduleOp == op->getParentOfType<FModuleOp>() &&
-           "ops with inner_sym must be inside an FModuleOp");
+  // Walk inner symbols, removing any not referenced.
+  InnerSymbolTable::walkSymbols(
+      mod, [&](StringAttr name, const InnerSymTarget &target) {
+        ++numInnerSymbolsFound;
 
-    // Check if the InnerSymAttr was found as part of any InnerRefAttr.
-    auto moduleName = moduleOp.moduleNameAttr();
-    auto symName = innerSym.getSymName();
-    if (innerRefs.contains({moduleName, symName}))
-      return;
+        // Check if the name is referenced by any InnerRef.
+        if (innerRefs.contains({moduleName, name}))
+          return;
 
-    // If not, it's dead code.
-    op->removeAttr("inner_sym");
+        dropSymbol(target);
+        ++numInnerSymbolsRemoved;
 
-    ++numSymbolsRemoved;
-
-    LLVM_DEBUG(llvm::dbgs() << DEBUG_TYPE << ": removed " << moduleName
-                            << "::" << symName << '\n';);
-  });
+        LLVM_DEBUG(llvm::dbgs() << DEBUG_TYPE << ": removed " << moduleName
+                                << "::" << name << '\n';);
+      });
 }
 
 void InnerSymbolDCEPass::runOnOperation() {
@@ -92,21 +119,21 @@ void InnerSymbolDCEPass::runOnOperation() {
   ModuleOp topModule = getOperation();
 
   // Traverse the entire IR once.
-  SmallVector<FModuleOp> modules;
+  SmallVector<FModuleLike> modules;
   topModule.walk([&](Operation *op) {
     // Find all InnerRefAttrs.
     for (NamedAttribute namedAttr : op->getAttrs())
       findInnerRefs(namedAttr.getValue());
 
-    // Collect all FModuleOps.
-    if (auto moduleOp = dyn_cast<FModuleOp>(op))
-      modules.push_back(moduleOp);
+    // Collect all FModuleLike operations.
+    if (auto mod = dyn_cast<FModuleLike>(op))
+      modules.push_back(mod);
   });
 
   // Traverse all FModuleOps in parallel, removing any InnerSymAttrs that are
   // dead code.
   parallelForEach(&getContext(), modules,
-                  [&](FModuleOp moduleOp) { removeInnerSyms(moduleOp); });
+                  [&](FModuleLike mod) { removeInnerSyms(mod); });
 }
 
 std::unique_ptr<mlir::Pass> circt::firrtl::createInnerSymbolDCEPass() {

@@ -22,11 +22,26 @@
 namespace circt {
 namespace esi {
 
-std::unique_ptr<OperationPass<ModuleOp>> createESIEmitCollateralPass();
+/// This should eventually become a set of functions to define the various
+/// platform-specific lowerings.
+struct Platform {
+  static constexpr char cosim[] = "cosim";
+  static constexpr char fpga[] = "fpga";
+};
+
+#define GEN_PASS_DECL
+#include "circt/Dialect/ESI/ESIPasses.h.inc"
+
+std::unique_ptr<OperationPass<>> createESIVerifyConnectionsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createESIPhysicalLoweringPass();
+std::unique_ptr<OperationPass<ModuleOp>> createESIBundleLoweringPass();
 std::unique_ptr<OperationPass<ModuleOp>> createESIPortLoweringPass();
+std::unique_ptr<OperationPass<ModuleOp>> createESITypeLoweringPass();
 std::unique_ptr<OperationPass<ModuleOp>> createESItoHWPass();
 std::unique_ptr<OperationPass<ModuleOp>> createESIConnectServicesPass();
+std::unique_ptr<OperationPass<ModuleOp>> createESICleanMetadataPass();
+std::unique_ptr<OperationPass<ModuleOp>> createESIBuildManifestPass();
+std::unique_ptr<OperationPass<ModuleOp>> createESIAppIDHierPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION
