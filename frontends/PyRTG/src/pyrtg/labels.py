@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .circt import ir
+from .base import ir
 from .core import Value
 from .rtg import rtg
 from .integers import Integer
@@ -62,7 +62,8 @@ class Label(Value):
   def _get_ssa_value(self) -> ir.Value:
     return self._value
 
-  def type(*args: ir.Type) -> ir.Type:
+  @staticmethod
+  def ty(*args: ir.Type) -> ir.Type:
     """
     Returns the label type.
     """

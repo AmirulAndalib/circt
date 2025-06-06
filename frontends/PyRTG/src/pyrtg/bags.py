@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .circt import ir, support
+from .base import ir, support
 from .rtg import rtg
 from .core import Value
 from .index import index
@@ -143,7 +143,8 @@ class Bag(Value):
   def get_type(self) -> ir.Type:
     return self._value.type
 
-  def type(*args: ir.Type) -> ir.Type:
+  @staticmethod
+  def ty(*args: ir.Type) -> ir.Type:
     """
     Returns the bag type for the given element type.
     """

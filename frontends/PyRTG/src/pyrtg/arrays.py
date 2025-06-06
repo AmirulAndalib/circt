@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .circt import ir
+from .base import ir
 from .rtg import rtg
 from .index import index
 from .core import Value
@@ -71,7 +71,8 @@ class Array(Value):
   def get_type(self) -> ir.Type:
     return self._value.type
 
-  def type(element_type: ir.Type) -> ir.Type:
+  @staticmethod
+  def ty(element_type: ir.Type) -> ir.Type:
     """
     Returns the array type for the given element type.
     """

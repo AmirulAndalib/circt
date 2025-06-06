@@ -84,6 +84,10 @@ def parse_args() -> argparse.Namespace:
       default="-",
       help=
       "Output Path (directory if 'split-output=True' or a filepath otherwise)")
+  parser.add_argument("--memories-as-immediates",
+                      type=bool,
+                      default=True,
+                      help="Lower memories as immediates")
 
   args = parser.parse_args()
 
@@ -128,7 +132,8 @@ def frontend_codegen(args: argparse.Namespace) -> ir.Module:
     module = ir.Module.create()
     with ir.InsertionPoint(module.body):
       for _, obj in inspect.getmembers(file):
-        if isinstance(obj, pyrtg.core.CodeGenRoot):
+        if isinstance(obj,
+                      pyrtg.core.CodeGenRoot) and not obj._already_generated:
           obj._codegen()
     return module
 
@@ -147,7 +152,8 @@ def compile(mlir_module: ir.Module, args: argparse.Namespace) -> None:
       verbose_pass_execution=args.verbose_pass_executions,
       output_format=to_output_format(args.output_format),
       output_path=args.output_path,
-      split_output=False)
+      split_output=False,
+      memories_as_immediates=args.memories_as_immediates)
   rtgtool_support.populate_randomizer_pipeline(pm, options)
   pm.run(mlir_module.operation)
 

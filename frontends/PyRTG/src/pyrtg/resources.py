@@ -7,7 +7,7 @@ from __future__ import annotations
 from .rtg import rtg
 from .rtgtest import rtgtest
 from .core import Value
-from .circt import ir
+from .base import ir
 from .integers import Integer
 
 from typing import Union
@@ -31,7 +31,8 @@ class Immediate(Value):
   def get_type(self) -> ir.Type:
     return rtg.ImmediateType.get(self._width)
 
-  def type(width: int) -> ir.Type:
+  @staticmethod
+  def ty(width: int) -> ir.Type:
     return rtg.ImmediateType.get(width)
 
 
@@ -188,5 +189,6 @@ class IntegerRegister(Value):
   def get_type(self) -> ir.Type:
     return rtgtest.IntegerRegisterType.get()
 
-  def type(*args) -> ir.Type:
+  @staticmethod
+  def ty(*args) -> ir.Type:
     return rtgtest.IntegerRegisterType.get()

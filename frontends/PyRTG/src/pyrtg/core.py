@@ -2,7 +2,7 @@
 #  See https://llvm.org/LICENSE.txt for license information.
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from .circt import ir
+from .base import ir
 
 
 class CodeGenRoot:
@@ -10,6 +10,8 @@ class CodeGenRoot:
   This is the base class for classes that have to be visited by the RTG tool
   during codegen.
   """
+
+  _already_generated: bool = False
 
   def _codegen(self):
     assert False, "must be implemented by the subclass"
@@ -28,7 +30,8 @@ class Value:
   def get_type(self) -> ir.Type:
     assert False, "must be implemented by subclass"
 
-  def type(*args: ir.Type) -> ir.Type:
+  @staticmethod
+  def ty(*args: ir.Type) -> ir.Type:
     assert False, "must be implemented by subclass"
 
   def _get_ssa_value(self) -> ir.Value:

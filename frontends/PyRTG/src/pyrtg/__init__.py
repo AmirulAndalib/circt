@@ -4,7 +4,7 @@
 
 from . import tests
 from . import core
-from .tests import test
+from .tests import test, embed_comment
 from .labels import Label
 from .rtg import rtg
 from .rtgtest import rtgtest
@@ -14,8 +14,10 @@ from .sets import Set
 from .integers import Integer, Bool
 from .bags import Bag
 from .sequences import sequence, Sequence, RandomizedSequence
-from .target import target, entry
+from .configs import config, Param, Config
 from .resources import IntegerRegister, Immediate
 from .arrays import Array
+from .contexts import CPUCore
 from .control_flow import If, Else, EndIf, For, Foreach
 from .tuples import Tuple
+from .memories import Memory, MemoryBlock
