@@ -11,10 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/CustomDirectiveImpl.h"
 #include "circt/Support/FoldUtils.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/Matchers.h"
@@ -307,19 +309,9 @@ LogicalResult FIFOOp::verify() {
 /// Suggest a name for each result value based on the saved result names
 /// attribute.
 void CompRegOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  // If the wire has an optional 'name' attribute, use it.
   if (auto name = getName())
     setNameFn(getResult(), *name);
 }
-
-LogicalResult CompRegOp::verify() {
-  if ((getReset() == nullptr) ^ (getResetValue() == nullptr))
-    return emitOpError(
-        "either reset and resetValue or neither must be specified");
-  return success();
-}
-
-std::optional<size_t> CompRegOp::getTargetResultIndex() { return 0; }
 
 template <typename TOp>
 LogicalResult verifyResets(TOp op) {
@@ -333,10 +325,17 @@ LogicalResult verifyResets(TOp op) {
   return success();
 }
 
+std::optional<size_t> CompRegOp::getTargetResultIndex() { return 0; }
+
+LogicalResult CompRegOp::verify() { return verifyResets(*this); }
+
+//===----------------------------------------------------------------------===//
+// CompRegClockEnabledOp
+//===----------------------------------------------------------------------===//
+
 /// Suggest a name for each result value based on the saved result names
 /// attribute.
 void CompRegClockEnabledOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  // If the wire has an optional 'name' attribute, use it.
   if (auto name = getName())
     setNameFn(getResult(), *name);
 }
@@ -345,10 +344,21 @@ std::optional<size_t> CompRegClockEnabledOp::getTargetResultIndex() {
   return 0;
 }
 
-LogicalResult CompRegClockEnabledOp::verify() {
-  if (failed(verifyResets(*this)))
-    return failure();
-  return success();
+LogicalResult CompRegClockEnabledOp::verify() { return verifyResets(*this); }
+
+LogicalResult CompRegClockEnabledOp::canonicalize(CompRegClockEnabledOp op,
+                                                  PatternRewriter &rewriter) {
+  // reg(comb.mux(en, d, ?), en) -> reg(d, en)
+  // reg(arith.select(en, d, ?), en) -> reg(d, en)
+  auto *inputOp = op.getInput().getDefiningOp();
+  if (isa_and_nonnull<comb::MuxOp, arith::SelectOp>(inputOp) &&
+      inputOp->getOperand(0) == op.getClockEnable()) {
+    rewriter.modifyOpInPlace(
+        op, [&] { op.getInputMutable().assign(inputOp->getOperand(1)); });
+    return success();
+  }
+
+  return failure();
 }
 
 //===----------------------------------------------------------------------===//
@@ -609,6 +619,52 @@ LogicalResult FirRegOp::canonicalize(FirRegOp op, PatternRewriter &rewriter) {
           op.getLoc(), APInt::getZero(hw::getBitWidth(op.getType())));
       rewriter.replaceOpWithNewOp<hw::BitcastOp>(op, op.getType(), constant);
     }
+    return success();
+  }
+
+  // Canonicalize registers with mux-based constant drivers.
+  // This pattern matches registers where the next value is a mux with one
+  // branch being the register itself (creating a self-loop) and the other
+  // branch being a constant. In such cases, the register effectively holds a
+  // constant value and can be replaced with that constant.
+  if (auto nextMux = op.getNext().getDefiningOp<comb::MuxOp>()) {
+    // Reject optimization if register has preset attribute (for simplicity)
+    if (op.getPresetAttr())
+      return failure();
+
+    Attribute value;
+    Value replacedValue;
+
+    // Check if true branch is self-loop and false branch is constant
+    if (nextMux.getTrueValue() == op.getResult() &&
+        matchPattern(nextMux.getFalseValue(), m_Constant(&value))) {
+      replacedValue = nextMux.getFalseValue();
+    }
+    // Check if false branch is self-loop and true branch is constant
+    else if (nextMux.getFalseValue() == op.getResult() &&
+             matchPattern(nextMux.getTrueValue(), m_Constant(&value))) {
+      replacedValue = nextMux.getTrueValue();
+    }
+
+    if (!replacedValue)
+      return failure();
+
+    // Verify reset value compatibility: if register has reset, it must be
+    // a constant that matches the mux constant
+    if (op.getResetValue()) {
+      Attribute resetConst;
+      if (matchPattern(op.getResetValue(), m_Constant(&resetConst))) {
+        if (resetConst != value)
+          return failure();
+      } else {
+        // Non-constant reset value prevents optimization
+        return failure();
+      }
+    }
+
+    assert(replacedValue);
+    // Apply the optimization if all conditions are met
+    rewriter.replaceOp(op, replacedValue);
     return success();
   }
 
