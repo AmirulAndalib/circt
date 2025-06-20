@@ -93,8 +93,17 @@ struct LogicEquivalenceCheckingOpConversion
       return success();
     }
 
-    smt::SolverOp solver =
-        rewriter.create<smt::SolverOp>(loc, rewriter.getI1Type(), ValueRange{});
+    auto unusedResult = op.use_empty();
+
+    // Solver will only return a result when it is used to check the returned
+    // value.
+    smt::SolverOp solver;
+    if (unusedResult)
+      solver = rewriter.create<smt::SolverOp>(loc, TypeRange{}, ValueRange{});
+    else
+      solver = rewriter.create<smt::SolverOp>(loc, rewriter.getI1Type(),
+                                              ValueRange{});
+
     rewriter.createBlock(&solver.getBodyRegion());
 
     // First, convert the block arguments of the miter bodies.
@@ -150,21 +159,41 @@ struct LogicEquivalenceCheckingOpConversion
     rewriter.create<smt::AssertOp>(loc, toAssert);
 
     // Fifth, check for satisfiablility and report the result back.
-    Value falseVal =
-        rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false));
-    Value trueVal =
-        rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(true));
-    auto checkOp = rewriter.create<smt::CheckOp>(loc, rewriter.getI1Type());
-    rewriter.createBlock(&checkOp.getSatRegion());
-    rewriter.create<smt::YieldOp>(loc, falseVal);
-    rewriter.createBlock(&checkOp.getUnknownRegion());
-    rewriter.create<smt::YieldOp>(loc, falseVal);
-    rewriter.createBlock(&checkOp.getUnsatRegion());
-    rewriter.create<smt::YieldOp>(loc, trueVal);
-    rewriter.setInsertionPointAfter(checkOp);
-    rewriter.create<smt::YieldOp>(loc, checkOp->getResults());
+    // If no operation uses the result of this solver, we leave our check
+    // operations empty. If the result is used, we create a check operation with
+    // the result type of the operation and yield the result of the check
+    // operation.
+    if (unusedResult) {
+      auto checkOp = rewriter.create<smt::CheckOp>(loc, TypeRange{});
+      rewriter.createBlock(&checkOp.getSatRegion());
+      rewriter.create<smt::YieldOp>(loc);
+      rewriter.createBlock(&checkOp.getUnknownRegion());
+      rewriter.create<smt::YieldOp>(loc);
+      rewriter.createBlock(&checkOp.getUnsatRegion());
+      rewriter.create<smt::YieldOp>(loc);
+      rewriter.setInsertionPointAfter(checkOp);
+      rewriter.create<smt::YieldOp>(loc);
 
-    rewriter.replaceOp(op, solver->getResults());
+      // Erase as operation is replaced by an operator without a return value.
+      rewriter.eraseOp(op);
+    } else {
+      Value falseVal =
+          rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false));
+      Value trueVal =
+          rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(true));
+      auto checkOp = rewriter.create<smt::CheckOp>(loc, rewriter.getI1Type());
+      rewriter.createBlock(&checkOp.getSatRegion());
+      rewriter.create<smt::YieldOp>(loc, falseVal);
+      rewriter.createBlock(&checkOp.getUnknownRegion());
+      rewriter.create<smt::YieldOp>(loc, falseVal);
+      rewriter.createBlock(&checkOp.getUnsatRegion());
+      rewriter.create<smt::YieldOp>(loc, trueVal);
+      rewriter.setInsertionPointAfter(checkOp);
+      rewriter.create<smt::YieldOp>(loc, checkOp->getResults());
+
+      rewriter.replaceOp(op, solver->getResults());
+    }
+
     return success();
   }
 };
@@ -323,6 +352,34 @@ struct VerifBoundedModelCheckingOpConversion
                       loc, circuitFuncOp,
                       iterArgs.take_front(circuitFuncOp.getNumArguments()))
                   ->getResults();
+
+          // If we have a cycle up to which we ignore assertions, we need an
+          // IfOp to track this
+          // First, save the insertion point so we can safely enter the IfOp
+
+          auto insideForPoint = builder.saveInsertionPoint();
+          // We need to still have the yielded result of the op in scope after
+          // we've built the check
+          Value yieldedValue;
+          auto ignoreAssertionsUntil =
+              op->getAttrOfType<IntegerAttr>("ignore_asserts_until");
+          if (ignoreAssertionsUntil) {
+            auto ignoreUntilConstant = builder.create<arith::ConstantOp>(
+                loc, rewriter.getI32IntegerAttr(
+                         ignoreAssertionsUntil.getValue().getZExtValue()));
+            auto shouldIgnore = builder.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::ult, i, ignoreUntilConstant);
+            auto ifShouldIgnore = builder.create<scf::IfOp>(
+                loc, builder.getI1Type(), shouldIgnore, true);
+            // If we should ignore, yield the existing value
+            builder.setInsertionPointToEnd(
+                &ifShouldIgnore.getThenRegion().front());
+            builder.create<scf::YieldOp>(loc, ValueRange(iterArgs.back()));
+            builder.setInsertionPointToEnd(
+                &ifShouldIgnore.getElseRegion().front());
+            yieldedValue = ifShouldIgnore.getResult(0);
+          }
+
           auto checkOp =
               rewriter.create<smt::CheckOp>(loc, builder.getI1Type());
           {
@@ -337,6 +394,17 @@ struct VerifBoundedModelCheckingOpConversion
 
           Value violated = builder.create<arith::OrIOp>(
               loc, checkOp.getResult(0), iterArgs.back());
+
+          // If we've packaged everything in an IfOp, we need to yield the
+          // new violated value
+          if (ignoreAssertionsUntil) {
+            builder.create<scf::YieldOp>(loc, violated);
+            // Replace the variable with the yielded value
+            violated = yieldedValue;
+          }
+
+          // If we created an IfOp, make sure we start inserting after it again
+          builder.restoreInsertionPoint(insideForPoint);
 
           // Call loop func to update clock & state arg values
           SmallVector<Value> loopCallInputs;
